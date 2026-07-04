@@ -224,6 +224,16 @@ class WhisperSyncConfig:
     # environment; silently skipped (with a warning) when it isn't set up.
     ambience_track: bool = True
     ambience_model: str = AMBIENCE_MODEL
+    # Retake detection (off by default): find lines the speaker re-recorded
+    # back-to-back in an unedited monologue (flub → stop → say it again) and
+    # export each set of attempts as a Final Cut *audition* — the alternatives
+    # stacked under one active pick (the last/best take) instead of every
+    # flubbed attempt cluttering the timeline. Detection is transcript-based
+    # (consecutive near-duplicate speech blocks); the thresholds below tune it.
+    detect_retakes: bool = False
+    retake_min_words: int = 4  # ignore blocks shorter than this (interjections)
+    retake_similarity: float = 0.6  # min token-sequence similarity to call two blocks the same line
+    retake_max_gap_s: float = 6.0  # max pause between consecutive attempts of one line
     # Split each rendered voice WAV into segments of this many minutes
     # (0 = keep one continuous file per clip, the default). Cut points snap
     # to the quietest moment near each nominal boundary, so a cut never lands

@@ -40,6 +40,7 @@ from whispersync.engine.media import (
     probe,
 )
 from whispersync.engine.naming import natural_key
+from whispersync.engine.retakes import detect_retakes
 from whispersync.engine.strategies import strategy_name
 from whispersync.engine.timestretch import (
     assemble_continuous,
@@ -49,7 +50,15 @@ from whispersync.engine.timestretch import (
 )
 from whispersync.engine.transcriber import WhisperEngine
 from whispersync.engine.transcript_export import save_transcript
-from whispersync.models import AlignmentMap, MediaClip, SyncResult, Transcript
+from whispersync.models import (
+    AlignmentMap,
+    MediaClip,
+    RetakeGroup,
+    SyncResult,
+    Take,
+    Transcript,
+    Word,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -479,6 +488,81 @@ def _sentence_pieces(
         pieces.append((padded[-1][1], tail_in, max(0.5, min(2.0, k and 1.0 / k or 1.0))))
 
     return lead, pieces
+
+
+def _retake_groups_for_clip(
+    am: AlignmentMap,
+    clip_duration: float,
+    rec_duration: float,
+    rec_transcript_words: list[Word],
+    config: WhisperSyncConfig,
+) -> list[RetakeGroup]:
+    """Retake groups for one camera clip, converted to the clip's own LOCAL
+    time (seconds from the clip's own start) so they can be attached directly
+    to its rendered voice ``MediaClip``.
+
+    Detection runs on the recorder's full transcript restricted to this clip's
+    aligned span ``[rec0, rec1]`` (the same span ``clip_pieces`` warps), so a
+    retake found here genuinely occurred while this clip was rolling. Take
+    spans are placed via the alignment's global affine map (``offset + k *
+    rec_time``) — the same anchor ``clip_pieces`` uses for its own piece
+    edges. This is an approximation under the piecewise (sentence-wise) warp
+    used by strategy 3, which can nudge actual playback position by up to a
+    per-phrase factor's worth of drift (real clock drift is a fraction of a
+    percent, so in practice this is well under a second) — acceptable for a
+    non-destructive editorial hint the user reviews in Final Cut before
+    committing to any cut, rather than a frame-exact placement.
+    """
+    if not config.detect_retakes:
+        return []
+    k = am.k or 1.0
+    rec0 = min(max((0.0 - am.offset) / k, 0.0), rec_duration)
+    rec1 = min(max((clip_duration - am.offset) / k, 0.0), rec_duration)
+    if rec1 - rec0 <= 1e-3:
+        return []
+    words = [w for w in rec_transcript_words if rec0 <= w.start < rec1]
+    groups = detect_retakes(words, config)
+    if not groups:
+        return []
+
+    def r2l(t_rec: float) -> float:
+        return am.offset + k * t_rec
+
+    local_groups: list[RetakeGroup] = []
+    for g in groups:
+        takes = [Take(start=r2l(t.start), end=r2l(t.end), text=t.text) for t in g.takes]
+        local_groups.append(RetakeGroup(takes=takes, keeper_index=g.keeper_index))
+    return local_groups
+
+
+def _retake_groups_in_segment(
+    groups: list[RetakeGroup] | None, seg_start: float, seg_end: float
+) -> list[RetakeGroup]:
+    """Re-base retake groups onto one N-minute voice segment's own local time.
+
+    Called once per output segment when ``voice_segment_minutes`` splits a
+    clip's rendered voice monolith (see the segmentation pass in
+    ``run_pipeline``): a group is kept only if it falls ENTIRELY within
+    ``[seg_start, seg_end)`` — a group straddling a segment boundary can't be
+    represented as a single audition in either segment, and splitting it
+    there would be rarer still since segment cuts are themselves snapped to
+    silence, i.e. away from speech. Take times shift so 0 means this
+    segment's own start.
+    """
+    if not groups:
+        return []
+    kept: list[RetakeGroup] = []
+    for g in groups:
+        g_start, g_end = g.span
+        if g_start < seg_start or g_end > seg_end:
+            continue
+        kept.append(
+            RetakeGroup(
+                takes=[Take(t.start - seg_start, t.end - seg_start, t.text) for t in g.takes],
+                keeper_index=g.keeper_index,
+            )
+        )
+    return kept
 
 
 def clip_pieces(
@@ -1325,6 +1409,14 @@ def run_pipeline(
             voice_name = f"{vclip.path.stem}_voice"
             if config.recorder_mode == "all":
                 voice_name = f"{vclip.path.stem}_{audio_files[ri].stem}_voice"
+            retake_groups = _retake_groups_for_clip(
+                am, vclip.duration, rec_infos[ri].duration, rec_transcripts[ri].words, config
+            )
+            if retake_groups:
+                warnings.append(
+                    f"{vclip.path.name}: found {len(retake_groups)} likely retake(s) — "
+                    "exported as Final Cut auditions (press Q to browse takes)"
+                )
             audio_clips.append(
                 MediaClip(
                     path=audio_files[ri],
@@ -1335,6 +1427,7 @@ def run_pipeline(
                     lane=lane,
                     display_name=voice_name,
                     role="Dialogue",
+                    retake_groups=retake_groups or None,
                 )
             )
             audio_speed.append(1.0 / am.k if am.k else 1.0)
@@ -1594,6 +1687,7 @@ def run_pipeline(
                     a, b = bounds[si], bounds[si + 1]
                     part = Path(f"{base}_p{si + 1:02d}.wav")
                     cut_wav_segment(aclip.path, part, a, b, codec=voice_codec)
+                    seg_retakes = _retake_groups_in_segment(aclip.retake_groups, a, b)
                     new_clips.append(
                         MediaClip(
                             path=part,
@@ -1604,6 +1698,7 @@ def run_pipeline(
                             lane=aclip.lane,
                             display_name=f"{aclip.display_name or aclip.path.stem}_p{si + 1:02d}",
                             role=aclip.role,
+                            retake_groups=seg_retakes or None,
                         )
                     )
                     new_speed.append(audio_speed[ci_a])

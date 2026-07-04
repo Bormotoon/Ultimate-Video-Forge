@@ -94,3 +94,11 @@ def test_main_window_segment_combo_defaults_to_monolith(qapp: QApplication) -> N
     values = [w.segment_combo.itemData(i) for i in range(w.segment_combo.count())]
     assert values == [0, 1, 2, 3, 5, 10]
     w.close()
+
+
+def test_main_window_retakes_check_defaults_off(qapp: QApplication) -> None:
+    from whispersync.gui.main_window import MainWindow
+
+    w = MainWindow()
+    assert w.retakes_check.isChecked() is False
+    w.close()

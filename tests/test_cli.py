@@ -109,3 +109,12 @@ def test_voice_segment_minutes_flag() -> None:
         ["--video-dir", "v", "--audio-file", "r.wav", "--voice-segment-minutes", "3"]
     )
     assert args.voice_segment_minutes == 3
+
+
+def test_detect_retakes_flag() -> None:
+    args = _build_parser().parse_args(["--video-dir", "v", "--audio-file", "r.wav"])
+    assert args.detect_retakes is None
+    args = _build_parser().parse_args(
+        ["--video-dir", "v", "--audio-file", "r.wav", "--detect-retakes"]
+    )
+    assert args.detect_retakes is True

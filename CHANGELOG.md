@@ -4,6 +4,47 @@ All notable changes to WhisperSync will be documented in this file.
 
 ## [Unreleased]
 
+### Added — retake detection (Final Cut auditions)
+
+- **`detect_retakes` / `--detect-retakes` / GUI "Detect retakes" checkbox**
+  (off by default): finds lines the speaker re-recorded back-to-back in an
+  unedited take (flub, stop, restart — common in lecture/monologue
+  recordings) and exports each set of attempts as a Final Cut **audition** —
+  a non-destructive stack of alternative clips (press <kbd>Q</kbd> in Final
+  Cut to browse takes), with the last attempt active by default. Nothing is
+  ever cut or reordered on disk; the editor reviews and picks.
+- Detection (`whispersync/engine/retakes.py`) works at the token level, not
+  whole-sentence blocks: it scans the recorder's own transcript (already
+  computed for sync) for a short run of words (`retake_min_words`, default 4)
+  that repeats verbatim within `retake_max_gap_s` (default 6.0s) of when it
+  was first spoken. A match is extended to its maximal common span in both
+  directions before being judged, so the same underlying repeat is decided
+  consistently regardless of which token offset within it was tried first —
+  an earlier per-candidate-local-gap design gave different answers depending
+  on scan order and produced false positives on unrelated later callbacks to
+  the same short phrase. Consecutive restarts of the same line chain into one
+  group (2+ attempts); the final attempt's own extent uses the same
+  sentence-pause threshold the renderer uses (a more lenient threshold was
+  tried first but let ordinary speech pauses minutes later swallow the
+  keeper into an unusably long take — non-destructive audition export makes
+  "keeper truncated a bit early" a far cheaper failure mode than "keeper
+  three minutes long").
+- FCPXML export (`whispersync/engine/export.py`) renders each retake group as
+  an `<audition>` anchored under the connected voice clip (a valid
+  `anchor_item` in the FCPXML 1.8+/1.9 DTD, confirmed against the public DTD
+  entity declarations), with the keeper as the first/active child and the
+  discarded attempts as alternates — verified structurally valid and
+  round-tripped through `validate_fcpxml`.
+- Validated on the real POS-vyp26 dataset transcript (93 minutes): found 6
+  plausible retakes, including one where the true repeated span begins
+  mid-sentence after an unrelated lead-in phrase — confirming the
+  match-extension approach recovers the correct span rather than only
+  whole-phrase-aligned repeats.
+- Intentionally the first tier of a two-tier design: an optional LLM refiner
+  (`refine_retakes`, currently a no-op seam) is planned to catch paraphrased
+  restarts an exact token match misses and judge which take was best
+  delivered, mirroring Podcast Reels Forge's local llama.cpp moment-scoring.
+
 ### Added — voice segmentation for NLE-side re-sync
 
 - **`voice_segment_minutes` / `--voice-segment-minutes` / GUI "Voice file

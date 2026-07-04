@@ -31,6 +31,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - [Quick Start](#quick-start)
 - [Usage](#usage) — [GUI](#gui) · [CLI](#cli)
 - [Sync Strategies Guide](#sync-strategies-guide)
+- [Retake Detection](#retake-detection)
 - [Configuration](#configuration)
 - [Output Files](#output-files)
 - [Verifying the Result](#verifying-the-result)
@@ -71,6 +72,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **FCPXML export** (v1.9 by default) — references your untouched video files plus the rendered synced WAVs, with honest per-asset audio channel/rate attributes; validated before it's handed to you.
 - **`--render-master-wav`** — additionally mixes every synced voice clip (and the ambience track, if enabled) at its timeline offset onto one silence-padded WAV spanning the whole timeline, for people without an NLE.
 - **Ambience track (optional)** — an AI source-separation model strips the camera's own (echoey, slightly off-sync) voice while keeping the room tone, on its own lane next to the clean voice; runs in an isolated `.sep-venv` environment, batch-processed with a single model load.
+- **Retake detection (optional, `--detect-retakes`)** — finds lines the speaker re-recorded back-to-back in an unedited take (flub, stop, restart) and exports each set of attempts as a Final Cut *audition* (press <kbd>Q</kbd> in Final Cut to browse takes) instead of leaving every flubbed attempt on the timeline. A transcript-based heuristic, fully non-destructive — nothing is ever cut, you review the auditions and pick.
 - **Transcript export** — full transcripts of every recorder and camera clip saved as JSON + SRT next to the output (word-level timestamps included).
 
 ### GUI
@@ -80,6 +82,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **Live multitrack timeline** — one row per camera and per audio lane, showing every clip's real position, applied speed change (e.g. `+0.10%`), and live status: pending (dashed), working (orange outline), done (solid). Hover for offset / duration / in-point / speed.
 - **Transcription Settings dialog** — model, language, device, compute type, transcribe mode (fast/quality), and initial prompt without touching a config file.
 - **Re-run with Selected Strategy** — after a run, switch the strategy radio and re-run; transcripts are cached, so it skips straight to alignment/render.
+- **Detect retakes checkbox** — finds re-recorded lines and exports them as Final Cut auditions (see [Retake Detection](#retake-detection)); off by default.
 - **Weighted overall progress** — one continuous progress bar across all stages (no per-stage resets), plus explicit "Loading Whisper model…" status during a first-time model download.
 - **Pipeline warnings surfaced in the log** — unaligned clips, high residual, strategy advice, validation problems.
 - **Responsive cancellation** — cancel takes effect mid-clip, even during a large multi-core render.
@@ -257,6 +260,7 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav \
 | `--ambience-track` | flag | Voice-free camera-ambience lane (needs `.sep-venv`, see `setup_sep_venv.sh`; default **on**, skipped with a warning when `.sep-venv` is missing) |
 | `--voice-segment-minutes` | int | Split each rendered voice WAV into ~N-minute segments, cut at the quietest point near each boundary (`0` = one continuous file per clip, default). Lets the NLE's own audio sync re-align every few minutes. Typical: `1`/`2`/`3`/`5`/`10` |
 | `--render-master-wav` | flag | Also render one WAV spanning the whole timeline (voice + ambience mixed at their offsets over silence) next to the FCPXML (default off) |
+| `--detect-retakes` | flag | Find re-recorded lines and export them as Final Cut auditions instead of leaving every attempt on the timeline (default off) |
 | `--save-transcripts` / `--no-save-transcripts` | flag | Save full transcripts (JSON+SRT) to `output/transcripts/` (default on) |
 | `--config` | Path | JSON config file (a missing path is an error, not a silent fallback) |
 | `--no-cache` | flag | Disable the transcription cache |
@@ -312,6 +316,20 @@ Strategy 3        Video:  |== phrase ==| pause |== phrase ==| pause |== phrase =
 
 > **Multiple recorders.** Pass `--audio-file` several times. Every clip aligns against every recorder; the timeline is built from the "primary" (best coverage). `--recorder-mode best` (default) keeps one audio lane with the strongest recorder per clip; `all` gives every recorder its own lane (multiple lavaliers/speakers). **Note:** if your files are just sequential chunks of *one* device (a recorder that splits every 15 min), they share one clock — losslessly concatenate them first (`ffmpeg` concat) instead of passing them as separate recorders.
 
+## Retake Detection
+
+An unedited lecture or monologue recording is often full of flubbed lines that got re-recorded on the spot: the speaker stumbles, stops, and restarts the same line — sometimes several times — before continuing. `--detect-retakes` (off by default) finds these automatically and exports each set of attempts as a Final Cut **audition**: a non-destructive stack of alternative clips, with the last (presumably best) attempt active by default. Press <kbd>Q</kbd> in Final Cut Pro while an audition is selected to browse the other takes, or double-click it to open the audition browser.
+
+```bash
+python main.py --cli --video-dir ./videos --audio-file rec.wav --detect-retakes
+```
+
+> **How it works.** Detection runs on the recorder's own transcript (already computed for sync), scanning at the word-token level for a short run of words that repeats verbatim shortly after it was first spoken — not just whole-sentence repeats, since a restart is usually a resumed sentence, not a cleanly bounded phrase. Consecutive restarts of the same line chain into one group (2 or more attempts); nothing is ever deleted or reordered — the algorithm only decides which spans to group into an audition.
+>
+> **Tuning.** `retake_min_words` (default 4) sets how many words must repeat before it counts as a restart — raise it if short common phrases ("что это", "то есть") are being flagged as false positives. `retake_max_gap_s` (default 6.0s) caps how long a pause may separate two attempts of the same line before they're treated as an unrelated callback instead of a retake.
+>
+> **This is a heuristic, reviewed non-destructively.** Exact-repeat detection won't catch every paraphrased restart, and can occasionally group a coincidental phrase repetition that isn't really a retake — but since nothing is cut (every alternative stays available in the audition), a false positive just means one audition the editor dismisses, and a missed retake is no worse than not running the feature at all. A future LLM-based refinement pass (mirroring [Podcast Reels Forge](https://github.com/Bormotoon/Podcast-Reels-Forge)'s local llama.cpp moment-scoring) is planned to catch paraphrased restarts and judge which take was best-delivered, rather than just "the last one."
+
 ## Configuration
 
 WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flags > JSON config > defaults.** An unknown key logs a warning (so typos don't silently do nothing), and a missing `--config` path is a hard error.
@@ -358,7 +376,11 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
     "pause_duck_db": -18.0,
     "ambience_track": true,
     "voice_segment_minutes": 0,
-    "render_master_wav": false
+    "render_master_wav": false,
+    "detect_retakes": false,
+    "retake_min_words": 4,
+    "retake_similarity": 0.6,
+    "retake_max_gap_s": 6.0
 }
 ```
 
@@ -382,6 +404,9 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
 | `render_master_wav` | bool | Also render one WAV spanning the whole timeline (default off) |
 | `cache_max_age_days` | float | Delete cached transcripts older than N days at engine start; `0` (default) keeps them forever |
 | `voice_segment_minutes` | int | Split each voice WAV into ~N-minute segments cut in silence (`0` = monolith, default) |
+| `detect_retakes` | bool | Find re-recorded lines and export as Final Cut auditions (default off) |
+| `retake_min_words` | int | Minimum token-run length to consider a restart candidate (default 4) |
+| `retake_max_gap_s` | float | Max pause between consecutive attempts of the same line (default 6.0s) |
 
 ## Output Files
 
@@ -444,12 +469,13 @@ WhisperSync/
 │   ├── app.py                       # Entry point (GUI/CLI dispatch); also the whispersync-gui script
 │   ├── cli.py                       # argparse CLI
 │   ├── config.py                    # WhisperSyncConfig dataclass + JSON loader
-│   ├── models.py                    # Word, Segment, Transcript, Anchor, AlignmentMap, MediaClip, SyncPlan, SyncResult
+│   ├── models.py                    # Word, Segment, Transcript, Anchor, AlignmentMap, MediaClip, Take, RetakeGroup, SyncPlan, SyncResult
 │   ├── engine/
 │   │   ├── pipeline.py              # End-to-end orchestration (incl. clip_pieces — the real strategy planner)
 │   │   ├── transcriber.py           # WhisperEngine + SHA-256 cache (+ age pruning)
 │   │   ├── matcher.py               # Anchors + RANSAC + two-stage outlier filter + strategy recommendation
 │   │   ├── strategies.py            # Strategy registry (id -> name/description)
+│   │   ├── retakes.py               # Retake detection (token-level restart matching) for Final Cut auditions
 │   │   ├── acoustic.py              # GCC-PHAT cross-correlation: Boundary Flex + acoustic fallback
 │   │   ├── separation.py            # Ambience track via the isolated .sep-venv
 │   │   ├── timestretch.py           # ffmpeg cut/resample-conform/atempo/assemble/master-mix wrappers

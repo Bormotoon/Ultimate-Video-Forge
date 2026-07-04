@@ -255,6 +255,20 @@ class MainWindow(QMainWindow):
         )
         options_layout.addRow("Voice file split:", self.segment_combo)
 
+        # Retake detection (off by default): find lines the speaker
+        # re-recorded back-to-back and export them as Final Cut auditions
+        # (press Q in FCPX to browse takes) instead of leaving every flubbed
+        # attempt on the timeline. A non-destructive heuristic — nothing is
+        # ever cut; the editor reviews/picks in Final Cut.
+        self.retakes_check = QCheckBox("Detect retakes (export as Final Cut auditions)")
+        self.retakes_check.setChecked(self.config.detect_retakes)
+        self.retakes_check.setToolTip(
+            "Find lines re-recorded back-to-back (flub, stop, restart) and group "
+            "each set of attempts into a Final Cut audition — a non-destructive "
+            "stack of alternatives you browse with Q. Off by default."
+        )
+        options_layout.addRow(self.retakes_check)
+
         left_layout.addWidget(options_group)
 
         self.btn_settings = QPushButton("Transcription Settings...")
@@ -508,6 +522,7 @@ class MainWindow(QMainWindow):
             ambience_track=self.ambience_check.isChecked(),
             recorder_mode=self.recorder_mode_combo.currentText(),
             voice_segment_minutes=int(self.segment_combo.currentData() or 0),
+            detect_retakes=self.retakes_check.isChecked(),
         )
 
         self.right_tabs.setCurrentIndex(0)  # show the Run tab during processing

@@ -324,3 +324,139 @@ def test_no_role_omits_attribute(tmp_path: Path) -> None:
     assert clip is not None
     assert clip.get("videoRole") is None and clip.get("audioRole") is None
     assert clip.get("name") == "a"  # falls back to stem
+
+
+# --- retake groups -> <audition> --------------------------------------------
+
+
+def _retake_plan(tmp_path: Path, groups: list) -> tuple[SyncPlan, list[MediaInfo]]:
+    video_info = _vinfo("/v/clip.mov", 30.0)
+    clips = [
+        MediaClip(
+            path=Path("/v/clip.mov"), kind="video", offset=0.0, in_point=0.0, duration=30.0, lane=1
+        ),
+        MediaClip(
+            path=Path("/audio/clip_voice.wav"),
+            kind="audio",
+            offset=0.0,
+            in_point=0.0,
+            duration=30.0,
+            lane=-1,
+            retake_groups=groups,
+        ),
+    ]
+    return SyncPlan(strategy_id=3, clips=clips, total_duration=30.0), [video_info]
+
+
+def test_no_retakes_emits_plain_asset_clip_not_audition(tmp_path: Path) -> None:
+    plan, infos = _retake_plan(tmp_path, None)
+    out = tmp_path / "no_retake.fcpxml"
+    generate_fcpxml(plan, infos, out)
+    root = ET.parse(out).getroot()
+    assert root.find(".//audition") is None
+    connected = root.find(".//asset-clip").findall("asset-clip")
+    assert len(connected) == 1
+
+
+def test_single_retake_group_wraps_in_audition(tmp_path: Path) -> None:
+    from whispersync.models import RetakeGroup, Take
+
+    group = RetakeGroup(
+        takes=[
+            Take(start=10.0, end=12.0, text="кто ещё учится в школе а не выпустился"),
+            Take(
+                start=12.0,
+                end=15.0,
+                text="кто ещё учится в школе а не выпустился ну и так далее",
+            ),
+        ],
+        keeper_index=-1,
+    )
+    plan, infos = _retake_plan(tmp_path, [group])
+    out = tmp_path / "retake.fcpxml"
+    result = generate_fcpxml(plan, infos, out)
+    assert validate_fcpxml(result)
+
+    root = ET.parse(out).getroot()
+    video_clip = root.find(".//asset-clip")
+    stories = list(video_clip)
+    # plain [0,10) clip, then <audition>, then plain [15,30) clip
+    tags = [el.tag for el in stories]
+    assert tags == ["asset-clip", "audition", "asset-clip"]
+
+    lead, audition, tail = stories
+    assert float(lead.get("duration").split("/")[0]) > 0  # non-zero lead-in
+
+    takes = audition.findall("asset-clip")
+    assert len(takes) == 2
+    # keeper (last take, per keeper_index=-1) is FIRST/active in the audition
+    assert "Keep" in takes[0].get("name")
+    assert "так далее" not in takes[0].get("name")  # name is a label, not full text
+    assert takes[1].get("name") != takes[0].get("name")
+    # keeper's own duration is 3s (12..15), the discarded take's is 2s (10..12)
+    assert takes[0].get("duration") is not None
+    assert takes[1].get("duration") is not None
+
+    # audition children carry no offset/lane of their own (they're alternates,
+    # not independently positioned) — only the audition wrapper is positioned.
+    assert takes[0].get("offset") is None
+    assert audition.get("offset") is not None
+    assert audition.get("lane") == "-1"
+
+
+def test_multiple_retake_groups_produce_multiple_auditions(tmp_path: Path) -> None:
+    from whispersync.models import RetakeGroup, Take
+
+    groups = [
+        RetakeGroup(
+            takes=[Take(1.0, 2.0, "a a a a"), Take(2.0, 3.0, "a a a a a")], keeper_index=-1
+        ),
+        RetakeGroup(
+            takes=[Take(20.0, 21.0, "b b b b"), Take(21.0, 22.0, "b b b b b")], keeper_index=-1
+        ),
+    ]
+    plan, infos = _retake_plan(tmp_path, groups)
+    out = tmp_path / "two_retakes.fcpxml"
+    generate_fcpxml(plan, infos, out)
+    root = ET.parse(out).getroot()
+    auditions = root.findall(".//audition")
+    assert len(auditions) == 2
+
+
+def test_retake_group_at_clip_start_has_no_leading_plain_clip(tmp_path: Path) -> None:
+    from whispersync.models import RetakeGroup, Take
+
+    group = RetakeGroup(
+        takes=[Take(0.0, 1.0, "a a a a"), Take(1.0, 2.5, "a a a a a")], keeper_index=-1
+    )
+    plan, infos = _retake_plan(tmp_path, [group])
+    out = tmp_path / "retake_at_start.fcpxml"
+    generate_fcpxml(plan, infos, out)
+    root = ET.parse(out).getroot()
+    stories = list(root.find(".//asset-clip"))
+    tags = [el.tag for el in stories]
+    assert tags == ["audition", "asset-clip"]  # no zero-length lead-in clip
+
+
+def test_audition_is_valid_per_dtd_anchor_item(tmp_path: Path) -> None:
+    # audition must be nested under the video asset-clip (a valid anchor_item
+    # position), each of its own children must be an asset-clip referencing a
+    # declared asset, and none of them may carry their own offset/lane.
+    from whispersync.models import RetakeGroup, Take
+
+    group = RetakeGroup(
+        takes=[Take(5.0, 6.0, "x x x x"), Take(6.0, 7.5, "x x x x x")], keeper_index=-1
+    )
+    plan, infos = _retake_plan(tmp_path, [group])
+    out = tmp_path / "dtd_check.fcpxml"
+    generate_fcpxml(plan, infos, out)
+    root = ET.parse(out).getroot()
+    asset_ids = {a.get("id") for a in root.findall(".//asset")}
+    audition = root.find(".//audition")
+    assert audition is not None
+    for child in audition:
+        assert child.tag == "asset-clip"
+        assert child.get("ref") in asset_ids
+        assert child.get("offset") is None
+        assert child.get("lane") is None
+        assert child.get("duration") is not None

@@ -212,6 +212,70 @@ def generate_fcpxml(
         if clip.role:
             el.set("videoRole" if clip.kind == "video" else "audioRole", clip.role)
 
+    def _emit_audio_story(parent_el: ET.Element, clip: MediaClip, base_offset: float) -> None:
+        """Emit ``clip``'s local ``[0, clip.duration)`` span as one or more
+        connected story elements under ``parent_el``: a single plain
+        asset-clip when it has no retake groups, or plain asset-clips
+        interleaved with an ``<audition>`` per retake group (the keeper take
+        active/first, the discarded attempts as alternates) when it does.
+        ``base_offset`` is the parent-clock position corresponding to this
+        clip's local time 0 (i.e. where ``clip.in_point`` starts playing).
+        """
+        ref = asset_map.get(str(clip.path.resolve()), "r2")
+
+        def _plain(local_start: float, local_dur: float, name: str | None = None) -> None:
+            el = ET.SubElement(
+                parent_el,
+                "asset-clip",
+                ref=ref,
+                lane=str(clip.lane),
+                name=name or _clip_name(clip),
+                offset=_frame_rational(base_offset + local_start, seq_fps, "round"),
+                start=_frame_rational(clip.in_point + local_start, seq_fps, "round"),
+                duration=_frame_rational(local_dur, seq_fps, "floor"),
+            )
+            _set_role(el, clip)
+
+        groups = clip.retake_groups
+        if not groups:
+            _plain(0.0, clip.duration)
+            return
+
+        cursor = 0.0
+        for gi, g in enumerate(sorted(groups, key=lambda g: g.span[0])):
+            g_start, g_end = g.span
+            g_start = max(cursor, min(g_start, clip.duration))
+            g_end = max(g_start, min(g_end, clip.duration))
+            if g_end - g_start <= 1e-4:
+                continue  # fell entirely outside this clip's span once clamped
+            if g_start > cursor + 1e-4:
+                _plain(cursor, g_start - cursor)
+            audition_el = ET.SubElement(
+                parent_el,
+                "audition",
+                lane=str(clip.lane),
+                offset=_frame_rational(base_offset + g_start, seq_fps, "round"),
+            )
+            keeper_pos = (len(g.takes) + g.keeper_index) % len(g.takes)
+            others = (t for idx, t in enumerate(g.takes) if idx != keeper_pos)
+            ordered = [g.takes[keeper_pos], *others]
+            for take_idx, take in enumerate(ordered):
+                t_start = max(0.0, min(take.start, clip.duration))
+                t_end = max(t_start, min(take.end, clip.duration))
+                label = "Keep" if take_idx == 0 else f"Take {take_idx}"
+                el = ET.SubElement(
+                    audition_el,
+                    "asset-clip",
+                    ref=ref,
+                    name=f"{_clip_name(clip)} — Retake {gi + 1} ({label})",
+                    start=_frame_rational(clip.in_point + t_start, seq_fps, "round"),
+                    duration=_frame_rational(t_end - t_start, seq_fps, "floor"),
+                )
+                _set_role(el, clip)
+            cursor = g_end
+        if cursor < clip.duration - 1e-4:
+            _plain(cursor, clip.duration - cursor)
+
     def _spine_clip(clip: MediaClip, offset_str: str) -> ET.Element:
         el = ET.SubElement(
             spine,
@@ -250,20 +314,11 @@ def generate_fcpxml(
 
     if not spine_elems:
         # No video (audio-only) — fall back to a single gap holding the audio so the
-        # document is still valid.
+        # document is still valid. The gap's own start=0s, so a clip's local time 0
+        # lands at parent-clock position clip.offset directly.
         gap = ET.SubElement(spine, "gap", name="Gap", offset="0s", start="0s", duration=seq_dur)
         for clip in audio_clips:
-            el = ET.SubElement(
-                gap,
-                "asset-clip",
-                ref=asset_map.get(str(clip.path.resolve()), "r2"),
-                lane=str(clip.lane),
-                name=_clip_name(clip),
-                offset=_frame_rational(clip.offset, seq_fps, "round"),
-                start=_frame_rational(clip.in_point, seq_fps, "round"),
-                duration=_frame_rational(clip.duration, seq_fps, "floor"),
-            )
-            _set_role(el, clip)
+            _emit_audio_story(gap, clip, clip.offset)
     else:
         # Attach each audio clip to the spine video clip covering its start.
         for clip in audio_clips:
@@ -282,17 +337,7 @@ def generate_fcpxml(
             # at the parent's `start` value (its in_point), NOT at the parent's spine
             # position. So offset = parent_in_point + rel (was mistakenly the spine
             # offset + rel, which pushed the audio far to the right).
-            el = ET.SubElement(
-                parent_el,
-                "asset-clip",
-                ref=asset_map.get(str(clip.path.resolve()), "r2"),
-                lane=str(clip.lane),
-                name=_clip_name(clip),
-                offset=_frame_rational(parent_in_pt + rel, seq_fps, "round"),
-                start=_frame_rational(clip.in_point, seq_fps, "round"),
-                duration=_frame_rational(clip.duration, seq_fps, "floor"),
-            )
-            _set_role(el, clip)
+            _emit_audio_story(parent_el, clip, parent_in_pt + rel)
 
     tree = ET.ElementTree(root)
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -241,6 +241,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "voice clip, and ambience if enabled, mixed at their timeline offsets) "
         "next to the FCPXML, for users without an NLE",
     )
+    parser.add_argument(
+        "--detect-retakes",
+        dest="detect_retakes",
+        action="store_true",
+        default=None,
+        help="Find lines the speaker re-recorded back-to-back (flub, stop, "
+        "restart) and export each set of attempts as a Final Cut audition "
+        "(press Q in Final Cut to browse takes), instead of leaving every "
+        "attempt on the timeline. Off by default; a non-destructive heuristic "
+        "— review the auditions before cutting anything.",
+    )
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     return parser
@@ -460,6 +471,8 @@ def main() -> None:
         overrides["render_master_wav"] = args.render_master_wav
     if args.voice_segment_minutes is not None:
         overrides["voice_segment_minutes"] = args.voice_segment_minutes
+    if args.detect_retakes is not None:
+        overrides["detect_retakes"] = args.detect_retakes
 
     if args.no_cache:
         overrides["use_cache"] = False
