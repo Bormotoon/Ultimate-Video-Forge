@@ -4,6 +4,15 @@ All notable changes to WhisperSync will be documented in this file.
 
 ## [Unreleased]
 
+### Added — Voice Enhancement (`--voice-enhance`)
+
+A listening test compared 6 third-party speech-enhancement variants of the rendered voice monolith. Rather than pick one winner, the new opt-in `voice_enhance` config field (`off` by default) exposes all of them as a per-project choice, wired into the pipeline as a stage that runs right after rendering and **before** self-check (so self-check validates whatever audio the user actually gets):
+
+- **`denoise`** / **`denoise_dereverb`** — Mel-Roformer denoise, optionally chained with a De-Reverb pass. Reuses the existing `.sep-venv`/audio-separator stack (same environment as `--ambience-track`); fast, no new dependencies. Implemented in the new `engine/enhance.py`, sharing `engine/separation.py`'s batching/output-matching logic (generalized from a hard-coded "Instrumental" stem to an arbitrary `stem` parameter via the new `run_separator_batch`).
+- **`resemble`**, **`sgmse_denoise`**/**`sgmse_dereverb`**, **`reuse`** — surfaced in config/CLI/GUI/docs as selectable modes, but not yet backed by a working engine; selecting one raises a clear "not available yet in this build" error rather than silently no-opping. Two real gaps found while researching the integration, left open: Resemble Enhance needed undocumented upstream compatibility patches (only 1 of a referenced set could be located); NVIDIA RE-USE's model is NSCLv1 (noncommercial-only) and its inference code is all-rights-reserved, so it can only ever be orchestrated against a user-built Docker image and a user-supplied clone of NVIDIA's own source — never vendored into this repo.
+- Every backend's output is conformed back to the exact duration/sample-rate/channel-count of the pre-enhancement audio (new `timestretch.conform_wav_to`) before it replaces the monolith — a third-party tool's own native rate, a mono-only model, or a few samples of resampling drift would otherwise desync the timeline. A missing environment or a backend failure is reported as a warning and the unenhanced monolith is kept, the same non-fatal pattern as `ambience_track` on a missing `.sep-venv`.
+- CLI: `--voice-enhance {off,denoise,denoise_dereverb,resemble,sgmse_denoise,sgmse_dereverb,reuse}`, `--reuse-source-dir`. GUI: a "Voice enhancement" dropdown next to the Self-check one. `system_check.py` reports which backends' environments are set up. Full pros/cons documented in the GUI Help tab and in the README's new "Voice Enhancement" section.
+
 ### Fixed/Changed — self-check hardening after a real-footage QA run
 
 A full review + field run (6.9-min DJI clip against the 93-min recorder,

@@ -33,6 +33,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - [Sync Strategies Guide](#sync-strategies-guide)
 - [Retake Detection](#retake-detection)
 - [Self-Check](#self-check)
+- [Voice Enhancement](#voice-enhancement)
 - [Configuration](#configuration)
 - [Output Files](#output-files)
 - [Verifying the Result](#verifying-the-result)
@@ -86,6 +87,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **Re-run with Selected Strategy** — after a run, switch the strategy radio and re-run; transcripts are cached, so it skips straight to alignment/render.
 - **Detect retakes checkbox** — finds re-recorded lines and exports them as Final Cut auditions (see [Retake Detection](#retake-detection)); off by default.
 - **Self-check dropdown (Off / Warn only / Warn + auto-repair)** — re-transcribes each rendered clip and flags content/timing spans that diverge from the camera's own transcript beyond normal Whisper jitter; the repair option additionally re-aligns and re-renders each flagged span. Off by default (one extra Whisper pass per clip; two if any span needs repair).
+- **Voice enhancement dropdown** — optionally cleans up the rendered voice (denoise / denoise+de-reverb / Resemble Enhance / SGMSE+ diffusion / RE-USE) before self-check validates it; pros/cons of each are in the Help tab. Off by default.
 - **Weighted overall progress** — one continuous progress bar across all stages (no per-stage resets), plus explicit "Loading Whisper model…" status during a first-time model download.
 - **Pipeline warnings surfaced in the log** — unaligned clips, high residual, strategy advice, validation problems.
 - **Responsive cancellation** — cancel takes effect mid-clip, even during a large multi-core render.
@@ -98,7 +100,8 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **`--dry-run`** — scan + transcribe + align only, prints the alignment summary without touching audio.
 - **`--verify`** — after rendering, measures the *realized* lip-sync lag per clip via GCC-PHAT and prints a median/p90/max summary (also available standalone as `tools/verify_sync.py`).
 - **`--self-check warn|repair`** — after rendering, re-transcribes each clip's voice monolith and compares it against the camera clip's own transcript, flagging content/timing spans `--verify`'s acoustic measurement can't see; `repair` also re-aligns and re-renders each flagged span (see [Self-Check](#self-check)).
-- **Environment self-check** — `python -m whispersync.engine.system_check` validates ffmpeg, CUDA (through the same ctranslate2 path the engine uses), dependencies, and disk space; writes `report.json`.
+- **`--voice-enhance`** — optionally clean up the rendered voice (denoise/de-reverb/generative/diffusion models) before self-check validates it; six variants to choose from (see [Voice Enhancement](#voice-enhancement)).
+- **Environment self-check** — `python -m whispersync.engine.system_check` validates ffmpeg, CUDA (through the same ctranslate2 path the engine uses), dependencies, disk space, and which voice-enhancement/ambience environments are set up; writes `report.json`.
 
 ### Performance & reliability
 
@@ -233,6 +236,10 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav \
 # Post-render lip-sync self-check + a single master WAV for editors without an NLE
 python main.py --cli --video-dir ./videos --audio-file rec.wav \
   --verify --render-master-wav
+
+# Denoise the synced voice before self-check validates it
+python main.py --cli --video-dir ./videos --audio-file rec.wav \
+  --voice-enhance denoise --self-check warn
 ```
 
 #### CLI options
@@ -266,6 +273,8 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav \
 | `--render-master-wav` | flag | Also render one WAV spanning the whole timeline (voice + ambience mixed at their offsets over silence) next to the FCPXML (default off) |
 | `--detect-retakes` | flag | Find re-recorded lines and export them as Final Cut auditions instead of leaving every attempt on the timeline (default off) |
 | `--self-check {warn,repair}` | str | Re-transcribe each rendered clip and flag content/timing spans against the camera's own transcript; `repair` also re-aligns and re-renders each flagged span (default off; one extra Whisper pass per clip, two if a span needs repair) |
+| `--voice-enhance {denoise,denoise_dereverb,resemble,sgmse_denoise,sgmse_dereverb,reuse}` | str | Run a third-party model over the rendered voice monolith before self-check (default off) — see [Voice Enhancement](#voice-enhancement) |
+| `--reuse-source-dir` | Path | Directory with NVIDIA's own RE-USE inference source (see [Voice Enhancement](#voice-enhancement)); only used with `--voice-enhance reuse` |
 | `--save-transcripts` / `--no-save-transcripts` | flag | Save full transcripts (JSON+SRT) to `output/transcripts/` (default on) |
 | `--config` | Path | JSON config file (a missing path is an error, not a silent fallback) |
 | `--no-cache` | flag | Disable the transcription cache |
@@ -353,6 +362,27 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav --self-check repa
 >
 > **Cost.** This is an extra full Whisper pass per rendered clip (a second pass if any span needed a repair attempt, to verify the fix). The main transcription engine is still unloaded before rendering as usual (rendering is pure ffmpeg); self-check then loads its own engine — one model reload, never two copies of the model in VRAM at once.
 
+## Voice Enhancement
+
+`--voice-enhance` (off by default) runs a third-party model over each rendered voice monolith right after rendering and **before** self-check, so self-check validates whatever audio you actually get. Six variants were compared in a listening test; there's no single best default — the right choice depends on your material and how much time you can spend rendering:
+
+| Mode | What it does | Speed | Notes |
+|------|---------------|-------|-------|
+| `denoise` | Mel-Roformer noise removal | Fast | Same `.sep-venv` stack as the ambience track. Safest choice — barely touches the voice's own timbre. |
+| `denoise_dereverb` | + a second pass stripping room reflections | Fast | Can thin out consonant tails or room warmth on some material — A/B listen before committing to a project. |
+| `resemble` | Resemble Enhance (generative) | Fast | Can produce a studio-like timbre, at the risk of subtle generative artifacts on hard passages. **Experimental** — some upstream compatibility patches aren't fully documented yet. |
+| `sgmse_denoise` / `sgmse_dereverb` | SGMSE+ diffusion denoise/de-reverb | **~5× slower than realtime** | The cleanest result of the six, but only realistic for short clips — needs a separate `.enh-venv`. |
+| `reuse` | NVIDIA RE-USE (denoise+dereverb+declip in one pass) | Fast | The strongest single-pass result, but its weights are **NSCLv1 (noncommercial-only)** and it runs via Docker with NVIDIA's own inference code, which you must supply yourself under their license — this project cannot redistribute it. Set `--reuse-source-dir` to where you cloned it. |
+
+```bash
+python main.py --cli --video-dir ./videos --audio-file rec.wav --voice-enhance denoise
+python main.py --cli --video-dir ./videos --audio-file rec.wav --voice-enhance denoise_dereverb
+```
+
+> **Environments.** `denoise`/`denoise_dereverb` reuse the `.sep-venv` environment already used by `--ambience-track` (see `setup_sep_venv.sh`) — nothing extra to install if you already have ambience working. The other four modes need environments this repo doesn't bundle (a separate venv for the diffusion models, a Docker image plus NVIDIA's own source for RE-USE) — `whispersync-cli` (or `system_check.py`) reports which environments are set up. A mode whose environment isn't ready is skipped with a warning at the end of the run; your unenhanced audio is kept, never a failed run.
+>
+> **Sync safety.** Every backend's output is conformed (resampled/padded/trimmed) back to the exact duration, sample rate, and channel count of the original rendered monolith before it replaces it — the property was verified sample-exact across all six variants during the original listening test, and the conform step makes it structural rather than coincidental.
+
 ## Configuration
 
 WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flags > JSON config > defaults.** An unknown key logs a warning (so typos don't silently do nothing), and a missing `--config` path is a hard error.
@@ -408,7 +438,9 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
     "self_check_transcribe_mode": "fast",
     "self_check_min_run_words": 5,
     "self_check_shift_threshold_s": 0.35,
-    "self_check_min_content_words": 5
+    "self_check_min_content_words": 5,
+    "voice_enhance": "off",
+    "reuse_source_dir": null
 }
 ```
 
@@ -438,6 +470,8 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
 | `self_check_mode` | str | `off` / `warn` / `repair` — re-transcribe each rendered clip and flag (or additionally repair) content/timing spans vs. the camera transcript (default `off`) |
 | `self_check_transcribe_mode` | str | `fast`/`quality` Whisper mode for the self-check pass, independent of `transcribe_mode` (default `fast`) |
 | `self_check_shift_threshold_s` | float | Min-over-edges per-word timing delta (s) above which a run is flagged `shifted` (default 0.35, field-calibrated) |
+| `voice_enhance` | str | `off` / `denoise` / `denoise_dereverb` / `resemble` / `sgmse_denoise` / `sgmse_dereverb` / `reuse` — third-party model run over the rendered voice before self-check (default `off`) — see [Voice Enhancement](#voice-enhancement) |
+| `reuse_source_dir` | str/null | Directory with NVIDIA's own RE-USE inference source, for `voice_enhance: reuse` only |
 
 ## Output Files
 

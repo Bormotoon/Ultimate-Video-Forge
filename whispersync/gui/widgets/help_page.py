@@ -142,6 +142,37 @@ class HelpPage(QWidget):
             "</ul>"
         )
 
+        self._heading("Voice enhancement")
+        self._para(
+            "After rendering, an optional third-party model can clean up the synced "
+            "voice before self-check checks it. Six variants were compared in a "
+            "listening test — pick per project, there's no single best default:"
+            "<ul>"
+            "<li><b>Denoise</b> — Mel-Roformer noise removal via the same "
+            "<code>.sep-venv</code> stack as the ambience track. Fast, the safest "
+            "choice, barely touches the voice's own timbre.</li>"
+            "<li><b>Denoise + De-reverb</b> — adds a second pass that strips room "
+            "reflections. Still fast, but can thin out consonant tails or room "
+            "warmth on some material — worth an A/B listen before committing.</li>"
+            "<li><b>Resemble Enhance</b> — a generative model that can produce a "
+            "studio-like timbre, at the risk of subtle generative artifacts on hard "
+            "passages. <i>Experimental</i>: some of its upstream compatibility "
+            "patches aren't fully documented yet.</li>"
+            "<li><b>SGMSE+ Denoise / De-reverb</b> — diffusion models that produce "
+            "the cleanest result of the six, but run roughly <b>5&times; slower "
+            "than realtime</b> — realistic only for short clips, not a multi-hour "
+            "recorder.</li>"
+            "<li><b>RE-USE</b> — NVIDIA's all-in-one denoise+dereverb+declip model. "
+            "Fast and the strongest single-pass result, but its weights are "
+            "licensed <b>noncommercial-only (NSCLv1)</b> and it runs via Docker "
+            "with NVIDIA's own inference code, which you supply yourself under "
+            "their license (this project can't redistribute it).</li>"
+            "</ul>"
+            "Off by default. A mode whose environment isn't set up yet on your "
+            "machine is skipped with a warning at the end of the run — your "
+            "unenhanced audio is always kept, never a failed run."
+        )
+
         self._heading("Tips")
         self._para(
             "<ul>"
