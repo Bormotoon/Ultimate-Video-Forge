@@ -44,9 +44,11 @@ def is_available(repo_root: Path) -> bool:
     return separator_cli(repo_root) is not None
 
 
-def _expected_output(out_dir: Path, input_path: Path, model_filename: str) -> Path:
+def _expected_output(
+    out_dir: Path, input_path: Path, model_filename: str, stem: str = _STEM
+) -> Path:
     model_stem = Path(model_filename).stem
-    return out_dir / f"{input_path.stem}_({_STEM})_{model_stem}.wav"
+    return out_dir / f"{input_path.stem}_({stem})_{model_stem}.wav"
 
 
 def _normalized_base(name: str) -> str:
@@ -62,19 +64,21 @@ def _normalized_base(name: str) -> str:
     return name.rstrip("_-. ").lower()
 
 
-def _find_output(out_dir: Path, input_path: Path, model_filename: str) -> Path | None:
-    """The separator's instrumental output for ``input_path``, or None.
+def _find_output(
+    out_dir: Path, input_path: Path, model_filename: str, stem: str = _STEM
+) -> Path | None:
+    """The separator's ``stem`` output for ``input_path``, or None.
 
     Tries the exact predicted name first, then falls back to scanning the
-    output dir for a WAV whose part before "(<Stem>)" normalizes to the same
+    output dir for a WAV whose part before "(<stem>)" normalizes to the same
     base as the input — exact normalized equality, so one input's stem being
     a prefix of another's can't cross-match. Multiple survivors (e.g. stale
     files from a previous run) resolve to the newest by mtime.
     """
-    exact = _expected_output(out_dir, input_path, model_filename)
+    exact = _expected_output(out_dir, input_path, model_filename, stem)
     if exact.exists():
         return exact
-    marker = f"({_STEM})"
+    marker = f"({stem})"
     want = _normalized_base(input_path.stem)
     candidates = [
         f
@@ -126,18 +130,55 @@ def extract_ambience_batch(
     catch the RuntimeError and fall back to the single-file
     ``extract_ambience`` for the remaining files. See PROJECT_ANALYSIS.md §6.3.
     """
-    if not camera_audios:
+    return run_separator_batch(
+        camera_audios,
+        out_dir,
+        repo_root,
+        model_filename,
+        _STEM,
+        model_dir=model_dir,
+        timeout=timeout,
+        error_label="Ambience separation",
+        unavailable_message=(
+            "Ambience separation needs the '.sep-venv' environment "
+            "(audio-separator). It is not set up — run setup_sep_venv.sh."
+        ),
+    )
+
+
+def run_separator_batch(
+    inputs: list[Path],
+    out_dir: Path,
+    repo_root: Path,
+    model_filename: str,
+    stem: str,
+    model_dir: Path | None = None,
+    timeout: int = 3600,
+    error_label: str = "Separation",
+    unavailable_message: str | None = None,
+) -> dict[Path, Path]:
+    """Run ``audio-separator`` once over ``inputs`` for a given model/stem and
+    return a ``{input_path: output_wav_path}`` map. Shared by ambience
+    extraction (``stem="Instrumental"``) and voice-enhancement denoise/dereverb
+    (``stem="dry"``/``"noreverb"``) — same CLI, same batching rationale, only
+    the model and the kept stem differ. See ``extract_ambience_batch`` for why
+    the whole batch goes through one process (model load amortized once).
+    """
+    if not inputs:
         return {}
     cli = separator_cli(repo_root)
     if cli is None:
         raise RuntimeError(
-            "Ambience separation needs the '.sep-venv' environment "
-            "(audio-separator). It is not set up — run setup_sep_venv.sh."
+            unavailable_message
+            or (
+                "Separation needs the '.sep-venv' environment (audio-separator). "
+                "It is not set up — run setup_sep_venv.sh."
+            )
         )
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(cli),
-        *(str(p) for p in camera_audios),
+        *(str(p) for p in inputs),
         "--model_filename",
         model_filename,
         "--output_dir",
@@ -145,7 +186,7 @@ def extract_ambience_batch(
         "--output_format",
         "WAV",
         "--single_stem",
-        _STEM,
+        stem,
         "--log_level",
         "warning",
     ]
@@ -153,22 +194,26 @@ def extract_ambience_batch(
         cmd += ["--model_file_dir", str(model_dir)]
 
     logger.info(
-        "Extracting ambience (%s) from %d clip(s) in one batch", model_filename, len(camera_audios)
+        "%s (%s, stem=%s) on %d file(s) in one batch",
+        error_label,
+        model_filename,
+        stem,
+        len(inputs),
     )
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(
-            f"Ambience separation failed (exit {result.returncode}): "
+            f"{error_label} failed (exit {result.returncode}): "
             f"{result.stderr[-600:] or result.stdout[-600:]}"
         )
 
     outputs: dict[Path, Path] = {}
-    for camera_audio in camera_audios:
-        produced = _find_output(out_dir, camera_audio, model_filename)
+    for input_path in inputs:
+        produced = _find_output(out_dir, input_path, model_filename, stem)
         if produced is None:
             raise RuntimeError(
-                f"Separator reported success but no instrumental output was found "
-                f"in {out_dir} for {camera_audio.name}."
+                f"Separator reported success but no '{stem}' output was found "
+                f"in {out_dir} for {input_path.name}."
             )
-        outputs[camera_audio] = produced
+        outputs[input_path] = produced
     return outputs
