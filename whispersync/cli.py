@@ -11,6 +11,7 @@ from typing import Any
 
 from whispersync import __version__
 from whispersync.config import WhisperSyncConfig, load_config
+from whispersync.engine import enhance
 from whispersync.engine.pipeline import PipelineProgress, run_pipeline
 from whispersync.logging_setup import setup_logging
 
@@ -267,6 +268,29 @@ def _build_parser() -> argparse.ArgumentParser:
         "re-check it once more); costs one extra Whisper pass per rendered "
         "clip (two if any span needs a repair attempt). Off by default.",
     )
+    parser.add_argument(
+        "--voice-enhance",
+        dest="voice_enhance",
+        choices=list(enhance.MODES),
+        default=None,
+        help="Run a third-party model over the rendered voice monolith before "
+        "self-check. 'denoise'/'denoise_dereverb' reuse the .sep-venv stack "
+        "(fast, safe). 'resemble' is experimental (undocumented upstream "
+        "patches). 'sgmse_denoise'/'sgmse_dereverb' are diffusion-based — "
+        "~5x slower than realtime, needs a separate '.enh-venv'. 'reuse' "
+        "needs Docker and NVIDIA's own RE-USE source under their license; "
+        "its model is NSCLv1 (noncommercial-only). Off by default; a mode "
+        "whose environment isn't set up is skipped with a warning.",
+    )
+    parser.add_argument(
+        "--reuse-source-dir",
+        dest="reuse_source_dir",
+        type=Path,
+        default=None,
+        help="Directory containing NVIDIA's own RE-USE inference source "
+        "(git-cloned by you under NVIDIA's license), mounted into the "
+        "Docker container for --voice-enhance reuse.",
+    )
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     return parser
@@ -490,6 +514,10 @@ def main() -> None:
         overrides["detect_retakes"] = args.detect_retakes
     if args.self_check_mode is not None:
         overrides["self_check_mode"] = args.self_check_mode
+    if args.voice_enhance is not None:
+        overrides["voice_enhance"] = args.voice_enhance
+    if args.reuse_source_dir is not None:
+        overrides["reuse_source_dir"] = str(args.reuse_source_dir)
 
     if args.no_cache:
         overrides["use_cache"] = False

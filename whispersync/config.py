@@ -224,6 +224,40 @@ class WhisperSyncConfig:
     # environment; silently skipped (with a warning) when it isn't set up.
     ambience_track: bool = True
     ambience_model: str = AMBIENCE_MODEL
+    # Voice enhancement (off by default): run a third-party model over the
+    # rendered voice monolith before self-check, on its own lane's worth of
+    # audio (not the ambience track — that stays untouched). Six variants were
+    # compared in a listening test; each trades speed/quality/license
+    # differently, so the user picks per project instead of a single default:
+    #   "off"              — no enhancement (default).
+    #   "denoise"          — Mel-Roformer denoise via .sep-venv. Fast, safest;
+    #                        same stack as ambience_track.
+    #   "denoise_dereverb" — + a second .sep-venv pass (De-Reverb model).
+    #                        Fast; can thin out room tone/consonant tails —
+    #                        listen before committing to a project.
+    #   "resemble"         — Resemble Enhance (generative, studio-like
+    #                        timbre). Needs resemble-enhance installed into
+    #                        .sep-venv; EXPERIMENTAL — some upstream compat
+    #                        patches are undocumented, may need re-patching.
+    #   "sgmse_denoise"    — SGMSE+ diffusion denoise (separate ".enh-venv").
+    #                        Cleanest result, but ~5x slower than realtime —
+    #                        impractical for anything but short clips.
+    #   "sgmse_dereverb"   — SGMSE+ diffusion de-reverb, same venv/cost.
+    #   "reuse"            — NVIDIA RE-USE/SEMamba via Docker. Fast, handles
+    #                        noise+reverb+clipping in one pass, but the model
+    #                        is NSCLv1 (noncommercial-only) and its inference
+    #                        code is NVIDIA all-rights-reserved — cannot be
+    #                        redistributed; the repo only ships the generic
+    #                        Docker environment, you supply NVIDIA's own
+    #                        RE-USE source under their license (see README).
+    # Any mode whose environment isn't set up is skipped with a warning,
+    # keeping the unenhanced audio — never a hard failure. See engine/enhance.py.
+    voice_enhance: str = "off"
+    # Directory containing NVIDIA's own RE-USE inference code (git-cloned by
+    # the user under NVIDIA's license — never shipped by this repo), mounted
+    # into the "reuse-se:blackwell" Docker container at run time. Only used
+    # when voice_enhance == "reuse".
+    reuse_source_dir: str | None = None
     # Retake detection (off by default): find lines the speaker re-recorded
     # back-to-back in an unedited monologue (flub → stop → say it again) and
     # export each set of attempts as a Final Cut *audition* — the alternatives

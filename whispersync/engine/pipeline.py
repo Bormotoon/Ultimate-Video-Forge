@@ -1796,6 +1796,38 @@ def run_pipeline(
             if pool is not None:
                 pool.shutdown(wait=True)
 
+        # --- optional voice enhancement: run a third-party model over each
+        # rendered voice monolith BEFORE self-check, so self-check validates
+        # whatever audio the user actually gets. Batched across every clip in
+        # one call per backend (same reasoning as the ambience separator
+        # below — one model load, not one per clip). A missing environment or
+        # a backend failure is reported as a warning and the unenhanced
+        # monolith is kept, never a hard failure — see engine/enhance.py. ---
+        if config.voice_enhance != "off" and audio_clips:
+            _notify("processing", 1.0, f"Enhancing voice ({config.voice_enhance})...")
+            from whispersync.engine import enhance
+
+            repo_root = Path(__file__).resolve().parents[2]
+            enhance_dir = output_path.parent / "enhance_tmp"
+            try:
+                enhanced = enhance.run_batch(
+                    config.voice_enhance,
+                    [aclip.path for aclip in audio_clips],
+                    enhance_dir,
+                    repo_root,
+                )
+                for aclip in audio_clips:
+                    out_path = enhanced.get(aclip.path)
+                    if out_path is not None:
+                        os.replace(out_path, aclip.path)
+            except (RuntimeError, OSError) as e:
+                warnings.append(
+                    f"Voice enhancement ({config.voice_enhance}) failed ({e}) — "
+                    "using unenhanced audio."
+                )
+            finally:
+                shutil.rmtree(enhance_dir, ignore_errors=True)
+
         # --- optional self-check: re-transcribe each rendered voice monolith
         # and compare it against the camera clip's own transcript, to catch
         # CONTENT defects (--verify's acoustic lag measurement can't see a
