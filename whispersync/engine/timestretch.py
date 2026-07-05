@@ -274,6 +274,52 @@ def extract_segment(
     return output_path
 
 
+def conform_wav_to(
+    input_path: Path,
+    output_path: Path,
+    duration: float,
+    sample_rate: int,
+    channels: int,
+    codec: str,
+) -> Path:
+    """Conform an externally-produced WAV to an exact duration/rate/channels/codec.
+
+    Used for third-party voice-enhancement tools (``engine/enhance.py``): their
+    output may differ slightly in sample rate, channel count, or sample count
+    from what the pipeline rendered (a model's own native rate, a mono-only
+    model, a few samples of resampling drift). Unlike ``resample_conform_segment``
+    (which tempo-conforms a *source* piece by a known factor) or ``extract_segment``
+    (which cuts a window from a source), this normalizes an *already-produced*
+    output back to the pipeline's own format so the splice-in is transparent —
+    ``apad``+``atrim`` guarantee the exact sample count regardless of the input's
+    own length.
+    """
+    af = f"aresample={sample_rate}:resampler=soxr,apad,atrim=0:{duration:.6f},asetpts=PTS-STARTPTS"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-af",
+        af,
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        str(channels),
+        "-acodec",
+        codec,
+        str(output_path),
+    ]
+    logger.info("Running: %s", " ".join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0 and ":resampler=soxr" in af:
+        cmd[cmd.index("-af") + 1] = af.replace(":resampler=soxr", "")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg conform-to failed: {result.stderr}")
+    return output_path
+
+
 def render_piece(
     input_path: Path,
     output_dir: Path,

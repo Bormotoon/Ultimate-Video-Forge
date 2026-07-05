@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from whispersync.engine.media import build_atempo_chain
+import shutil
+import subprocess
+
+import pytest
+
+from whispersync.engine.media import build_atempo_chain, probe
 from whispersync.engine.timestretch import (
     RESAMPLE_CONFORM_MAX_DEVIATION,
+    conform_wav_to,
     duck_filter_chain,
     edge_fade_filters,
     seam_fade_filters,
@@ -216,3 +222,39 @@ def test_atempo_segment_filter_locks_exact_length() -> None:
         "apply_atempo_segment must pad+trim each piece to an exact length so "
         "concatenated pieces do not accumulate atempo rounding drift"
     )
+
+
+# --- conform_wav_to ------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+def test_conform_wav_to_normalizes_rate_channels_duration(tmp_path) -> None:
+    # Simulate a third-party enhancer's output: mono, a different sample rate,
+    # and a slightly different duration than what the pipeline expects back.
+    odd = tmp_path / "enhancer_output.wav"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=220:duration=2.03",
+            "-ar",
+            "44100",
+            "-ac",
+            "1",
+            str(odd),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    out = tmp_path / "conformed.wav"
+    conform_wav_to(odd, out, duration=2.0, sample_rate=48000, channels=2, codec="pcm_s24le")
+
+    info = probe(out)
+    assert info.audio_sample_rate == 48000
+    assert info.audio_channels == 2
+    assert abs(info.duration - 2.0) < 0.01
