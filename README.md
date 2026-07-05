@@ -74,7 +74,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **`--render-master-wav`** — additionally mixes every synced voice clip (and the ambience track, if enabled) at its timeline offset onto one silence-padded WAV spanning the whole timeline, for people without an NLE.
 - **Ambience track (optional)** — an AI source-separation model strips the camera's own (echoey, slightly off-sync) voice while keeping the room tone, on its own lane next to the clean voice; runs in an isolated `.sep-venv` environment, batch-processed with a single model load.
 - **Retake detection (optional, `--detect-retakes`)** — finds lines the speaker re-recorded back-to-back in an unedited take (flub, stop, restart) and exports each set of attempts as a Final Cut *audition* (press <kbd>Q</kbd> in Final Cut to browse takes) instead of leaving every flubbed attempt on the timeline. A transcript-based heuristic, fully non-destructive — nothing is ever cut, you review the auditions and pick.
-- **Self-check (optional, `--self-check`)** — after rendering, re-transcribes each clip's voice monolith and compares it word-for-word against the camera clip's own transcript, flagging spans where content or timing diverge beyond normal cross-run Whisper jitter. Catches defects `--verify`'s acoustic lag measurement can't see (a dropped/duplicated word, a piece built from the wrong recorder span). Detect-only — findings become warnings for you to check in the NLE; nothing is re-rendered automatically. Costs one extra Whisper pass per clip.
+- **Self-check (optional, `--self-check warn|repair`)** — after rendering, re-transcribes each clip's voice monolith and compares it word-for-word against the camera clip's own transcript, flagging spans where content or timing diverge beyond normal cross-run Whisper jitter. Catches defects `--verify`'s acoustic lag measurement can't see (a dropped/duplicated word, a piece built from the wrong recorder span). `warn` just reports findings; `repair` additionally re-aligns and re-renders each flagged span's own small stretch of audio, then re-checks it once more. Costs one extra Whisper pass per clip (two if any span needs a repair attempt).
 - **Transcript export** — full transcripts of every recorder and camera clip saved as JSON + SRT next to the output (word-level timestamps included).
 
 ### GUI
@@ -85,7 +85,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **Transcription Settings dialog** — model, language, device, compute type, transcribe mode (fast/quality), and initial prompt without touching a config file.
 - **Re-run with Selected Strategy** — after a run, switch the strategy radio and re-run; transcripts are cached, so it skips straight to alignment/render.
 - **Detect retakes checkbox** — finds re-recorded lines and exports them as Final Cut auditions (see [Retake Detection](#retake-detection)); off by default.
-- **Self-check checkbox** — re-transcribes each rendered clip and flags content/timing spans that diverge from the camera's own transcript beyond normal Whisper jitter; off by default (one extra Whisper pass per clip).
+- **Self-check dropdown (Off / Warn only / Warn + auto-repair)** — re-transcribes each rendered clip and flags content/timing spans that diverge from the camera's own transcript beyond normal Whisper jitter; the repair option additionally re-aligns and re-renders each flagged span. Off by default (one extra Whisper pass per clip; two if any span needs repair).
 - **Weighted overall progress** — one continuous progress bar across all stages (no per-stage resets), plus explicit "Loading Whisper model…" status during a first-time model download.
 - **Pipeline warnings surfaced in the log** — unaligned clips, high residual, strategy advice, validation problems.
 - **Responsive cancellation** — cancel takes effect mid-clip, even during a large multi-core render.
@@ -97,7 +97,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **Meaningful exit codes** — `0` success, `1` run failure, `2` usage/config error.
 - **`--dry-run`** — scan + transcribe + align only, prints the alignment summary without touching audio.
 - **`--verify`** — after rendering, measures the *realized* lip-sync lag per clip via GCC-PHAT and prints a median/p90/max summary (also available standalone as `tools/verify_sync.py`).
-- **`--self-check`** — after rendering, re-transcribes each clip's voice monolith and compares it against the camera clip's own transcript, flagging content/timing spans `--verify`'s acoustic measurement can't see (see [Self-Check](#self-check)).
+- **`--self-check warn|repair`** — after rendering, re-transcribes each clip's voice monolith and compares it against the camera clip's own transcript, flagging content/timing spans `--verify`'s acoustic measurement can't see; `repair` also re-aligns and re-renders each flagged span (see [Self-Check](#self-check)).
 - **Environment self-check** — `python -m whispersync.engine.system_check` validates ffmpeg, CUDA (through the same ctranslate2 path the engine uses), dependencies, and disk space; writes `report.json`.
 
 ### Performance & reliability
@@ -265,7 +265,7 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav \
 | `--voice-segment-minutes` | int | Split each rendered voice WAV into ~N-minute segments, cut at the quietest point near each boundary (`0` = one continuous file per clip, default). Lets the NLE's own audio sync re-align every few minutes. Typical: `1`/`2`/`3`/`5`/`10` |
 | `--render-master-wav` | flag | Also render one WAV spanning the whole timeline (voice + ambience mixed at their offsets over silence) next to the FCPXML (default off) |
 | `--detect-retakes` | flag | Find re-recorded lines and export them as Final Cut auditions instead of leaving every attempt on the timeline (default off) |
-| `--self-check` | flag | Re-transcribe each rendered clip and flag content/timing spans against the camera's own transcript (default off; one extra Whisper pass per clip) |
+| `--self-check {warn,repair}` | str | Re-transcribe each rendered clip and flag content/timing spans against the camera's own transcript; `repair` also re-aligns and re-renders each flagged span (default off; one extra Whisper pass per clip, two if a span needs repair) |
 | `--save-transcripts` / `--no-save-transcripts` | flag | Save full transcripts (JSON+SRT) to `output/transcripts/` (default on) |
 | `--config` | Path | JSON config file (a missing path is an error, not a silent fallback) |
 | `--no-cache` | flag | Disable the transcription cache |
@@ -337,17 +337,21 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav --detect-retakes
 
 ## Self-Check
 
-`--verify` measures the *realized* lip-sync lag via acoustic cross-correlation — but it's blind to CONTENT defects: a dropped word, a duplicated phrase, or a piece rendered from the wrong recorder span can still show a small lag if enough of the surrounding audio still lines up. `--self-check` (off by default) closes that gap: after a clip's voice monolith is rendered, it re-transcribes that rendered audio with Whisper and compares it word-for-word against the camera clip's own transcript (already computed during alignment). Spans where the two disagree — either a timing drift beyond normal cross-run Whisper jitter, or words that simply don't match — are reported as warnings.
+`--verify` measures the *realized* lip-sync lag via acoustic cross-correlation — but it's blind to CONTENT defects: a dropped word, a duplicated phrase, or a piece rendered from the wrong recorder span can still show a small lag if enough of the surrounding audio still lines up. `--self-check` (off by default) closes that gap: after a clip's voice monolith is rendered, it re-transcribes that rendered audio with Whisper and compares it word-for-word against the camera clip's own transcript (already computed during alignment). Spans where the two disagree — either a timing drift beyond normal cross-run Whisper jitter, or words that simply don't match — are reported. Two modes build on the same detection:
+
+- **`warn`** — just reports flagged spans for you to check in the NLE. Nothing is re-rendered.
+- **`repair`** — additionally re-aligns each flagged span's own small stretch of recorder audio and re-renders only the piece(s) covering it, then re-checks the result once more before accepting the fix. A span that can't be confidently re-aligned (or still doesn't match after the attempt) is reported exactly like a `warn`-mode finding instead of risking a worse edit — the rest of the clip is never touched.
 
 ```bash
-python main.py --cli --video-dir ./videos --audio-file rec.wav --self-check
+python main.py --cli --video-dir ./videos --audio-file rec.wav --self-check warn
+python main.py --cli --video-dir ./videos --audio-file rec.wav --self-check repair
 ```
 
-> **How it works.** The rendered voice WAV is transcribed fresh (`self_check_transcribe_mode`, default `fast`) and matched against the camera transcript at the token level via the same normalize+difflib approach used for anchor matching. A run of `self_check_min_run_words` (default 3) or more consecutive matched words whose median timing delta exceeds `self_check_shift_threshold_s` (default 0.25s) is flagged `shifted`; a run of `self_check_min_content_words` (default 3) or more words with no counterpart at all on the other side is flagged `content`.
+> **How it works (detection).** The rendered voice WAV is transcribed fresh (`self_check_transcribe_mode`, default `fast`) and matched against the camera transcript at the token level via the same normalize+difflib approach used for anchor matching. A run of `self_check_min_run_words` (default 3) or more consecutive matched words whose median timing delta exceeds `self_check_shift_threshold_s` (default 0.25s) is flagged `shifted`; a run of `self_check_min_content_words` (default 3) or more words with no counterpart at all on the other side is flagged `content`.
 >
-> **Detect-only.** v1 reports findings as warnings — nothing is automatically re-rendered. Review a flagged span in your NLE before deciding whether it needs a fix; a short 1-2 word disagreement is routine cross-run Whisper noise and is filtered out by design.
+> **How it works (repair).** An ffmpeg render is deterministic — re-rendering the exact same recorder span verbatim would reproduce a content defect byte-for-byte, so the only thing that fixes either a `shifted` or a `content` span is re-deriving where in the recorder this stretch of speech actually comes from. `repair` re-aligns just that neighbourhood: first a transcript re-match restricted to the flagged span plus a few seconds of context (the same normalize+difflib+RANSAC approach used for the whole-clip alignment, just windowed), falling back to a local GCC-PHAT acoustic re-check (as used by Boundary Flex / the acoustic fallback) when there aren't enough words nearby to trust a re-match. The repaired stretch is re-planned with the same sentence-wise piece logic as the main render, rendered, and spliced into the existing monolith — everything outside the flagged span+margin is untouched, byte-for-byte.
 >
-> **Cost.** This is an extra full Whisper pass per rendered clip, run *after* the main transcription engine would normally have been unloaded to free VRAM for rendering — enabling `--self-check` keeps the model loaded (or reloads it) through the render phase instead.
+> **Cost.** This is an extra full Whisper pass per rendered clip (a second pass if any span needed a repair attempt, to verify the fix), run *after* the main transcription engine would normally have been unloaded to free VRAM for rendering — enabling `--self-check` keeps the model loaded (or reloads it) through the render phase instead.
 
 ## Configuration
 
@@ -400,7 +404,7 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
     "retake_min_words": 4,
     "retake_similarity": 0.6,
     "retake_max_gap_s": 6.0,
-    "self_check": false,
+    "self_check_mode": "off",
     "self_check_transcribe_mode": "fast",
     "self_check_min_run_words": 3,
     "self_check_shift_threshold_s": 0.25,
@@ -431,7 +435,7 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
 | `detect_retakes` | bool | Find re-recorded lines and export as Final Cut auditions (default off) |
 | `retake_min_words` | int | Minimum token-run length to consider a restart candidate (default 4) |
 | `retake_max_gap_s` | float | Max pause between consecutive attempts of the same line (default 6.0s) |
-| `self_check` | bool | Re-transcribe each rendered clip and flag content/timing spans vs. the camera transcript (default off) |
+| `self_check_mode` | str | `off` / `warn` / `repair` — re-transcribe each rendered clip and flag (or additionally repair) content/timing spans vs. the camera transcript (default `off`) |
 | `self_check_transcribe_mode` | str | `fast`/`quality` Whisper mode for the self-check pass, independent of `transcribe_mode` (default `fast`) |
 | `self_check_shift_threshold_s` | float | Median per-word timing delta (s) above which a run is flagged `shifted` (default 0.25) |
 
@@ -452,7 +456,7 @@ Source video and recorder files are never modified.
 ## Verifying the Result
 
 - **`--verify`** — after a successful run, measures the *realized* lag between each rendered voice WAV and its camera audio via GCC-PHAT cross-correlation, printing median/p90/max per clip (and embedding the numbers in `--json` output).
-- **`--self-check`** — re-transcribes each rendered voice WAV and flags content/timing spans against the camera's own transcript — see [Self-Check](#self-check) for what `--verify` alone can't catch.
+- **`--self-check warn|repair`** — re-transcribes each rendered voice WAV and flags (or repairs) content/timing spans against the camera's own transcript — see [Self-Check](#self-check) for what `--verify` alone can't catch.
 - **`tools/verify_sync.py`** — the same measurement as a standalone tool for any pair of audio files: `python tools/verify_sync.py camera.wav voice.wav [--json]`.
 - **`python -m whispersync.engine.system_check`** — environment audit: ffmpeg, CUDA-via-ctranslate2, dependencies, `.sep-venv`, disk space.
 

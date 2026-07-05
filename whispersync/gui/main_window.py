@@ -272,18 +272,26 @@ class MainWindow(QMainWindow):
         # Self-check (off by default): re-transcribe each rendered voice
         # monolith and compare it against the camera clip's own transcript,
         # flagging content/timing spans --verify's acoustic lag measurement
-        # can't see. Detect-only — findings appear as warnings, nothing is
-        # ever re-rendered automatically. Costs one extra Whisper pass.
-        self.self_check_check = QCheckBox("Self-check rendered audio (extra Whisper pass)")
-        self.self_check_check.setChecked(self.config.self_check)
-        self.self_check_check.setToolTip(
+        # can't see. "Warn only" just reports findings; "Warn + auto-repair"
+        # additionally re-aligns and re-renders each flagged span's own small
+        # stretch of audio before re-checking it once more. Costs one extra
+        # Whisper pass per clip (two if any span needed a repair attempt).
+        self.self_check_combo = QComboBox()
+        self.self_check_combo.addItem("Off", "off")
+        self.self_check_combo.addItem("Warn only", "warn")
+        self.self_check_combo.addItem("Warn + auto-repair", "repair")
+        idx = self.self_check_combo.findData(self.config.self_check_mode)
+        self.self_check_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.self_check_combo.setToolTip(
             "Re-transcribe each rendered voice monolith and compare it against "
             "the camera clip's own transcript, flagging spans where content or "
             "timing diverge beyond normal Whisper jitter — catches defects the "
-            "acoustic --verify check can't see. Warnings only, no auto-repair. "
-            "Off by default; costs one extra Whisper pass per clip."
+            "acoustic --verify check can't see. 'Warn only' just reports "
+            "findings; 'Warn + auto-repair' additionally re-aligns and "
+            "re-renders each flagged span before re-checking it. Off by "
+            "default; costs one extra Whisper pass per clip."
         )
-        options_layout.addRow(self.self_check_check)
+        options_layout.addRow("Self-check:", self.self_check_combo)
 
         left_layout.addWidget(options_group)
 
@@ -539,7 +547,7 @@ class MainWindow(QMainWindow):
             recorder_mode=self.recorder_mode_combo.currentText(),
             voice_segment_minutes=int(self.segment_combo.currentData() or 0),
             detect_retakes=self.retakes_check.isChecked(),
-            self_check=self.self_check_check.isChecked(),
+            self_check_mode=str(self.self_check_combo.currentData() or "off"),
         )
 
         self.right_tabs.setCurrentIndex(0)  # show the Run tab during processing

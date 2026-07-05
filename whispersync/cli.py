@@ -254,16 +254,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--self-check",
-        dest="self_check",
-        action="store_true",
+        dest="self_check_mode",
+        choices=["off", "warn", "repair"],
         default=None,
         help="After rendering, re-transcribe each clip's voice monolith and "
         "compare it against the camera clip's own transcript, flagging spans "
         "where content or timing diverge beyond normal cross-run Whisper "
         "jitter. Catches content defects (a dropped/duplicated word, a piece "
         "built from the wrong recorder span) that --verify's acoustic lag "
-        "measurement can't see. Detect-only (warnings, no auto-repair); costs "
-        "one extra Whisper pass per rendered clip. Off by default.",
+        "measurement can't see. 'warn' (just report findings) or 'repair' "
+        "(additionally re-align and re-render each flagged span, then "
+        "re-check it once more); costs one extra Whisper pass per rendered "
+        "clip (two if any span needs a repair attempt). Off by default.",
     )
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
@@ -486,8 +488,8 @@ def main() -> None:
         overrides["voice_segment_minutes"] = args.voice_segment_minutes
     if args.detect_retakes is not None:
         overrides["detect_retakes"] = args.detect_retakes
-    if args.self_check is not None:
-        overrides["self_check"] = args.self_check
+    if args.self_check_mode is not None:
+        overrides["self_check_mode"] = args.self_check_mode
 
     if args.no_cache:
         overrides["use_cache"] = False

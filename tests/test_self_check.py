@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from whispersync.engine.self_check import diagnose_words
-from whispersync.models import Word
+import pytest
+
+from whispersync.config import WhisperSyncConfig
+from whispersync.engine.self_check import SelfCheckSpan, diagnose_words, realign_span
+from whispersync.models import AlignmentMap, Word
 
 
 def _words(text: str, start: float, dt: float = 0.3, offset: float = 0.0) -> list[Word]:
@@ -79,3 +82,72 @@ def test_jitter_within_normal_whisper_noise_is_not_flagged() -> None:
         t += 0.3
     spans = diagnose_words(render, cam)
     assert spans == []
+
+
+def _linear_words(
+    count: int, offset: float, k: float, dt: float = 0.25
+) -> tuple[list[Word], list[Word]]:
+    """A camera/recorder word-pair sequence following ``t_cam = offset + k *
+    t_rec`` exactly, starting near recorder time 0 (as a real recorder does)."""
+    cam_words: list[Word] = []
+    rec_words: list[Word] = []
+    t_rec = 0.0
+    for i in range(count):
+        dur = 0.2
+        t_cam = offset + k * t_rec
+        cam_words.append(Word(text=f"w{i}", start=t_cam, end=t_cam + dur * k, probability=0.95))
+        rec_words.append(Word(text=f"w{i}", start=t_rec, end=t_rec + dur, probability=0.95))
+        t_rec += dt
+    return cam_words, rec_words
+
+
+def test_realign_span_recovers_true_offset_via_transcript_match() -> None:
+    true_offset, true_k = 100.0, 1.001
+    cam_words, rec_words = _linear_words(400, true_offset, true_k)
+
+    # The alignment map used at render time is close but measurably off in
+    # this neighbourhood (the actual scenario self-check exists to catch).
+    stale_am = AlignmentMap(anchors=[], offset=98.0, k=1.0005, residual_ms=0.0)
+    span = SelfCheckSpan(start=150.0, end=154.0, kind="shifted", detail="test")
+    cfg = WhisperSyncConfig(min_anchors=8, anchor_min_confidence=0.6)
+
+    result = realign_span(
+        span,
+        stale_am,
+        cam_words,
+        rec_words,
+        cam_audio_wav=None,
+        rec_audio_path=None,  # type: ignore[arg-type]
+        rec_duration=200.0,
+        config=cfg,
+    )
+
+    assert result is not None
+    assert result.offset == pytest.approx(true_offset, abs=0.05)
+    assert result.k == pytest.approx(true_k, abs=1e-4)
+
+
+def test_realign_span_gives_up_without_enough_local_words() -> None:
+    # Too few words in the flagged neighbourhood (a near-silent stretch) to
+    # trust a transcript re-match, and no audio to fall back to acoustically.
+    cam_words = [Word(text="hi", start=0.0, end=0.2, probability=0.95)]
+    rec_words = [Word(text="hi", start=100.0, end=100.2, probability=0.95)]
+    stale_am = AlignmentMap(anchors=[], offset=100.0, k=1.0, residual_ms=0.0)
+    span = SelfCheckSpan(start=0.0, end=1.0, kind="content", detail="test")
+    cfg = WhisperSyncConfig()
+
+    result = realign_span(
+        span,
+        stale_am,
+        cam_words,
+        rec_words,
+        cam_audio_wav=None,
+        rec_audio_path=None,  # type: ignore[arg-type]
+        rec_duration=200.0,
+        config=cfg,
+    )
+    assert result is None
+
+
+def test_self_check_mode_defaults_off() -> None:
+    assert WhisperSyncConfig().self_check_mode == "off"

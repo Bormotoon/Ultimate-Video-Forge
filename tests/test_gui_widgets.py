@@ -104,9 +104,11 @@ def test_main_window_retakes_check_defaults_off(qapp: QApplication) -> None:
     w.close()
 
 
-def test_main_window_self_check_check_defaults_off(qapp: QApplication) -> None:
+def test_main_window_self_check_combo_defaults_off(qapp: QApplication) -> None:
     from whispersync.gui.main_window import MainWindow
 
     w = MainWindow()
-    assert w.self_check_check.isChecked() is False
+    assert w.self_check_combo.currentData() == "off"
+    values = [w.self_check_combo.itemData(i) for i in range(w.self_check_combo.count())]
+    assert values == ["off", "warn", "repair"]
     w.close()

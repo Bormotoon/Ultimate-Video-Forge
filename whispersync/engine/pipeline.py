@@ -947,6 +947,114 @@ def _timeline_end(clips: list[MediaClip]) -> float:
     return max((c.offset + c.duration for c in clips), default=0.0)
 
 
+# Extra local-time margin added on each side of a flagged span before
+# re-rendering it: the span itself is only where the MISMATCH was detected,
+# not necessarily the full extent of the affected audio (a shifted run's
+# first/last word already carries some of the delta) — padding out to a
+# nearby word gap avoids re-cutting exactly at the edge of the bad material.
+_REPAIR_MARGIN_S = 1.0
+
+
+def _repair_span(
+    span: Any,  # self_check.SelfCheckSpan; typed loosely to avoid an import cycle at module load
+    job: Any,  # RenderJob (a locally-defined class; see run_pipeline)
+    monolith_path: Path,
+    monolith_duration: float,
+    cam_words: list[Word],
+    rec_words: list[Word],
+    config: WhisperSyncConfig,
+    out_sr: int,
+    tmp_dir: Path,
+) -> Path | None:
+    """Re-render just the audio covering ``span`` and splice it into an
+    already-assembled voice monolith, returning the path to the repaired
+    monolith (a new file; ``monolith_path`` itself is left untouched) or
+    ``None`` if no repair could be made (the caller then leaves the span as
+    a plain warning instead of risking a worse edit).
+
+    The repair re-derives where in the recorder this stretch of speech
+    actually comes from (``self_check.realign_span``) rather than touching
+    only timing: an ffmpeg render is deterministic, so re-rendering the same
+    recorder span verbatim reproduces a content defect byte-for-byte — only a
+    fresh local alignment can fix either a `shifted` or a `content` span.
+    """
+    from whispersync.engine.self_check import realign_span
+
+    new_am = realign_span(
+        span,
+        job.am,
+        cam_words,
+        rec_words,
+        job.cam_audio,
+        job.rec_path,
+        job.rec_duration,
+        config,
+    )
+    if new_am is None:
+        return None
+
+    lo = max(0.0, span.start - _REPAIR_MARGIN_S)
+    hi = min(monolith_duration, span.end + _REPAIR_MARGIN_S)
+    if hi - lo <= 1e-3:
+        return None
+
+    k = new_am.k or 1.0
+    rec0 = max(0.0, (lo - new_am.offset) / k)
+    rec1 = min(job.rec_duration, (hi - new_am.offset) / k)
+    if rec1 - rec0 <= 1e-3:
+        return None
+
+    rec_word_spans = [(w.start, w.end) for w in rec_words]
+    plan = _sentence_pieces(new_am, rec0, rec1, rec_word_spans, config)
+    if plan is None:
+        out_dur = hi - lo
+        if out_dur <= 1e-3:
+            return None
+        plan = (0.0, [(rec0, rec1 - rec0, (rec1 - rec0) / out_dur)])
+    lead, pieces = plan
+    if not pieces:
+        return None
+
+    fade_ms = config.crossfade_ms if config.crossfade_enabled else 0
+    seg_paths = _render_pieces_sequential(
+        pieces,
+        job.rec_path,
+        tmp_dir,
+        fade_ms,
+        sample_rate=out_sr,
+        channels=job.channels,
+        codec=job.codec,
+        stretch_method=config.stretch_method,
+    )
+    repaired_piece = tmp_dir / "repaired_span.wav"
+    assemble_continuous(
+        seg_paths, lead, hi - lo, out_sr, repaired_piece, channels=job.channels, codec=job.codec
+    )
+
+    before_path = tmp_dir / "before_span.wav"
+    after_path = tmp_dir / "after_span.wav"
+    segments = []
+    if lo > 1e-3:
+        cut_wav_segment(monolith_path, before_path, 0.0, lo, codec=job.codec)
+        segments.append(before_path)
+    segments.append(repaired_piece)
+    if monolith_duration - hi > 1e-3:
+        cut_wav_segment(monolith_path, after_path, hi, monolith_duration, codec=job.codec)
+        segments.append(after_path)
+
+    repaired_monolith = tmp_dir / f"repaired_{monolith_path.name}"
+    assemble_continuous(
+        segments,
+        0.0,
+        monolith_duration,
+        out_sr,
+        repaired_monolith,
+        channels=job.channels,
+        codec=job.codec,
+    )
+    return repaired_monolith
+
+
 # Voice segmentation: how far a cut may wander from its nominal N-minute mark
 # to find silence, and how short a final tail is allowed to be before it is
 # merged into the previous segment instead of becoming its own tiny file.
@@ -1388,6 +1496,8 @@ def run_pipeline(
             channels: int
             codec: str
             video_clip_idx: int  # index into video_clips/clip_transcripts, for self-check
+            recorder_idx: int  # index into rec_transcripts/rec_master_paths, for self-check repair
+            am: AlignmentMap  # this job's own alignment, for self-check repair re-planning
 
         render_jobs: list[RenderJob] = []
 
@@ -1465,6 +1575,8 @@ def run_pipeline(
                     channels=out_channels_by_rec[ri],
                     codec=out_codec_by_rec[ri],
                     video_clip_idx=ci,
+                    recorder_idx=ri,
+                    am=am,
                 )
             )
 
@@ -1519,7 +1631,7 @@ def run_pipeline(
         # rendered monolith), so when it's enabled the unload is deferred past
         # that stage instead — rendering itself is pure ffmpeg either way, so
         # holding the model through it only costs idle VRAM, not speed.
-        if engine is not None and not config.self_check:
+        if engine is not None and config.self_check_mode == "off":
             engine.unload()
             engine = None
 
@@ -1665,8 +1777,14 @@ def run_pipeline(
         # span). Runs on the MONOLITH, before the voice-segmentation split
         # below, since a segment boundary is just a silence-snapped cut of the
         # same audio and re-checking each piece separately would only re-find
-        # the same spans (or split one flagged span across two segments). ---
-        if config.self_check and render_jobs:
+        # the same spans (or split one flagged span across two segments).
+        # "repair" additionally re-aligns and re-renders each flagged span's
+        # own small stretch of audio, then re-transcribes the (now possibly
+        # repaired) monolith ONCE more to report what actually still needs a
+        # human look — a span left after repair (couldn't be re-aligned
+        # confidently, or still doesn't match) is reported exactly like a
+        # "warn"-mode finding. ---
+        if config.self_check_mode != "off" and render_jobs:
             _notify("processing", 1.0, "Self-check: verifying rendered audio...")
             from whispersync.engine.self_check import check_rendered_clip
 
@@ -1680,12 +1798,48 @@ def run_pipeline(
                         j / max(len(render_jobs), 1),
                         f"Self-check {j + 1}/{len(render_jobs)}: {aclip.path.name}",
                     )
-                    rendered_transcript = check_engine.transcribe(aclip.path)
                     cam_words = clip_transcripts[job.video_clip_idx].words
+                    rendered_transcript = check_engine.transcribe(aclip.path)
                     spans = check_rendered_clip(rendered_transcript.words, cam_words, config)
+
+                    if spans and config.self_check_mode == "repair":
+                        rec_words = rec_transcripts[job.recorder_idx].words
+                        repaired_path = aclip.path
+                        fixed_any = False
+                        repair_tmp = Path(
+                            tempfile.mkdtemp(prefix="whispersync_repair_", dir=audio_synced_dir)
+                        )
+                        job_scratch_dirs.append(repair_tmp)
+                        for span in spans:
+                            candidate = _repair_span(
+                                span,
+                                job,
+                                repaired_path,
+                                aclip.duration,
+                                cam_words,
+                                rec_words,
+                                config,
+                                out_sr,
+                                repair_tmp,
+                            )
+                            if candidate is not None:
+                                repaired_path = candidate
+                                fixed_any = True
+                        if fixed_any:
+                            aclip.path = repaired_path
+                            rendered_transcript = check_engine.transcribe(aclip.path)
+                            spans = check_rendered_clip(
+                                rendered_transcript.words, cam_words, config
+                            )
+
                     for span in spans:
+                        status = (
+                            "still flagged after repair attempt"
+                            if (config.self_check_mode == "repair")
+                            else "found"
+                        )
                         warnings.append(
-                            f"{aclip.path.name}: self-check found a {span.kind} span "
+                            f"{aclip.path.name}: self-check {status} a {span.kind} span "
                             f"[{span.start:.1f}s-{span.end:.1f}s] — {span.detail}"
                         )
             finally:

@@ -239,10 +239,14 @@ class WhisperSyncConfig:
     # camera clip's OWN transcript (already computed during alignment) to catch
     # CONTENT defects that --verify's acoustic GCC-PHAT lag measurement can't
     # see (a dropped/duplicated word, a piece built from the wrong recorder
-    # span) — see engine/self_check.py. Detect-only in v1: findings become
-    # warnings for the user to check in the NLE; no automatic repair yet,
-    # mirroring how detect_retakes shipped as a pure detector first.
-    self_check: bool = False
+    # span) — see engine/self_check.py. "off" disables it; "warn" reports
+    # flagged spans as warnings only; "repair" additionally re-aligns each
+    # flagged span's own small stretch of recorder audio (transcript re-match,
+    # falling back to a local acoustic re-check) and re-renders only the
+    # pieces inside that span, then re-checks it once more before accepting
+    # the fix — a span it can't confidently re-align, or that still doesn't
+    # pass after repair, is left as a warning instead of a worse edit.
+    self_check_mode: str = "off"
     # "fast" reuses the same batched pipeline as fast camera/recorder
     # transcription; "quality" is the slower sequential+context pipeline (see
     # transcribe_mode). Self-check runs AFTER the main Whisper engine was

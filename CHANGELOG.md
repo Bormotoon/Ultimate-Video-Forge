@@ -4,18 +4,18 @@ All notable changes to WhisperSync will be documented in this file.
 
 ## [Unreleased]
 
-### Added — post-render self-check (content diagnostics)
+### Added — post-render self-check (content diagnostics + optional repair)
 
-- **`self_check` / `--self-check` / GUI "Self-check rendered audio" checkbox**
-  (off by default): after a clip's voice monolith is rendered, re-transcribes
-  it with Whisper and compares its words against the camera clip's OWN
-  transcript (already computed during alignment), flagging spans where
-  content or timing diverge beyond normal cross-run Whisper jitter.
-  Complements `--verify`'s GCC-PHAT acoustic lag measurement, which can only
-  see *where* two waveforms correlate and is blind to CONTENT defects (a
-  dropped/duplicated word, a piece built from the wrong recorder span) —
-  those can still show a small measured lag if enough surrounding audio still
-  lines up.
+- **`self_check_mode` / `--self-check {warn,repair}` / GUI "Self-check"
+  dropdown (Off / Warn only / Warn + auto-repair)** (off by default): after a
+  clip's voice monolith is rendered, re-transcribes it with Whisper and
+  compares its words against the camera clip's OWN transcript (already
+  computed during alignment), flagging spans where content or timing diverge
+  beyond normal cross-run Whisper jitter. Complements `--verify`'s GCC-PHAT
+  acoustic lag measurement, which can only see *where* two waveforms
+  correlate and is blind to CONTENT defects (a dropped/duplicated word, a
+  piece built from the wrong recorder span) — those can still show a small
+  measured lag if enough surrounding audio still lines up.
 - Detection (`whispersync/engine/self_check.py`) matches normalized tokens
   between the rendered and camera transcripts with the same difflib approach
   used for anchor matching, then judges two independent signals: a sliding
@@ -30,18 +30,36 @@ All notable changes to WhisperSync will be documented in this file.
   well-synced prefix sharing the same run — an early version of the
   algorithm had exactly this bug on a synthetic long-prefix/short-shifted-tail
   case caught during testing.
-- Detect-only in v1 (mirrors how `detect_retakes` shipped as a pure detector
-  first): findings become `warnings` entries naming the affected clip, span,
-  and kind — no automatic repair. A future repair tier (nudging the
-  surrounding pause pieces' durations and re-rendering just the affected
-  piece, reusing the sentence-wise strategy's pause elasticity) is a natural
-  next step once detection is validated on real recordings.
+- **`repair` mode** (`self_check.realign_span` + `pipeline._repair_span`): a
+  single mechanism handles BOTH span kinds, because an ffmpeg render is
+  deterministic — re-rendering the exact same recorder span verbatim would
+  reproduce a content defect byte-for-byte, so only re-deriving where in the
+  recorder a stretch of speech actually comes from can fix either a `shifted`
+  or a `content` span. For each flagged span, `realign_span` re-aligns just
+  that neighbourhood (span ± `REPAIR_CONTEXT_S`=6s of context): first a
+  transcript re-match (the same normalize+difflib+RANSAC approach as the
+  whole-clip alignment, windowed to the span), falling back to a single local
+  GCC-PHAT cross-correlation (reusing the acoustic-fallback/Boundary-Flex
+  primitives) when too few words are nearby to trust a re-match. The repaired
+  stretch is re-planned with the same sentence-wise piece logic as the main
+  render (`_sentence_pieces`), rendered, and spliced into the existing
+  monolith by cutting out `[span.start-margin, span.end+margin]` and
+  reassembling — everything outside that window is untouched byte-for-byte.
+  The monolith is re-transcribed and re-checked once after all of a clip's
+  spans are repaired, so a span that couldn't be confidently re-aligned (or
+  still doesn't match after the attempt) is reported exactly like a
+  `warn`-mode finding instead of risking a worse edit.
+- `warn` mode (mirrors how `detect_retakes` shipped as a pure detector first)
+  remains available and is the safer starting point: findings become
+  `warnings` entries naming the affected clip, span, and kind, with no
+  automatic repair.
 - Self-check transcription is a deliberate second Whisper pass, independent
   of the main `transcribe_mode` (`self_check_transcribe_mode`, default
   `fast`) — it runs AFTER the main engine would normally be unloaded to free
   VRAM for rendering, so enabling it defers that unload until after the
-  self-check pass instead (rendering itself is pure ffmpeg either way, so
-  this only costs idle VRAM headroom during rendering, not speed).
+  self-check (and any repair re-check) pass instead (rendering itself is pure
+  ffmpeg either way, so this only costs idle VRAM headroom during rendering,
+  not speed).
 
 ### Added — retake detection (Final Cut auditions)
 

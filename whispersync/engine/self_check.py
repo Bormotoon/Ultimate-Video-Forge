@@ -1,5 +1,5 @@
 """Post-render self-check: verify a rendered voice monolith against the
-camera clip's own transcript.
+camera clip's own transcript, with an optional repair pass.
 
 ``--verify``/``tools/verify_sync.py`` already measures realized LAG between
 the rendered voice and the camera audio via GCC-PHAT cross-correlation — but
@@ -14,22 +14,38 @@ transcript (already computed during alignment — the natural "original" to
 check against, not the recorder). The two transcripts should describe the
 same speech at (very nearly) the same local timestamps if the render is
 correct; a span where they diverge — either a timing drift beyond normal
-cross-run Whisper jitter, or words that simply don't match — is flagged as a
-warning for the user to check in the NLE. v1 is detect-only (no automatic
-repair), mirroring how ``engine.retakes`` shipped first as a pure detector
-before any editing action was layered on top.
+cross-run Whisper jitter, or words that simply don't match — is flagged.
+
+Two modes build on the same detection: "warn" (the default) just reports
+flagged spans for the user to check in the NLE; "repair" additionally
+re-aligns each flagged span's own small stretch of recorder audio (transcript
+re-match first, falling back to a local GCC-PHAT re-check the same way the
+acoustic fallback / Boundary Flex do) and re-renders only the pieces inside
+that span — the rest of the clip is untouched. Both a `shifted` (timing-only)
+and a `content` (wrong/missing words) span get the SAME treatment: an ffmpeg
+render is deterministic, so re-rendering the same recorder span verbatim
+would reproduce a content defect byte-for-byte — the only thing that can fix
+either kind of defect is re-deriving where in the recorder this piece of
+speech actually comes from, i.e. a fresh local alignment.
 """
 
 from __future__ import annotations
 
 import difflib
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
+import numpy as np
+
+from whispersync.config import WhisperSyncConfig
 from whispersync.engine.matcher import normalize_token
-from whispersync.models import Word
+from whispersync.models import AlignmentMap, Word
 
-__all__ = ["SelfCheckSpan", "check_rendered_clip"]
+logger = logging.getLogger(__name__)
+
+__all__ = ["SelfCheckSpan", "check_rendered_clip", "realign_span"]
 
 # A run of at least this many consecutive matched words with a median timing
 # delta above this many seconds is flagged as "shifted". Normal cross-run
@@ -238,3 +254,124 @@ def check_rendered_clip(
             config, "self_check_min_content_words", DEFAULT_MIN_CONTENT_WORDS
         ),
     )
+
+
+# Extra recorder-time context added on each side of a flagged span before
+# re-aligning it: a repair needs a few real words of surrounding context (not
+# just the flagged span itself) to fit a meaningful local line/offset, and a
+# few seconds of margin so a re-derived boundary doesn't land exactly on the
+# old (possibly wrong) one.
+REPAIR_CONTEXT_S = 6.0
+# Below this many word anchors, a local transcript re-match isn't trustworthy
+# (RANSAC through 2-3 points is a guess, not a fit) — fall back to acoustic.
+REPAIR_MIN_ANCHORS = 4
+
+
+def _local_transcript_realign(
+    rec_lo: float,
+    rec_hi: float,
+    cam_lo: float,
+    cam_hi: float,
+    cam_words: list[Word],
+    rec_words: list[Word],
+    config: WhisperSyncConfig,
+) -> AlignmentMap | None:
+    """Re-derive ``(offset, k)`` from ONLY the words inside
+    ``[rec_lo, rec_hi]`` (recorder) / ``[cam_lo, cam_hi]`` (camera local
+    time) — the same normalize+difflib+RANSAC approach ``matcher.align()``
+    uses for a whole clip, restricted to this small window so a bad match
+    far away in the clip can't influence the repair."""
+    from whispersync.engine.matcher import (
+        _anchors_from_words,
+        normalize_words,
+        ransac_linear_fit,
+        reject_gross_outliers,
+    )
+
+    cam_window = [w for w in cam_words if cam_lo <= w.start <= cam_hi]
+    rec_window = [w for w in rec_words if rec_lo <= w.start <= rec_hi]
+    cam_norm = normalize_words(cam_window, config.anchor_min_confidence)
+    rec_norm = normalize_words(rec_window, config.anchor_min_confidence)
+    if not cam_norm or not rec_norm:
+        return None
+
+    anchors = _anchors_from_words(cam_norm, rec_norm)
+    if len(anchors) < REPAIR_MIN_ANCHORS:
+        return None
+    kept = reject_gross_outliers(anchors)
+    if len(kept) < 2:
+        kept = anchors
+    offset, k, inliers = ransac_linear_fit(kept)
+    if len(inliers) < REPAIR_MIN_ANCHORS:
+        return None
+    residuals_ms = [abs((offset + k * a.rec_time) - a.cam_time) * 1000 for a in inliers]
+    residual_ms = float(np.median(residuals_ms)) if residuals_ms else 0.0
+    return AlignmentMap(anchors=kept, offset=offset, k=k, residual_ms=residual_ms)
+
+
+def _local_acoustic_realign(
+    cam_lo: float,
+    cam_hi: float,
+    prior_k: float,
+    cam_audio_wav: Path,
+    rec_audio_path: Path,
+    config: WhisperSyncConfig,
+) -> AlignmentMap | None:
+    """Fallback when the transcript re-match found too few anchors: a single
+    GCC-PHAT cross-correlation over the WHOLE flagged span (not per-boundary
+    like Boundary Flex), reusing the current clock rate ``prior_k`` — a short
+    span rarely has enough duration to fit its own trustworthy K, but the
+    offset alone recovers "which part of the recorder this really is"."""
+    from whispersync.engine.acoustic import _REFINE_SR, _window_slice, gcc_phat, load_mono16k_track
+
+    cam_track = load_mono16k_track(cam_audio_wav)
+    rec_track = load_mono16k_track(rec_audio_path)
+    win = max(cam_hi - cam_lo, 2.0)
+    rec_win = win + 2 * config.acoustic_max_lag_s
+    cam_mid = (cam_lo + cam_hi) / 2.0
+    rec_mid_guess = cam_mid / prior_k if prior_k else cam_mid
+    cam_sig = _window_slice(cam_track, cam_mid, win, _REFINE_SR)
+    rec_sig = _window_slice(rec_track, rec_mid_guess, rec_win, _REFINE_SR)
+    lag_s, sharp = gcc_phat(cam_sig, rec_sig, _REFINE_SR, config.acoustic_max_lag_s, config.gcc_eps)
+    if sharp < config.acoustic_fallback_min_sharpness:
+        return None
+    rec_mid = rec_mid_guess - lag_s
+    offset = cam_mid - prior_k * rec_mid
+    return AlignmentMap(anchors=[], offset=offset, k=prior_k, residual_ms=0.0)
+
+
+def realign_span(
+    span: SelfCheckSpan,
+    am: AlignmentMap,
+    cam_words: list[Word],
+    rec_words: list[Word],
+    cam_audio_wav: Path | None,
+    rec_audio_path: Path,
+    rec_duration: float,
+    config: WhisperSyncConfig,
+) -> AlignmentMap | None:
+    """Re-align just the flagged span's own stretch of recorder audio.
+
+    Returns a fresh ``AlignmentMap`` valid ONLY near this span (not the whole
+    clip) — the caller re-plans pieces for the span's neighbourhood with it —
+    or ``None`` if neither a transcript re-match nor an acoustic re-check
+    found anything more confident than what's already there, in which case
+    the span is left as a warning instead of risking a worse edit.
+    ``cam_audio_wav`` is ``None`` when ``config.boundary_flex`` was off for
+    the render (see ``RenderJob.cam_audio``) — the acoustic fallback is
+    simply skipped then, since it has no camera audio to cross-correlate.
+    """
+    k = am.k or 1.0
+    cam_lo = max(0.0, span.start - REPAIR_CONTEXT_S)
+    cam_hi = span.end + REPAIR_CONTEXT_S
+    rec_lo = max(0.0, (cam_lo - am.offset) / k)
+    rec_hi = min(rec_duration, (cam_hi - am.offset) / k)
+    if rec_hi <= rec_lo:
+        return None
+
+    result = _local_transcript_realign(rec_lo, rec_hi, cam_lo, cam_hi, cam_words, rec_words, config)
+    if result is not None:
+        return result
+    if cam_audio_wav is None:
+        return None
+    return _local_acoustic_realign(cam_lo, cam_hi, k, cam_audio_wav, rec_audio_path, config)
