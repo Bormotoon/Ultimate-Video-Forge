@@ -118,3 +118,10 @@ def test_detect_retakes_flag() -> None:
         ["--video-dir", "v", "--audio-file", "r.wav", "--detect-retakes"]
     )
     assert args.detect_retakes is True
+
+
+def test_self_check_flag() -> None:
+    args = _build_parser().parse_args(["--video-dir", "v", "--audio-file", "r.wav"])
+    assert args.self_check is None
+    args = _build_parser().parse_args(["--video-dir", "v", "--audio-file", "r.wav", "--self-check"])
+    assert args.self_check is True

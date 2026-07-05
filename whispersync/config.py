@@ -234,6 +234,26 @@ class WhisperSyncConfig:
     retake_min_words: int = 4  # ignore blocks shorter than this (interjections)
     retake_similarity: float = 0.6  # min token-sequence similarity to call two blocks the same line
     retake_max_gap_s: float = 6.0  # max pause between consecutive attempts of one line
+    # Post-render self-check (off by default): after a clip's voice monolith is
+    # rendered, re-transcribe it with Whisper and compare its words against the
+    # camera clip's OWN transcript (already computed during alignment) to catch
+    # CONTENT defects that --verify's acoustic GCC-PHAT lag measurement can't
+    # see (a dropped/duplicated word, a piece built from the wrong recorder
+    # span) — see engine/self_check.py. Detect-only in v1: findings become
+    # warnings for the user to check in the NLE; no automatic repair yet,
+    # mirroring how detect_retakes shipped as a pure detector first.
+    self_check: bool = False
+    # "fast" reuses the same batched pipeline as fast camera/recorder
+    # transcription; "quality" is the slower sequential+context pipeline (see
+    # transcribe_mode). Self-check runs AFTER the main Whisper engine was
+    # already unloaded for rendering, so this is a deliberate second model
+    # load/VRAM cost independent of transcribe_mode — "fast" is the sensible
+    # default since self-check only needs to catch gross defects, not match
+    # transcribe_mode's own accuracy bar.
+    self_check_transcribe_mode: str = "fast"
+    self_check_min_run_words: int = 3  # words in a run before a timing shift can be flagged
+    self_check_shift_threshold_s: float = 0.25  # median per-word delta above normal Whisper jitter
+    self_check_min_content_words: int = 3  # words in a mismatch before it's flagged as content
     # Split each rendered voice WAV into segments of this many minutes
     # (0 = keep one continuous file per clip, the default). Cut points snap
     # to the quietest moment near each nominal boundary, so a cut never lands

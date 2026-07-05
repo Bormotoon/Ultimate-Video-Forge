@@ -102,3 +102,11 @@ def test_main_window_retakes_check_defaults_off(qapp: QApplication) -> None:
     w = MainWindow()
     assert w.retakes_check.isChecked() is False
     w.close()
+
+
+def test_main_window_self_check_check_defaults_off(qapp: QApplication) -> None:
+    from whispersync.gui.main_window import MainWindow
+
+    w = MainWindow()
+    assert w.self_check_check.isChecked() is False
+    w.close()

@@ -269,6 +269,22 @@ class MainWindow(QMainWindow):
         )
         options_layout.addRow(self.retakes_check)
 
+        # Self-check (off by default): re-transcribe each rendered voice
+        # monolith and compare it against the camera clip's own transcript,
+        # flagging content/timing spans --verify's acoustic lag measurement
+        # can't see. Detect-only — findings appear as warnings, nothing is
+        # ever re-rendered automatically. Costs one extra Whisper pass.
+        self.self_check_check = QCheckBox("Self-check rendered audio (extra Whisper pass)")
+        self.self_check_check.setChecked(self.config.self_check)
+        self.self_check_check.setToolTip(
+            "Re-transcribe each rendered voice monolith and compare it against "
+            "the camera clip's own transcript, flagging spans where content or "
+            "timing diverge beyond normal Whisper jitter — catches defects the "
+            "acoustic --verify check can't see. Warnings only, no auto-repair. "
+            "Off by default; costs one extra Whisper pass per clip."
+        )
+        options_layout.addRow(self.self_check_check)
+
         left_layout.addWidget(options_group)
 
         self.btn_settings = QPushButton("Transcription Settings...")
@@ -523,6 +539,7 @@ class MainWindow(QMainWindow):
             recorder_mode=self.recorder_mode_combo.currentText(),
             voice_segment_minutes=int(self.segment_combo.currentData() or 0),
             detect_retakes=self.retakes_check.isChecked(),
+            self_check=self.self_check_check.isChecked(),
         )
 
         self.right_tabs.setCurrentIndex(0)  # show the Run tab during processing

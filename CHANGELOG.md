@@ -4,6 +4,45 @@ All notable changes to WhisperSync will be documented in this file.
 
 ## [Unreleased]
 
+### Added — post-render self-check (content diagnostics)
+
+- **`self_check` / `--self-check` / GUI "Self-check rendered audio" checkbox**
+  (off by default): after a clip's voice monolith is rendered, re-transcribes
+  it with Whisper and compares its words against the camera clip's OWN
+  transcript (already computed during alignment), flagging spans where
+  content or timing diverge beyond normal cross-run Whisper jitter.
+  Complements `--verify`'s GCC-PHAT acoustic lag measurement, which can only
+  see *where* two waveforms correlate and is blind to CONTENT defects (a
+  dropped/duplicated word, a piece built from the wrong recorder span) —
+  those can still show a small measured lag if enough surrounding audio still
+  lines up.
+- Detection (`whispersync/engine/self_check.py`) matches normalized tokens
+  between the rendered and camera transcripts with the same difflib approach
+  used for anchor matching, then judges two independent signals: a sliding
+  window over consecutive matched word-pairs flags a `shifted` span when its
+  median timing delta exceeds `self_check_shift_threshold_s` (default 0.25s,
+  chosen to sit above normal ±50-100ms per-word Whisper jitter) over at least
+  `self_check_min_run_words` (default 3) words; a long replace/insert/delete
+  run in the same diff (at least `self_check_min_content_words`, default 3)
+  flags a `content` mismatch. The sliding window (rather than one greedy run
+  merged across the whole matched sequence) exists specifically so a
+  genuinely shifted tail can't be diluted below threshold by a long
+  well-synced prefix sharing the same run — an early version of the
+  algorithm had exactly this bug on a synthetic long-prefix/short-shifted-tail
+  case caught during testing.
+- Detect-only in v1 (mirrors how `detect_retakes` shipped as a pure detector
+  first): findings become `warnings` entries naming the affected clip, span,
+  and kind — no automatic repair. A future repair tier (nudging the
+  surrounding pause pieces' durations and re-rendering just the affected
+  piece, reusing the sentence-wise strategy's pause elasticity) is a natural
+  next step once detection is validated on real recordings.
+- Self-check transcription is a deliberate second Whisper pass, independent
+  of the main `transcribe_mode` (`self_check_transcribe_mode`, default
+  `fast`) — it runs AFTER the main engine would normally be unloaded to free
+  VRAM for rendering, so enabling it defers that unload until after the
+  self-check pass instead (rendering itself is pure ffmpeg either way, so
+  this only costs idle VRAM headroom during rendering, not speed).
+
 ### Added — retake detection (Final Cut auditions)
 
 - **`detect_retakes` / `--detect-retakes` / GUI "Detect retakes" checkbox**

@@ -252,13 +252,26 @@ def _build_parser() -> argparse.ArgumentParser:
         "attempt on the timeline. Off by default; a non-destructive heuristic "
         "— review the auditions before cutting anything.",
     )
+    parser.add_argument(
+        "--self-check",
+        dest="self_check",
+        action="store_true",
+        default=None,
+        help="After rendering, re-transcribe each clip's voice monolith and "
+        "compare it against the camera clip's own transcript, flagging spans "
+        "where content or timing diverge beyond normal cross-run Whisper "
+        "jitter. Catches content defects (a dropped/duplicated word, a piece "
+        "built from the wrong recorder span) that --verify's acoustic lag "
+        "measurement can't see. Detect-only (warnings, no auto-repair); costs "
+        "one extra Whisper pass per rendered clip. Off by default.",
+    )
     parser.add_argument("--json", dest="json_output", action="store_true", help="Output as JSON")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
     return parser
 
 
 # ---------------------------------------------------------------------------
-# --verify: post-render self-check
+# --verify: acoustic lag measurement (post-render)
 # ---------------------------------------------------------------------------
 
 
@@ -473,6 +486,8 @@ def main() -> None:
         overrides["voice_segment_minutes"] = args.voice_segment_minutes
     if args.detect_retakes is not None:
         overrides["detect_retakes"] = args.detect_retakes
+    if args.self_check is not None:
+        overrides["self_check"] = args.self_check
 
     if args.no_cache:
         overrides["use_cache"] = False

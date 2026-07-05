@@ -17,7 +17,7 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1387,6 +1387,7 @@ def run_pipeline(
             pauses: list[tuple[float, float]]  # local-time pause spans, for ducking
             channels: int
             codec: str
+            video_clip_idx: int  # index into video_clips/clip_transcripts, for self-check
 
         render_jobs: list[RenderJob] = []
 
@@ -1463,6 +1464,7 @@ def run_pipeline(
                     pauses=pauses,
                     channels=out_channels_by_rec[ri],
                     codec=out_codec_by_rec[ri],
+                    video_clip_idx=ci,
                 )
             )
 
@@ -1512,8 +1514,12 @@ def run_pipeline(
         # ambience extraction below runs its own GPU model in .sep-venv). Free
         # its VRAM now rather than in the `finally` block at the very end —
         # holding it through rendering/ambience is a common cause of GPU OOM on
-        # cards with 8-12 GB VRAM. See PROJECT_ANALYSIS.md §6.1.
-        if engine is not None:
+        # cards with 8-12 GB VRAM. See PROJECT_ANALYSIS.md §6.1. Self-check
+        # needs the engine again right after rendering (to transcribe the
+        # rendered monolith), so when it's enabled the unload is deferred past
+        # that stage instead — rendering itself is pure ffmpeg either way, so
+        # holding the model through it only costs idle VRAM, not speed.
+        if engine is not None and not config.self_check:
             engine.unload()
             engine = None
 
@@ -1651,6 +1657,45 @@ def run_pipeline(
         else:
             if pool is not None:
                 pool.shutdown(wait=True)
+
+        # --- optional self-check: re-transcribe each rendered voice monolith
+        # and compare it against the camera clip's own transcript, to catch
+        # CONTENT defects (--verify's acoustic lag measurement can't see a
+        # dropped/duplicated word or a piece built from the wrong recorder
+        # span). Runs on the MONOLITH, before the voice-segmentation split
+        # below, since a segment boundary is just a silence-snapped cut of the
+        # same audio and re-checking each piece separately would only re-find
+        # the same spans (or split one flagged span across two segments). ---
+        if config.self_check and render_jobs:
+            _notify("processing", 1.0, "Self-check: verifying rendered audio...")
+            from whispersync.engine.self_check import check_rendered_clip
+
+            check_config = replace(config, transcribe_mode=config.self_check_transcribe_mode)
+            check_engine = WhisperEngine(check_config)
+            try:
+                for j, job in enumerate(render_jobs):
+                    aclip = audio_clips[job.clip_idx]
+                    _notify(
+                        "processing",
+                        j / max(len(render_jobs), 1),
+                        f"Self-check {j + 1}/{len(render_jobs)}: {aclip.path.name}",
+                    )
+                    rendered_transcript = check_engine.transcribe(aclip.path)
+                    cam_words = clip_transcripts[job.video_clip_idx].words
+                    spans = check_rendered_clip(rendered_transcript.words, cam_words, config)
+                    for span in spans:
+                        warnings.append(
+                            f"{aclip.path.name}: self-check found a {span.kind} span "
+                            f"[{span.start:.1f}s-{span.end:.1f}s] — {span.detail}"
+                        )
+            finally:
+                check_engine.unload()
+            # The main engine was only kept loaded for self-check to reuse its
+            # VRAM headroom timing; free it now rather than holding it through
+            # ambience separation / the optional master-WAV mix below.
+            if engine is not None:
+                engine.unload()
+                engine = None
 
         # --- optionally split each rendered voice monolith into N-minute
         # segments (cut in silence), so an NLE's own audio sync (e.g. FCPX
