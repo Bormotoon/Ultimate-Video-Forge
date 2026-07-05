@@ -112,3 +112,21 @@ def test_main_window_self_check_combo_defaults_off(qapp: QApplication) -> None:
     values = [w.self_check_combo.itemData(i) for i in range(w.self_check_combo.count())]
     assert values == ["off", "warn", "repair"]
     w.close()
+
+
+def test_main_window_voice_enhance_combo_defaults_off(qapp: QApplication) -> None:
+    from whispersync.gui.main_window import MainWindow
+
+    w = MainWindow()
+    assert w.voice_enhance_combo.currentData() == "off"
+    values = [w.voice_enhance_combo.itemData(i) for i in range(w.voice_enhance_combo.count())]
+    assert values == [
+        "off",
+        "denoise",
+        "denoise_dereverb",
+        "resemble",
+        "sgmse_denoise",
+        "sgmse_dereverb",
+        "reuse",
+    ]
+    w.close()

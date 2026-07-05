@@ -132,6 +132,35 @@ def check_ambience_separator() -> dict:
     return {"available": available, "repo_root": str(repo_root)}
 
 
+def check_voice_enhance_environments() -> dict:
+    """Whether each ``voice_enhance`` backend's environment is set up.
+
+    Only "denoise"/"denoise_dereverb" are wired up today (they reuse
+    ``.sep-venv`` — see ``check_ambience_separator``); the rest (resemble,
+    sgmse_denoise/dereverb, reuse) are reported as "not yet available in this
+    build" rather than probed, since their engine backends don't exist yet.
+    Not fatal either way — the feature is opt-in."""
+    from whispersync.engine import enhance
+
+    repo_root = Path(__file__).resolve().parents[2]
+    result: dict = {}
+    for mode in enhance.MODES:
+        if mode == "off":
+            continue
+        available = enhance.is_available(mode, repo_root)
+        result[mode] = available
+        if available:
+            _ok(f"Voice enhancement '{mode}' — available")
+        elif mode in enhance.SEP_VENV_MODES:
+            _warn(
+                f"Voice enhancement '{mode}' — not set up "
+                "(optional; run setup_sep_venv.sh to enable --voice-enhance)"
+            )
+        else:
+            _warn(f"Voice enhancement '{mode}' — not available in this build yet")
+    return result
+
+
 def check_disk_space(min_gb: int = 10) -> dict:
     usage = shutil.disk_usage("/")
     free_gb = usage.free / (1024**3)
@@ -165,6 +194,9 @@ def run_all_checks() -> dict:
     print("\n[Ambience separator]")
     sep = check_ambience_separator()
 
+    print("\n[Voice enhancement]")
+    enh = check_voice_enhance_environments()
+
     report = {
         "ffmpeg": ff,
         "ffprobe": ff,
@@ -173,6 +205,7 @@ def run_all_checks() -> dict:
         "python": py,
         "dependencies": deps,
         "ambience_separator": sep,
+        "voice_enhance": enh,
     }
 
     # In the current working directory (where the user runs the command from),

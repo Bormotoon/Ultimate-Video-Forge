@@ -293,6 +293,41 @@ class MainWindow(QMainWindow):
         )
         options_layout.addRow("Self-check:", self.self_check_combo)
 
+        # Voice enhancement (off by default): run a third-party model over the
+        # rendered voice monolith, before self-check validates it. Six variants
+        # were compared in a listening test; each trades speed/quality/license
+        # differently (see the Help tab for the full pros/cons breakdown), so
+        # this is a per-project choice rather than a single recommended default.
+        # A mode whose environment isn't set up is skipped with a warning at
+        # the end of the run (same UX as ambience_track on a missing .sep-venv)
+        # rather than disabling combo entries individually.
+        self.voice_enhance_combo = QComboBox()
+        self.voice_enhance_combo.addItem("Off", "off")
+        self.voice_enhance_combo.addItem("Denoise (fast, safest)", "denoise")
+        self.voice_enhance_combo.addItem("Denoise + De-reverb", "denoise_dereverb")
+        self.voice_enhance_combo.addItem(
+            "Resemble Enhance (studio timbre, experimental)", "resemble"
+        )
+        self.voice_enhance_combo.addItem("SGMSE+ Denoise (slow, cleanest)", "sgmse_denoise")
+        self.voice_enhance_combo.addItem("SGMSE+ De-reverb (slow)", "sgmse_dereverb")
+        self.voice_enhance_combo.addItem("RE-USE (fastest, noncommercial license only)", "reuse")
+        idx = self.voice_enhance_combo.findData(self.config.voice_enhance)
+        self.voice_enhance_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.voice_enhance_combo.setToolTip(
+            "Run a third-party model over the rendered voice monolith before "
+            "self-check. 'Denoise'/'Denoise + De-reverb' reuse the .sep-venv "
+            "stack already used for ambience — fast and safe. 'Resemble "
+            "Enhance' gives a studio-like timbre but is experimental (some "
+            "upstream patches are undocumented). The 'SGMSE+' modes sound "
+            "cleanest but run ~5x slower than realtime (diffusion) — needs a "
+            "separate '.enh-venv'. 'RE-USE' is the fastest all-in-one option "
+            "but its model is NSCLv1 (noncommercial use only) and needs "
+            "Docker plus NVIDIA's own RE-USE source under their license. Off "
+            "by default; a mode whose environment isn't set up is skipped "
+            "with a warning, keeping the unenhanced audio."
+        )
+        options_layout.addRow("Voice enhancement:", self.voice_enhance_combo)
+
         left_layout.addWidget(options_group)
 
         self.btn_settings = QPushButton("Transcription Settings...")
@@ -548,6 +583,7 @@ class MainWindow(QMainWindow):
             voice_segment_minutes=int(self.segment_combo.currentData() or 0),
             detect_retakes=self.retakes_check.isChecked(),
             self_check_mode=str(self.self_check_combo.currentData() or "off"),
+            voice_enhance=str(self.voice_enhance_combo.currentData() or "off"),
         )
 
         self.right_tabs.setCurrentIndex(0)  # show the Run tab during processing
