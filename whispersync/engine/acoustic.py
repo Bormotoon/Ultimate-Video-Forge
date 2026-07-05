@@ -48,8 +48,10 @@ def read_wav_mono16k(path: Path) -> tuple[np.ndarray, int]:
     return data / 32768.0, sr
 
 
-def load_mono16k_track(path: Path) -> np.ndarray:
-    """Decode an entire audio file (any format/channel layout ffmpeg reads) to a
+def load_mono16k_track(
+    path: Path, start_s: float | None = None, duration_s: float | None = None
+) -> np.ndarray:
+    """Decode an audio file (any format/channel layout ffmpeg reads) to a
     mono 16 kHz float array, once. Boundary Flex used to re-run ffmpeg (via
     ``extract_audio_window``) for every single boundary it measured — for a
     clip with hundreds of pieces that's hundreds of short-lived ffmpeg
@@ -57,6 +59,12 @@ def load_mono16k_track(path: Path) -> np.ndarray:
     and slicing the resulting numpy array for every window instead removes
     that spawn overhead entirely (the FFT-based ``gcc_phat`` cost dominates
     once ffmpeg is out of the loop). See PROJECT_ANALYSIS.md §6.2.
+
+    ``start_s``/``duration_s`` decode only that window of the file — for a
+    caller needing a few seconds of a multi-hour recorder (the self-check
+    repair's local acoustic probe), decoding everything would dominate the
+    whole operation's cost. Times in the returned array are then relative to
+    ``start_s``, not to the file's own zero.
     """
     import tempfile
 
@@ -66,7 +74,14 @@ def load_mono16k_track(path: Path) -> np.ndarray:
     os.close(fd)
     tmp_path = Path(tmp_name)
     try:
-        extract_audio_to_wav(path, tmp_path, sample_rate=_REFINE_SR, mono=True)
+        extract_audio_to_wav(
+            path,
+            tmp_path,
+            sample_rate=_REFINE_SR,
+            mono=True,
+            start_s=start_s,
+            duration_s=duration_s,
+        )
         sig, _ = read_wav_mono16k(tmp_path)
         return sig
     finally:

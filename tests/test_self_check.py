@@ -37,16 +37,42 @@ def test_sustained_shift_is_flagged() -> None:
 def test_shifted_tail_is_not_diluted_by_synced_prefix() -> None:
     # A long well-synced prefix followed by a genuinely shifted tail: the
     # combined median of the whole run must not hide the tail's local shift.
+    # (min_run_words=3 explicitly — this test exercises the sliding-window
+    # dilution logic, not the field-calibrated default run length.)
     render = _words("а б в г д е ж з и к л м н о", 0.0)
     cam_prefix = _words("а б в г д е ж з и к", 0.0)
     cam_tail = _words("л м н о", 3.0, offset=0.6)
-    spans = diagnose_words(render, cam_prefix + cam_tail)
+    spans = diagnose_words(render, cam_prefix + cam_tail, min_run_words=3)
     assert any(s.kind == "shifted" for s in spans)
 
 
+def test_wrong_occurrence_match_is_not_flagged() -> None:
+    # The same 5-word phrase occurs twice on the camera side; the render only
+    # has the second occurrence (difflib may pair it with the FIRST, creating
+    # a huge fake delta). Since the right-time twin exists on the camera, the
+    # match must be recognized as wrong-occurrence, not a render defect.
+    phrase = "именно так это всё работает"
+    cam = _words(phrase, 0.0) + _words("совсем другие слова в середине", 4.0) + _words(phrase, 10.0)
+    render = _words("иной уникальный набор токенов тут", 4.0) + _words(phrase, 10.0)
+    spans = diagnose_words(render, cam, min_run_words=3)
+    assert [s for s in spans if s.kind == "shifted"] == []
+
+
+def test_start_jitter_with_agreeing_ends_is_not_flagged() -> None:
+    # Whisper's start times are its noisiest output: echo can smear a word's
+    # attack by ~0.5s while the word END still agrees. min-over-edges must
+    # clear these — only a shift moving BOTH edges is a placement defect.
+    render = [
+        Word(text=f"w{i}", start=i * 0.5 + 0.45, end=i * 0.5 + 0.48, probability=0.9)
+        for i in range(8)
+    ]
+    cam = [Word(text=f"w{i}", start=i * 0.5, end=i * 0.5 + 0.48, probability=0.9) for i in range(8)]
+    assert diagnose_words(render, cam, min_run_words=3) == []
+
+
 def test_content_mismatch_is_flagged() -> None:
-    render = _words("сегодня мы говорим о совершенно других вещах", 0.0)
-    cam = _words("сегодня мы говорим о синхронизации звука здесь", 0.0)
+    render = _words("сегодня мы говорим о теме совершенно других непохожих чужих вещей", 0.0)
+    cam = _words("сегодня мы говорим о теме монтажа синхронизации звука и видео", 0.0)
     spans = diagnose_words(render, cam)
     assert any(s.kind == "content" for s in spans)
 

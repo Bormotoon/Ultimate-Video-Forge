@@ -132,23 +132,34 @@ def extract_audio_to_wav(
     output_path: Path | None = None,
     sample_rate: int = 16000,
     mono: bool = True,
+    start_s: float | None = None,
+    duration_s: float | None = None,
 ) -> Path:
+    """Decode a file's audio to PCM WAV; ``start_s``/``duration_s`` decode
+    only that window (fast input seek) instead of the whole file — a
+    multi-hour recorder shouldn't be fully decoded when the caller needs a
+    few seconds of it for one local measurement."""
     if output_path is None:
         fd, tmp_name = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         output_path = Path(tmp_name)
 
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-vn",
-        "-acodec",
-        "pcm_s16le",
-        "-ar",
-        str(sample_rate),
-    ]
+    cmd = ["ffmpeg", "-y"]
+    if start_s is not None and start_s > 0:
+        cmd.extend(["-ss", f"{start_s:.6f}"])
+    if duration_s is not None:
+        cmd.extend(["-t", f"{duration_s:.6f}"])
+    cmd.extend(
+        [
+            "-i",
+            str(input_path),
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            str(sample_rate),
+        ]
+    )
     if mono:
         cmd.extend(["-ac", "1"])
     cmd.append(str(output_path))

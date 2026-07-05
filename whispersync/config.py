@@ -255,9 +255,12 @@ class WhisperSyncConfig:
     # default since self-check only needs to catch gross defects, not match
     # transcribe_mode's own accuracy bar.
     self_check_transcribe_mode: str = "fast"
-    self_check_min_run_words: int = 3  # words in a run before a timing shift can be flagged
-    self_check_shift_threshold_s: float = 0.25  # median per-word delta above normal Whisper jitter
-    self_check_min_content_words: int = 3  # words in a mismatch before it's flagged as content
+    # Detection thresholds, field-calibrated on real footage (see
+    # engine/self_check.py): the softest values that produced ZERO false
+    # spans on a clip whose measured acoustic lag was <25 ms everywhere.
+    self_check_min_run_words: int = 5  # words in a run before a timing shift can be flagged
+    self_check_shift_threshold_s: float = 0.35  # min-over-edges per-word delta, beyond echo jitter
+    self_check_min_content_words: int = 5  # words in a mismatch before it's flagged as content
     # Split each rendered voice WAV into segments of this many minutes
     # (0 = keep one continuous file per clip, the default). Cut points snap
     # to the quietest moment near each nominal boundary, so a cut never lands

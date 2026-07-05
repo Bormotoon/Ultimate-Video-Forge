@@ -52,6 +52,7 @@ from whispersync.engine.transcriber import WhisperEngine
 from whispersync.engine.transcript_export import save_transcript
 from whispersync.models import (
     AlignmentMap,
+    Anchor,
     MediaClip,
     RetakeGroup,
     SyncResult,
@@ -993,23 +994,49 @@ def _repair_span(
     if new_am is None:
         return None
 
+    # Splice boundaries snap to the CAMERA transcript's inter-word silences:
+    # the re-rendered chunk's first/last piece carries a declick fade from
+    # zero, so a splice landing mid-word would put an audible 10 ms dip inside
+    # speech — in a word gap the same dip sits in room tone and disappears.
     lo = max(0.0, span.start - _REPAIR_MARGIN_S)
     hi = min(monolith_duration, span.end + _REPAIR_MARGIN_S)
+    cam_gaps = recorder_word_gaps([(w.start, w.end) for w in cam_words])
+    lo = min(_snap_to_word_gap(lo, cam_gaps, config.seam_snap_max_s), span.start)
+    hi = max(_snap_to_word_gap(hi, cam_gaps, config.seam_snap_max_s), span.end)
+    lo = max(0.0, lo)
+    hi = min(monolith_duration, hi)
     if hi - lo <= 1e-3:
         return None
 
+    # _sentence_pieces plans in the map's own LOCAL-time coordinates, assuming
+    # they start at 0 (its head logic places sentence 0 at its absolute target
+    # position) — so hand it a WINDOW-relative map: local time 0 = `lo`. Both
+    # the offset and every anchor's cam_time shift by -lo; recorder times are
+    # untouched.
     k = new_am.k or 1.0
-    rec0 = max(0.0, (lo - new_am.offset) / k)
-    rec1 = min(job.rec_duration, (hi - new_am.offset) / k)
+    win_am = AlignmentMap(
+        anchors=[
+            Anchor(
+                cam_time=a.cam_time - lo,
+                rec_time=a.rec_time,
+                token=a.token,
+                confidence=a.confidence,
+            )
+            for a in new_am.anchors
+        ],
+        offset=new_am.offset - lo,
+        k=k,
+        residual_ms=new_am.residual_ms,
+    )
+    rec0 = max(0.0, (0.0 - win_am.offset) / k)
+    rec1 = min(job.rec_duration, ((hi - lo) - win_am.offset) / k)
     if rec1 - rec0 <= 1e-3:
         return None
 
     rec_word_spans = [(w.start, w.end) for w in rec_words]
-    plan = _sentence_pieces(new_am, rec0, rec1, rec_word_spans, config)
+    plan = _sentence_pieces(win_am, rec0, rec1, rec_word_spans, config)
     if plan is None:
         out_dur = hi - lo
-        if out_dur <= 1e-3:
-            return None
         plan = (0.0, [(rec0, rec1 - rec0, (rec1 - rec0) / out_dur)])
     lead, pieces = plan
     if not pieces:
@@ -1627,11 +1654,10 @@ def run_pipeline(
         # its VRAM now rather than in the `finally` block at the very end —
         # holding it through rendering/ambience is a common cause of GPU OOM on
         # cards with 8-12 GB VRAM. See PROJECT_ANALYSIS.md §6.1. Self-check
-        # needs the engine again right after rendering (to transcribe the
-        # rendered monolith), so when it's enabled the unload is deferred past
-        # that stage instead — rendering itself is pure ffmpeg either way, so
-        # holding the model through it only costs idle VRAM, not speed.
-        if engine is not None and config.self_check_mode == "off":
+        # (below) creates its OWN engine with its own transcribe mode, so
+        # keeping this one loaded "for later" would only mean two copies of
+        # the model in VRAM at once — always unload here.
+        if engine is not None:
             engine.unload()
             engine = None
 
@@ -1826,7 +1852,13 @@ def run_pipeline(
                                 repaired_path = candidate
                                 fixed_any = True
                         if fixed_any:
-                            aclip.path = repaired_path
+                            # Replace the original monolith IN PLACE: the
+                            # repaired file currently lives in repair_tmp — a
+                            # scratch dir deleted in the outer `finally` — so
+                            # leaving aclip.path pointing there would hand the
+                            # FCPXML a path that no longer exists by the time
+                            # the user opens it.
+                            os.replace(repaired_path, aclip.path)
                             rendered_transcript = check_engine.transcribe(aclip.path)
                             spans = check_rendered_clip(
                                 rendered_transcript.words, cam_words, config
@@ -1844,12 +1876,6 @@ def run_pipeline(
                         )
             finally:
                 check_engine.unload()
-            # The main engine was only kept loaded for self-check to reuse its
-            # VRAM headroom timing; free it now rather than holding it through
-            # ambience separation / the optional master-WAV mix below.
-            if engine is not None:
-                engine.unload()
-                engine = None
 
         # --- optionally split each rendered voice monolith into N-minute
         # segments (cut in silence), so an NLE's own audio sync (e.g. FCPX

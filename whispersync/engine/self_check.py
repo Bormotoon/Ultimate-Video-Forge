@@ -31,6 +31,7 @@ speech actually comes from, i.e. a fresh local alignment.
 
 from __future__ import annotations
 
+import bisect
 import difflib
 import logging
 from collections.abc import Sequence
@@ -48,18 +49,23 @@ logger = logging.getLogger(__name__)
 __all__ = ["SelfCheckSpan", "check_rendered_clip", "realign_span"]
 
 # A run of at least this many consecutive matched words with a median timing
-# delta above this many seconds is flagged as "shifted". Normal cross-run
-# Whisper word-timing jitter (two independent transcriptions of conceptually
-# the same speech) is on the order of ±50-100 ms per word; a sustained
-# multi-word median past 250 ms is well outside that noise band.
-DEFAULT_MIN_RUN_WORDS = 3
-DEFAULT_SHIFT_THRESHOLD_S = 0.25
+# delta above this many seconds is flagged as "shifted". Calibrated on a real
+# 7-minute clip whose measured acoustic lag was <25 ms everywhere (i.e. any
+# span flagged there is a false positive): comparing a clean-recorder
+# transcription against a noisy-camera transcription of the same speech
+# produces word-timing disagreements well past the naive ±100 ms estimate —
+# echo smears word onsets by 300-500 ms — so the deltas use min-over-edges
+# and wrong-occurrence rejection (see _shifted_spans), and these values are
+# the softest ones that produced ZERO false spans on that material.
+DEFAULT_MIN_RUN_WORDS = 5
+DEFAULT_SHIFT_THRESHOLD_S = 0.35
 
 # A content run (words present on one side with no match on the other) at
-# least this long is flagged as "content" — short 1-2 word gaps are routine
-# Whisper transcription disagreement (a dropped filler word, a differently
-# split contraction), not evidence the render used the wrong audio.
-DEFAULT_MIN_CONTENT_WORDS = 3
+# least this long is flagged as "content" — short gaps are routine Whisper
+# disagreement (the camera's echoey audio makes it mishear or drop words a
+# clean recorder track keeps: 3-word one-sided runs were common on real
+# material with perfect acoustic sync), not evidence of wrong render audio.
+DEFAULT_MIN_CONTENT_WORDS = 5
 
 
 @dataclass
@@ -99,6 +105,22 @@ def _median(values: list[float]) -> float:
     return s[len(s) // 2]
 
 
+def _has_same_time_counterpart(
+    norm: str, t: float, cam_times_by_norm: dict[str, list[float]], tol_s: float
+) -> bool:
+    """Whether the camera transcript contains the SAME normalized token
+    within ``tol_s`` of time ``t``. Used to reject wrong-occurrence matches:
+    difflib's LCS happily pairs a common word (or a whole repeated phrase —
+    a retake!) with a far-away occurrence of the same text, producing a huge
+    but fake timing delta. If the correct-time counterpart exists, the match
+    simply went to the wrong twin — the audio at ``t`` is fine."""
+    times = cam_times_by_norm.get(norm)
+    if not times:
+        return False
+    i = bisect.bisect_left(times, t)
+    return any(0 <= j < len(times) and abs(times[j] - t) <= tol_s for j in (i - 1, i))
+
+
 def _shifted_spans(
     render_toks: list[_Tok],
     cam_toks: list[_Tok],
@@ -118,11 +140,41 @@ def _shifted_spans(
     on its own median, so a local anomaly is caught regardless of what comes
     before or after it; overlapping/adjacent flagged windows are then merged
     into one reported span.
+
+    A pair whose delta exceeds the threshold is first checked for a
+    same-time counterpart (``_has_same_time_counterpart``): validated on a
+    real 7-minute clip, every large "shift" difflib produced was a common
+    word or repeated phrase matched to the wrong occurrence (deltas up to
+    5.9 s on a clip whose measured acoustic lag was <25 ms everywhere) — a
+    genuine render defect means the content is NOT present at the right
+    time, so the existence of a right-time twin clears the pair.
     """
     n = len(equal_pairs)
     if n < min_run_words:
         return []
-    deltas = [abs(render_toks[ri].start - cam_toks[ci].start) for ri, ci in equal_pairs]
+    cam_times_by_norm: dict[str, list[float]] = {}
+    for t in cam_toks:
+        cam_times_by_norm.setdefault(t.norm, []).append(t.start)
+    for times in cam_times_by_norm.values():
+        times.sort()
+
+    deltas: list[float] = []
+    for ri, ci in equal_pairs:
+        # min over both word edges: Whisper's start times are its noisiest
+        # output (breath/onset ambiguity, echo smearing the attack on the
+        # camera track can move a start by 300-500 ms between two honest
+        # transcriptions of the same speech), while a REAL placement shift
+        # moves both edges together — so a word is "in place" if EITHER edge
+        # agrees.
+        delta = min(
+            abs(render_toks[ri].start - cam_toks[ci].start),
+            abs(render_toks[ri].end - cam_toks[ci].end),
+        )
+        if delta > shift_threshold_s and _has_same_time_counterpart(
+            render_toks[ri].norm, render_toks[ri].start, cam_times_by_norm, shift_threshold_s
+        ):
+            delta = 0.0  # wrong-occurrence match; the right-time twin exists
+        deltas.append(delta)
 
     flagged: list[tuple[int, int]] = []  # (start_idx, end_idx) into equal_pairs, inclusive
     for i in range(n - min_run_words + 1):
@@ -312,6 +364,7 @@ def _local_transcript_realign(
 def _local_acoustic_realign(
     cam_lo: float,
     cam_hi: float,
+    prior_offset: float,
     prior_k: float,
     cam_audio_wav: Path,
     rec_audio_path: Path,
@@ -319,19 +372,34 @@ def _local_acoustic_realign(
 ) -> AlignmentMap | None:
     """Fallback when the transcript re-match found too few anchors: a single
     GCC-PHAT cross-correlation over the WHOLE flagged span (not per-boundary
-    like Boundary Flex), reusing the current clock rate ``prior_k`` — a short
-    span rarely has enough duration to fit its own trustworthy K, but the
-    offset alone recovers "which part of the recorder this really is"."""
+    like Boundary Flex), reusing the current clock map ``prior_offset``/
+    ``prior_k`` as the search center — a short span rarely has enough
+    duration to fit its own trustworthy K, but the offset alone recovers
+    "which part of the recorder this really is".
+
+    Only the needed window (± a little margin) of each track is decoded —
+    the recorder can be hours long, and decoding all of it to a mono-16k
+    array for one local measurement would dominate the repair's cost.
+    """
     from whispersync.engine.acoustic import _REFINE_SR, _window_slice, gcc_phat, load_mono16k_track
 
-    cam_track = load_mono16k_track(cam_audio_wav)
-    rec_track = load_mono16k_track(rec_audio_path)
     win = max(cam_hi - cam_lo, 2.0)
-    rec_win = win + 2 * config.acoustic_max_lag_s
     cam_mid = (cam_lo + cam_hi) / 2.0
-    rec_mid_guess = cam_mid / prior_k if prior_k else cam_mid
-    cam_sig = _window_slice(cam_track, cam_mid, win, _REFINE_SR)
-    rec_sig = _window_slice(rec_track, rec_mid_guess, rec_win, _REFINE_SR)
+    # The recorder time this camera moment maps to under the CURRENT (possibly
+    # stale) alignment — the acoustic probe searches ±max_lag around it.
+    rec_mid_guess = (cam_mid - prior_offset) / prior_k if prior_k else cam_mid
+    if rec_mid_guess < 0:
+        return None
+
+    # Decode a window around each center (window + max-lag margin on each
+    # side), then slice the *decoded* arrays relative to their own origins.
+    margin = win / 2.0 + config.acoustic_max_lag_s + 0.5
+    cam_start = max(0.0, cam_mid - margin)
+    rec_start = max(0.0, rec_mid_guess - margin)
+    cam_track = load_mono16k_track(cam_audio_wav, start_s=cam_start, duration_s=2 * margin)
+    rec_track = load_mono16k_track(rec_audio_path, start_s=rec_start, duration_s=2 * margin)
+    cam_sig = _window_slice(cam_track, cam_mid - cam_start, win, _REFINE_SR)
+    rec_sig = _window_slice(rec_track, rec_mid_guess - rec_start, win, _REFINE_SR)
     lag_s, sharp = gcc_phat(cam_sig, rec_sig, _REFINE_SR, config.acoustic_max_lag_s, config.gcc_eps)
     if sharp < config.acoustic_fallback_min_sharpness:
         return None
@@ -374,4 +442,6 @@ def realign_span(
         return result
     if cam_audio_wav is None:
         return None
-    return _local_acoustic_realign(cam_lo, cam_hi, k, cam_audio_wav, rec_audio_path, config)
+    return _local_acoustic_realign(
+        cam_lo, cam_hi, am.offset, k, cam_audio_wav, rec_audio_path, config
+    )

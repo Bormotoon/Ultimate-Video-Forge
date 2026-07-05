@@ -347,11 +347,11 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav --self-check warn
 python main.py --cli --video-dir ./videos --audio-file rec.wav --self-check repair
 ```
 
-> **How it works (detection).** The rendered voice WAV is transcribed fresh (`self_check_transcribe_mode`, default `fast`) and matched against the camera transcript at the token level via the same normalize+difflib approach used for anchor matching. A run of `self_check_min_run_words` (default 3) or more consecutive matched words whose median timing delta exceeds `self_check_shift_threshold_s` (default 0.25s) is flagged `shifted`; a run of `self_check_min_content_words` (default 3) or more words with no counterpart at all on the other side is flagged `content`.
+> **How it works (detection).** The rendered voice WAV is transcribed fresh (`self_check_transcribe_mode`, default `fast`) and matched against the camera transcript at the token level via the same normalize+difflib approach used for anchor matching. A run of `self_check_min_run_words` (default 5) or more consecutive matched words whose median timing delta exceeds `self_check_shift_threshold_s` (default 0.35s) is flagged `shifted`; a run of `self_check_min_content_words` (default 5) or more words with no counterpart at all on the other side is flagged `content`. Two discriminators keep transcription noise out (both field-calibrated on real footage whose measured acoustic lag was <25 ms everywhere): a word's delta is the *minimum* over its start and end edges (echo smears word onsets on the camera track by 300-500 ms even when sync is perfect — a real shift moves both edges), and a large delta is discarded when the same word also exists on the camera side at the *right* time (difflib pairing a common word or a repeated phrase with the wrong far-away occurrence, not a render defect).
 >
 > **How it works (repair).** An ffmpeg render is deterministic — re-rendering the exact same recorder span verbatim would reproduce a content defect byte-for-byte, so the only thing that fixes either a `shifted` or a `content` span is re-deriving where in the recorder this stretch of speech actually comes from. `repair` re-aligns just that neighbourhood: first a transcript re-match restricted to the flagged span plus a few seconds of context (the same normalize+difflib+RANSAC approach used for the whole-clip alignment, just windowed), falling back to a local GCC-PHAT acoustic re-check (as used by Boundary Flex / the acoustic fallback) when there aren't enough words nearby to trust a re-match. The repaired stretch is re-planned with the same sentence-wise piece logic as the main render, rendered, and spliced into the existing monolith — everything outside the flagged span+margin is untouched, byte-for-byte.
 >
-> **Cost.** This is an extra full Whisper pass per rendered clip (a second pass if any span needed a repair attempt, to verify the fix), run *after* the main transcription engine would normally have been unloaded to free VRAM for rendering — enabling `--self-check` keeps the model loaded (or reloads it) through the render phase instead.
+> **Cost.** This is an extra full Whisper pass per rendered clip (a second pass if any span needed a repair attempt, to verify the fix). The main transcription engine is still unloaded before rendering as usual (rendering is pure ffmpeg); self-check then loads its own engine — one model reload, never two copies of the model in VRAM at once.
 
 ## Configuration
 
@@ -406,9 +406,9 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
     "retake_max_gap_s": 6.0,
     "self_check_mode": "off",
     "self_check_transcribe_mode": "fast",
-    "self_check_min_run_words": 3,
-    "self_check_shift_threshold_s": 0.25,
-    "self_check_min_content_words": 3
+    "self_check_min_run_words": 5,
+    "self_check_shift_threshold_s": 0.35,
+    "self_check_min_content_words": 5
 }
 ```
 
@@ -437,7 +437,7 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
 | `retake_max_gap_s` | float | Max pause between consecutive attempts of the same line (default 6.0s) |
 | `self_check_mode` | str | `off` / `warn` / `repair` — re-transcribe each rendered clip and flag (or additionally repair) content/timing spans vs. the camera transcript (default `off`) |
 | `self_check_transcribe_mode` | str | `fast`/`quality` Whisper mode for the self-check pass, independent of `transcribe_mode` (default `fast`) |
-| `self_check_shift_threshold_s` | float | Median per-word timing delta (s) above which a run is flagged `shifted` (default 0.25) |
+| `self_check_shift_threshold_s` | float | Min-over-edges per-word timing delta (s) above which a run is flagged `shifted` (default 0.35, field-calibrated) |
 
 ## Output Files
 

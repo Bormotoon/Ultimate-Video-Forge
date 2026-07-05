@@ -4,6 +4,53 @@ All notable changes to WhisperSync will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed/Changed — self-check hardening after a real-footage QA run
+
+A full review + field run (6.9-min DJI clip against the 93-min recorder,
+`--self-check repair --detect-retakes --verify`) surfaced three real bugs in
+the freshly-added repair path and showed the detection thresholds were far
+too trusting of Whisper word timings on real (echoey) camera audio:
+
+- **Repair rendered silence (coordinate-space bug):** `_repair_span` fed
+  `_sentence_pieces` a window of the clip while its planning math places
+  sentences at ABSOLUTE clip-local target times — for a span at e.g. 150s
+  the "repaired" chunk began with ~150s of lead silence and was trimmed to
+  the window length, i.e. pure silence. The original integration test
+  checked only duration/channels and passed anyway; it now verifies window
+  CONTENT (RMS + GCC-PHAT lag vs the original, plus a nonzero-offset-map
+  variant), and `_repair_span` hands `_sentence_pieces` a window-relative
+  alignment map (offset and anchor cam-times shifted by −window-start).
+- **Repaired monolith vanished before export:** the repaired file lived in a
+  `whispersync_repair_*` scratch dir that the pipeline's `finally` deletes,
+  so the FCPXML would reference a path that no longer existed. The repair
+  now `os.replace`s the original monolith in place; `aclip.path` never
+  changes.
+- **Local acoustic re-check probed the wrong recorder spot:** it ignored the
+  alignment's offset (`rec_guess = cam_mid / k` instead of
+  `(cam_mid − offset) / k`) and used a wider recorder window that gcc_phat
+  silently truncates from the START, biasing the measured lag by the width
+  difference. Both fixed; the probe also now decodes only the needed window
+  (`load_mono16k_track(start_s=, duration_s=)`) instead of the entire
+  (possibly multi-hour) recorder per span.
+- **Two model copies in VRAM:** the main engine's unload was deferred "for
+  self-check to reuse", but self-check builds its OWN engine with its own
+  mode — during self-check both models sat in VRAM. The main engine now
+  always unloads before rendering; self-check loads fresh (one reload/run).
+- **Splice boundaries snap to camera word gaps** (reusing seam-snap), so the
+  re-rendered chunk's edge fades land in room tone instead of mid-word.
+- **Detection discriminators (the QA run's main lesson):** on a clip whose
+  measured realized lag was 8.5 ms median / 23 ms p90 (69/69 confident
+  GCC-PHAT windows — i.e. every flagged span was a false positive), the old
+  detector flagged 10 spans, including a "5.9 s shift" that was difflib
+  matching a repeated phrase to its other occurrence. Word deltas now take
+  the minimum over start/end edges (echo smears onsets by 300-500 ms on the
+  camera track even in perfect sync; a real shift moves both edges), and a
+  large delta is discarded when the same token exists on the camera side at
+  the right time (wrong-occurrence match, not a defect). Defaults
+  recalibrated to the softest zero-false-positive values on that material:
+  `self_check_min_run_words` 3→5, `self_check_shift_threshold_s` 0.25→0.35,
+  `self_check_min_content_words` 3→5.
+
 ### Added — post-render self-check (content diagnostics + optional repair)
 
 - **`self_check_mode` / `--self-check {warn,repair}` / GUI "Self-check"
@@ -55,11 +102,11 @@ All notable changes to WhisperSync will be documented in this file.
   automatic repair.
 - Self-check transcription is a deliberate second Whisper pass, independent
   of the main `transcribe_mode` (`self_check_transcribe_mode`, default
-  `fast`) — it runs AFTER the main engine would normally be unloaded to free
-  VRAM for rendering, so enabling it defers that unload until after the
-  self-check (and any repair re-check) pass instead (rendering itself is pure
-  ffmpeg either way, so this only costs idle VRAM headroom during rendering,
-  not speed).
+  `fast`). The main engine is unloaded before rendering as usual; self-check
+  then loads its own engine — one model reload per run, and never two copies
+  of the model in VRAM at once (an earlier revision deferred the main
+  engine's unload "for self-check to reuse", but self-check builds its own
+  engine with its own mode, so that only doubled VRAM for nothing).
 
 ### Added — retake detection (Final Cut auditions)
 
