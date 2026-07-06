@@ -142,6 +142,61 @@ class HelpPage(QWidget):
             "</ul>"
         )
 
+        self._heading("Ambience track")
+        self._para(
+            "(On by default) — an AI source-separation model strips the camera's "
+            "own (echoey, slightly mis-synced) voice out of its scratch audio and "
+            "keeps only the room tone, placed on its own lane below the clean "
+            "synced voice. Without this, the camera's doubled voice would comb-"
+            "filter against the recorder's. Needs the separate <code>.sep-venv</code> "
+            "environment (see <code>setup_sep_venv.sh</code>); skipped with a "
+            "warning if it isn't set up."
+        )
+
+        self._heading("Voice file split")
+        self._para(
+            "One continuous file per clip by default — or split each rendered "
+            "voice WAV into segments of a chosen length (1&ndash;10&nbsp;min), cut "
+            "at the quietest moment near each boundary so a cut never lands mid-"
+            "speech. Useful when your NLE's own audio sync (e.g. Final Cut's "
+            "<i>Synchronize Clips</i>) re-aligns each audio item independently: "
+            "shorter segments let it correct any residual drift every few minutes "
+            "instead of just once per clip."
+        )
+
+        self._heading("Retake detection")
+        self._para(
+            "<b>Detect retakes</b> (off by default) — finds lines the speaker "
+            "re-recorded back-to-back in an unedited take (flub, stop, restart, "
+            "sometimes several times) and groups each set of attempts into a "
+            "Final Cut <i>audition</i>: a non-destructive stack of alternatives, "
+            "with the last attempt active by default. Press <b>Q</b> in Final Cut "
+            "while an audition is selected to browse the other takes. Nothing is "
+            "ever deleted or reordered — a false positive just means one audition "
+            "to dismiss."
+        )
+
+        self._heading("Self-check")
+        self._para(
+            "(Off by default) — Boundary Flex and <code>--verify</code> only "
+            "measure whether the recorder and camera <i>waveforms</i> line up; "
+            "they're blind to CONTENT defects, like a dropped word or a piece "
+            "rendered from the wrong stretch of the recorder. Self-check closes "
+            "that gap: after rendering, it re-transcribes each clip's voice "
+            "monolith and compares it word-for-word against the camera clip's own "
+            "transcript, flagging spans where content or timing diverge beyond "
+            "normal cross-run Whisper jitter."
+            "<ul>"
+            "<li><b>Warn only</b> — just reports what it found; nothing is "
+            "re-rendered.</li>"
+            "<li><b>Warn + auto-repair</b> — additionally re-aligns and "
+            "re-renders each flagged span's own small stretch of audio, then "
+            "checks the result once more before accepting the fix.</li>"
+            "</ul>"
+            "Costs one extra Whisper pass per rendered clip (two if any span "
+            "needs a repair attempt)."
+        )
+
         self._heading("Voice enhancement")
         self._para(
             "After rendering, an optional third-party model can clean up the synced "
