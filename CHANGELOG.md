@@ -4,12 +4,312 @@ All notable changes to WhisperSync will be documented in this file.
 
 ## [Unreleased]
 
+### Audit remediation (PROJECT_AUDIT_2026-09-08)
+
+A project-wide audit found that the main risk was not style but **silently
+wrong results**: work that looked successful while the audio, the timeline or
+the diagnosis was incorrect. The changes below are grouped by what could go
+wrong, not by file.
+
+#### Results could be overwritten or invented
+
+- **Every source now has a stable id** (`engine/sources.py`). File stems were
+  being used as identifiers, so `/A/take.wav` and `/B/take.wav` both produced
+  `.master/take_master.wav`: the second extraction overwrote the first and
+  *both* recorders then rendered from one file. The same collision hit
+  `clip.mov` vs `clip.mp4`, two cameras' identically-named clips, and their
+  exported transcripts. Master audio, rendered voice, transcripts and ambience
+  are all named from the id; display names are for the UI only.
+- **Each run owns its scratch and locks its output** (`engine/workspace.py`).
+  Runs shared `audio_synced/`, `.master/` and `enhance_tmp/` under ffmpeg's
+  `-y`, so a second run overwrote the audio the first run's FCPXML still
+  referenced and either run's cleanup deleted files the other was reading. A
+  concurrent run on the same output folder is now refused with an explanation.
+- **Results are published atomically.** The FCPXML, the master WAV and every
+  rendered voice track are written to a temporary beside their destination and
+  moved into place only when complete, so a crash or cancellation mid-render
+  can no longer replace a previous good result with a fragment.
+- **The separator can no longer return a stale file.** Each batch runs into a
+  private output directory and every output is verified (readable, non-empty,
+  positive duration) before publication — a partially failed earlier run used
+  to leave files with exactly the names the next run would look for, and those
+  were accepted as its results.
+- **Cache pruning only deletes its own files.** With a user-chosen `cache_dir`
+  and `cache_max_age_days` set, retention deleted every old `*.json` in that
+  directory. Transcripts now live in a `transcripts/` subdirectory and each
+  file's name shape and schema marker are checked before any unlink.
+- **A duplicated input file is rejected** instead of being processed twice
+  under two identities.
+
+#### Audio and timeline could be wrong
+
+- **One acceptance gate for every alignment** (`matcher.evaluate_alignment`).
+  Placement and rendering judged maps separately, so a map placement had
+  rejected could still be used to cut audio; neither looked at the clock ratio,
+  the residual or how much of the clip the evidence covered. A two-anchor fit
+  with `k=10`, `offset=-1004 s` and a sub-millisecond residual passed both. A
+  map that fails the gate becomes an explicit *unresolved* clip.
+- **Boundary Flex actually moves the speech.** The correction shifted a piece's
+  read position and its output position by compensating amounts, which cancel
+  exactly: a −80 ms correction left a recorder event at 107 s on camera 7 s,
+  precisely where it started. Corrections now re-target read boundaries while
+  output positions stay fixed, so the plan's length and contiguity are
+  invariant by construction.
+- **Pause ducking used the time map backwards.** Recorder words were projected
+  with `(t − offset) / k` — the inverse of the map — so with a non-zero offset
+  real speech was classified as silence and attenuated by 18 dB. Invisible on
+  the identity maps the old tests used.
+- **An implausible tempo now rejects the breakpoint** instead of being clamped.
+  Clamping kept the bad anchor and broke the geometry: a 10 s clip came out
+  with 9.8 s of pieces. Plans are validated (`pipeline.validate_pieces`).
+- **The acoustic scan has no blind spots.** It probed the recorder on a 30 s
+  grid and searched ±1 s around each probe — 2 s inspected out of every 30 — so
+  a true offset landing in a hole was reported as "no match". Camera windows
+  are now correlated against whole overlapping recorder blocks, and a window
+  whose best match barely beats a rival elsewhere is declined rather than
+  resolved by argmax.
+- **A successful acoustic match is no longer discarded.** Confidence was
+  measured by `len(anchors)`, which is zero for an acoustic map by
+  construction; `AlignmentMap.provenance`/`inliers`/`evidence_span_s` now carry
+  the evidence.
+- **Float recorders keep their headroom.** A 32-bit float source was conformed
+  to `pcm_s32le` purely because it was "32-bit", hard-clipping every sample
+  above full scale — unrecoverable.
+- **Probing and decoding agree on the audio stream.** ffprobe's "first audio
+  stream" and ffmpeg's automatic selection are different rules, so a container
+  with a mono mic plus a silent stereo scratch track could be probed on one and
+  decoded from the other. The chosen stream is recorded and mapped explicitly.
+- **VFR duration** uses timestamps instead of `nb_frames / r_frame_rate`, which
+  reported 8 s for a 10 s file.
+- **Negative lip-sync calibration is delivered, not clamped.** Two serializers
+  independently clamped the resulting negative offset to zero, producing
+  exactly the uncalibrated result. The whole plan's origin is shifted instead.
+- **Unresolved clips fall back per camera**, not after an unrelated camera's
+  last clip.
+- **Large WAVs are written as RF64 when needed** (`-rf64 auto`) — plain RIFF
+  cannot describe a file past 4 GiB, which stereo 48 kHz/24-bit reaches in
+  ~4.1 hours.
+- **The master mix no longer clips.** `amix` with `normalize=0` sums past full
+  scale; correlated microphones produced hard-clipped output (measured flat
+  factor ~30). The mix runs in float with a limiter at 0 dBFS.
+
+#### The exported project could not be trusted
+
+- **Simultaneous cameras are stacked, not queued.** Every camera went into the
+  spine, which is a single sequential track, so two cameras both covering
+  [0, 10] were exported as A [0, 10] and B [10, 20] — twenty seconds of footage
+  from a ten-second shoot, with the audio still at its true positions. One
+  camera forms the primary storyline; the rest are connected clips on their own
+  lanes.
+- **Replaced camera audio is muted** with `srcEnable="video"`. `videoRole` does
+  not disable audio, so the camera's own microphone played under the clean
+  synced voice — two copies of the same speech, comb-filtering. Clips with no
+  replacement keep their sound.
+- **Retakes are exported as markers, not auditions.** The audition played the
+  keeper take's audio at the group's start while the picture did not switch at
+  all: takes at [2,4] and [5,8] put the voice 3 s ahead and left a hole in the
+  clean track. Markers convey the same finding with no risk to the A/V
+  relationship.
+- **FCPXML validation actually validates.** It accepted a document with a
+  dangling `ref` and a nonsense duration. It now checks resource references,
+  time values, positive durations, media existence and that the sequence covers
+  its spine. `export.fcpxml_intervals` recovers absolute intervals for
+  round-trip testing.
+- **Retake groups keep all their attempts.** Three identical takes produced a
+  group of two with the middle one kept, because the backward extension walked
+  into the previous attempt and the resulting negative gap rejected the third.
+
+#### Diagnosis could not be trusted
+
+- **Self-check distinguishes passed / failed / inconclusive.** An empty span
+  list meant all three: a render containing *no speech at all* against a camera
+  clip with six words was reported as clean — total content loss reading as a
+  pass — and "could not be checked" was indistinguishable from "checked and
+  fine".
+- **A lost tail is flagged at the tail.** A render keeping only [0, 0.2] of a
+  clip whose camera held six more words out to 20 s produced a span of
+  [0.2, 0.2]: a zero-length flag at the start for a twenty-second hole at the
+  end, which no repair could act on.
+- **Verification uses the real source and range.** Voice clips were matched
+  back to their video by `display_name.startswith(stem)`, which paired `A1`
+  with `A10`, collapsed two cameras' identically named clips, and compared a
+  voice *segment* covering minutes 5–10 against the opening seconds of the
+  video — reporting the five-minute content difference as lip-sync lag. Clips
+  now carry an explicit `source_ref`.
+- **Verification reports honest coverage.** Rejected windows were dropped
+  before counting, so the report always read N/N: three windows with sharpness
+  [100, 1, 1] reported "1/1 confident" instead of 1/3. A pass now also requires
+  enough independent, well-spread measurements; `inconclusive` is a distinct
+  outcome and exit code.
+- **`--grid-s 0` no longer hangs.** A zero grid left the sampling cursor in
+  place and a negative one walked it backwards, so the loop never terminated.
+
+#### Cancelling, closing and failing
+
+- **Cancel actually stops the run.** It emitted a log line and nothing else, so
+  neither `finished` nor `error` fired — and those are what stop the thread and
+  restore the buttons. The QThread kept running and the window stayed stuck
+  mid-run. `SyncWorker.cancelled` is now a third terminal outcome.
+- **Closing waits for the pipeline.** `quit()` cannot interrupt an executing
+  slot, so the window closed over a live worker. The close is deferred until
+  the thread really stops; a second close forces it.
+- **Cleanup waits for render workers.** `shutdown(wait=False)` returned while
+  ffmpeg workers were still running, and the scratch and masters they were
+  using were then deleted underneath them.
+- **`fork` is never used for the render pool.** The `threading.active_count()`
+  heuristic cannot see Qt, CTranslate2 or CUDA native threads — probed inside a
+  real QThread it returned 1, selecting `fork` in exactly the situation the
+  check existed to prevent.
+- **Cancellation reaches long stages.** Extraction, Flex, enhancement,
+  self-check and segmentation each ran to completion first.
+- **Optional-backend timeouts degrade instead of aborting.**
+  `subprocess.TimeoutExpired` is not a `RuntimeError`/`OSError`, so it flew past
+  every caller's fallback and destroyed a finished project for an optional
+  stage.
+- **A padded clip whose length cannot be restored is discarded**, not published
+  — a 12-second file standing in for a 1.75-second clip desynchronises
+  everything after it.
+- **Ambience skips silent clips and survives per-clip failures.** One silent
+  b-roll clip raised outside the batch's `try` and threw away the whole export
+  after hours of rendering.
+- **Resemble staging resolves its symlinks.** A relative target produced a
+  directory of dangling links that every existence check passed.
+- **The system check survives its own diagnostics.** An ffmpeg that hung or was
+  not executable took the whole report down; disk space is now measured on the
+  output, cache and temp filesystems rather than `/`.
+- **Configuration is validated once, up front** (`WhisperSyncConfig.validate`).
+  `seed_bin_width=0`, the string `"false"` for a boolean, `NaN`, and unknown
+  enum values were all accepted and surfaced hours later as strange results.
+  Config errors are now a usage error (exit 2) with a message naming every
+  problem at once.
+- **The GUI remembers all recorders**, and browse/drop/restore share one
+  handler; missing paths are named rather than silently dropped.
+
+#### Found during the verification pass
+
+- **Voice segmentation re-introduced the float-clipping defect.** The
+  segment cutter chose its codec from bit depth alone, so a float voice
+  monolith was cut to `pcm_s32le` — hard-clipping every sample above full
+  scale at the very last step, after the render path had carefully preserved
+  it. Every codec-selection site now goes through the format-aware helper.
+- **The self-check repair map was not gated.** A local fit over a handful of
+  anchors inside one flagged span could produce an implausible clock ratio and
+  then re-render that span at the wrong tempo — replacing a defect the user
+  could hear with one they could not explain. It now faces the same clock-ratio
+  and residual bar as any other map, and declines rather than guessing.
+- **The two negative-offset clamps now warn instead of absorbing silently.**
+  The plan's origin is normalised upstream so they are unreachable, but a clamp
+  that quietly discards a requested offset is exactly how the original defect
+  hid; if one is ever reached again it says so.
+
+#### Packaging and performance
+
+- **`--verify` works from an installed wheel.** Its implementation lived in
+  `tools/`, which package discovery does not ship, so it raised
+  `ModuleNotFoundError` at the END of a completed sync run. It moved to
+  `whispersync/engine/verify.py`; `tools/verify_sync.py` is a thin CLI wrapper.
+- **The GUI stylesheet ships**, declared as package data and loaded via
+  `importlib.resources`; the wheel silently had no theme.
+- **`setuptools>=77.0.3`** — the declared floor of 68 cannot parse this
+  project's own metadata.
+- **CI tests what ships**: a job builds the wheel, installs it into a clean
+  environment and smoke-tests entry points, late imports and package resources
+  from outside the checkout; plus Python 3.13 and a Windows/macOS import smoke.
+- **Optional backends are found on any platform** — `Scripts/` as well as
+  `bin/`, an explicit `WHISPERSYNC_SEP_VENV` path, and the user data directory,
+  with the executable bit actually checked. `requirements-sep.txt` pins the
+  separation stack.
+- **Setup scripts no longer destroy a working environment** before the
+  replacement is proven: preflight checks first, old environment moved aside
+  and restored on any failure.
+- **Camera transcripts hit the cache.** The key was built from the throw-away
+  scratch WAV, whose path and mtime differ every run, so the expensive
+  transcription was always redone and every entry was written once and never
+  read.
+- **Cache failures cost one re-transcription, not the run.** Invalid UTF-8
+  raised out of the pipeline; writes are now atomic and validated
+  (schema, finite times).
+- **The recorder is decoded once per Boundary Flex pass**, not once per clip
+  (~230 MB per hour at float32, plus an ffmpeg pass, per repetition), and
+  analysis arrays are float32.
+- **The GPU model is released before the CPU fallback loads** — both were alive
+  at once, on a machine that had just run out of memory.
+- **Resemble Enhance processes in overlapping chunks**, bounding peak memory
+  independently of clip length.
+- **ML subprocess output is streamed to disk** rather than buffered whole in
+  the parent (`engine/proc.py`).
+- **The full-reference re-match is bounded** — `difflib` is ~quadratic on
+  repetitive tokens, and the unbounded retry ran on the very clips where it was
+  slowest.
+
+### Fixed — a 71-clip field run lost every ambience track to one 1.75 s clip
+
+A full episode (`/srv/storage/files/rudnikon`, 71 camera clips) finished with
+"Ambience batch separation failed … no 'Instrumental' output was found" and no
+ambience lane at all, leaving 70 successfully separated WAVs on disk under
+names like `tmp0plj448a_(Instrumental)_melband_roformer_inst_v2.wav` that no
+editor could match back to a clip. Root cause and fixes:
+
+- **audio-separator swallows per-file failures.** `separator.py::separate()`
+  catches every per-file exception, logs it, and still exits 0 — so a batch
+  where one input died looked like a clean success. The dead input here was
+  `DJI_0762.MOV` (1.75 s): below ~10 s the MDX-C/RoFormer path enables
+  `override_model_segment_size` and dies with "The size of tensor a (0) must
+  match the size of tensor b (76734)". Inputs shorter than
+  `separation.MIN_INPUT_SECONDS` are now padded with silence before separation
+  and trimmed back to their exact original length afterwards.
+- **One bad clip no longer costs the whole batch.** `run_separator_batch` used
+  to raise if *any* input was missing an output, which threw away ~30 minutes
+  of GPU work and the other 70 clips' ambience. It now returns what it did
+  produce, retries the missing files individually (a failure can be transient),
+  and only raises if the batch produced *nothing*. Each skipped clip is named
+  in the log with the reason recovered from the separator's stderr, and the
+  pipeline reports "no ambience for N of M clip(s)" as a warning.
+- **Separator inputs are named after their clip.** The pipeline fed the
+  separator anonymous `tempfile` WAVs, and the separator derives output names
+  from input names — hence the unusable `tmp…` leftovers. Camera audio is now
+  extracted as `DJI_0762.wav` into a scratch dir, so even a partially failed
+  run leaves identifiable files behind.
+- **Output-name matching now mirrors the separator's own sanitisation**
+  (invalid chars → `_`, runs of `_` collapsed, leading/trailing `_. ` stripped)
+  instead of approximating it by stripping trailing separators.
+
+### Fixed — unusable `voice_enhance` modes are reported before the run, not after
+
+The same run ended with "Voice enhancement (resemble) failed (… not available
+yet in this build)" *after* several hours of transcription and rendering.
+`run_pipeline` now pre-flights both optional environments (voice enhancement
+and the ambience separator) in its first seconds and warns then, while the run
+can still be cancelled and the setup fixed. Modes with no backend in this build
+(`sgmse_denoise`/`sgmse_dereverb`/`reuse`) are greyed out in the GUI dropdown
+and are not restored from a saved config.
+
+### Added — `voice_enhance=resemble` is now a working backend
+
+Resemble Enhance is driven through its Python API from `.sep-venv` (where it is
+`pip install`-ed alongside audio-separator). Its own `resemble-enhance` console
+script is deliberately bypassed: as of torchaudio 2.9 its `torchaudio.load` /
+`save` delegate to TorchCodec, which isn't installed there, so the CLI dies with
+an `ImportError` before reading any audio — the API itself is pure tensor work
+and is unaffected. WhisperSync does the file I/O with `soundfile`, prefers the
+weights already on disk (upstream's `download()` runs a `git pull` on every call
+and fails offline), runs the whole shoot in one process (one model load), and
+tolerates per-file failures. It is a mono model; `conform_wav_to` puts each
+result back to the original's exact duration/rate/channels.
+
+### Fixed — enhanced-output name collision across cameras
+
+`_conform_to_originals` named every output `<stem>_enhanced.wav`, so two clips
+with the same filename from different cameras produced one file that was then
+spliced over *both* — one clip silently getting the other's audio. Names are
+de-duplicated now, as are the ambience separator's per-clip inputs.
+
 ### Added — Voice Enhancement (`--voice-enhance`)
 
 A listening test compared 6 third-party speech-enhancement variants of the rendered voice monolith. Rather than pick one winner, the new opt-in `voice_enhance` config field (`off` by default) exposes all of them as a per-project choice, wired into the pipeline as a stage that runs right after rendering and **before** self-check (so self-check validates whatever audio the user actually gets):
 
 - **`denoise`** / **`denoise_dereverb`** — Mel-Roformer denoise, optionally chained with a De-Reverb pass. Reuses the existing `.sep-venv`/audio-separator stack (same environment as `--ambience-track`); fast, no new dependencies. Implemented in the new `engine/enhance.py`, sharing `engine/separation.py`'s batching/output-matching logic (generalized from a hard-coded "Instrumental" stem to an arbitrary `stem` parameter via the new `run_separator_batch`).
-- **`resemble`**, **`sgmse_denoise`**/**`sgmse_dereverb`**, **`reuse`** — surfaced in config/CLI/GUI/docs as selectable modes, but not yet backed by a working engine; selecting one raises a clear "not available yet in this build" error rather than silently no-opping. Two real gaps found while researching the integration, left open: Resemble Enhance needed undocumented upstream compatibility patches (only 1 of a referenced set could be located); NVIDIA RE-USE's model is NSCLv1 (noncommercial-only) and its inference code is all-rights-reserved, so it can only ever be orchestrated against a user-built Docker image and a user-supplied clone of NVIDIA's own source — never vendored into this repo.
+- **`resemble`**, **`sgmse_denoise`**/**`sgmse_dereverb`**, **`reuse`** — surfaced in config/CLI/GUI/docs as selectable modes, but not yet backed by a working engine; selecting one raises a clear "not available yet in this build" error rather than silently no-opping. (`resemble` was implemented later in this same Unreleased block — see "Added — `voice_enhance=resemble` is now a working backend" above.) Two real gaps found while researching the integration, left open: Resemble Enhance needed undocumented upstream compatibility patches (only 1 of a referenced set could be located); NVIDIA RE-USE's model is NSCLv1 (noncommercial-only) and its inference code is all-rights-reserved, so it can only ever be orchestrated against a user-built Docker image and a user-supplied clone of NVIDIA's own source — never vendored into this repo.
 - Every backend's output is conformed back to the exact duration/sample-rate/channel-count of the pre-enhancement audio (new `timestretch.conform_wav_to`) before it replaces the monolith — a third-party tool's own native rate, a mono-only model, or a few samples of resampling drift would otherwise desync the timeline. A missing environment or a backend failure is reported as a warning and the unenhanced monolith is kept, the same non-fatal pattern as `ambience_track` on a missing `.sep-venv`.
 - CLI: `--voice-enhance {off,denoise,denoise_dereverb,resemble,sgmse_denoise,sgmse_dereverb,reuse}`, `--reuse-source-dir`. GUI: a "Voice enhancement" dropdown next to the Self-check one. `system_check.py` reports which backends' environments are set up. Full pros/cons documented in the GUI Help tab and in the README's new "Voice Enhancement" section.
 

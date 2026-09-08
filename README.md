@@ -74,7 +74,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **FCPXML export** (v1.9 by default) — references your untouched video files plus the rendered synced WAVs, with honest per-asset audio channel/rate attributes; validated before it's handed to you.
 - **`--render-master-wav`** — additionally mixes every synced voice clip (and the ambience track, if enabled) at its timeline offset onto one silence-padded WAV spanning the whole timeline, for people without an NLE.
 - **Ambience track (optional)** — an AI source-separation model strips the camera's own (echoey, slightly off-sync) voice while keeping the room tone, on its own lane next to the clean voice; runs in an isolated `.sep-venv` environment, batch-processed with a single model load.
-- **Retake detection (optional, `--detect-retakes`)** — finds lines the speaker re-recorded back-to-back in an unedited take (flub, stop, restart) and exports each set of attempts as a Final Cut *audition* (press <kbd>Q</kbd> in Final Cut to browse takes) instead of leaving every flubbed attempt on the timeline. A transcript-based heuristic, fully non-destructive — nothing is ever cut, you review the auditions and pick.
+- **Retake detection (optional, `--detect-retakes`)** — finds lines the speaker re-recorded back-to-back in an unedited take (flub, stop, restart) and **marks** each attempt on the timeline, so you can jump straight to them instead of hunting for the flubs yourself. A transcript-based heuristic, fully non-destructive — nothing is cut, moved or re-timed.
 - **Self-check (optional, `--self-check warn|repair`)** — after rendering, re-transcribes each clip's voice monolith and compares it word-for-word against the camera clip's own transcript, flagging spans where content or timing diverge beyond normal cross-run Whisper jitter. Catches defects `--verify`'s acoustic lag measurement can't see (a dropped/duplicated word, a piece built from the wrong recorder span). `warn` just reports findings; `repair` additionally re-aligns and re-renders each flagged span's own small stretch of audio, then re-checks it once more. Costs one extra Whisper pass per clip (two if any span needs a repair attempt).
 - **Transcript export** — full transcripts of every recorder and camera clip saved as JSON + SRT next to the output (word-level timestamps included).
 
@@ -85,7 +85,7 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **Live multitrack timeline** — one row per camera and per audio lane, showing every clip's real position, applied speed change (e.g. `+0.10%`), and live status: pending (dashed), working (orange outline), done (solid). Hover for offset / duration / in-point / speed.
 - **Transcription Settings dialog** — model, language, device, compute type, transcribe mode (fast/quality), and initial prompt without touching a config file.
 - **Re-run with Selected Strategy** — after a run, switch the strategy radio and re-run; transcripts are cached, so it skips straight to alignment/render.
-- **Detect retakes checkbox** — finds re-recorded lines and exports them as Final Cut auditions (see [Retake Detection](#retake-detection)); off by default.
+- **Detect retakes checkbox** — finds re-recorded lines and marks each attempt on the timeline (see [Retake Detection](#retake-detection)); off by default.
 - **Self-check dropdown (Off / Warn only / Warn + auto-repair)** — re-transcribes each rendered clip and flags content/timing spans that diverge from the camera's own transcript beyond normal Whisper jitter; the repair option additionally re-aligns and re-renders each flagged span. Off by default (one extra Whisper pass per clip; two if any span needs repair).
 - **Voice enhancement dropdown** — optionally cleans up the rendered voice (denoise / denoise+de-reverb / Resemble Enhance / SGMSE+ diffusion / RE-USE) before self-check validates it; pros/cons of each are in the Help tab. Off by default.
 - **Weighted overall progress** — one continuous progress bar across all stages (no per-stage resets), plus explicit "Loading Whisper model…" status during a first-time model download.
@@ -109,9 +109,13 @@ Using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
 - **Transcription cache** — SHA-256-keyed by file, settings, and the *resolved* device/compute type; re-runs skip transcription entirely. Optional age-based pruning (`cache_max_age_days`).
 - **One shared render pool** — pieces of all clips render across all CPU cores through a single process pool; each clip's final assembly overlaps the next clips' rendering.
 - **In-memory Boundary Flex** — both tracks are decoded to memory once per clip and windows are sliced from arrays (no per-boundary ffmpeg spawns).
-- **Fork safety** — the render pool forks only in a single-threaded process (CLI); the GUI gets forkserver/spawn, avoiding the classic fork-in-a-threaded-Qt-process deadlock.
+- **Run isolation** — each run owns a uniquely named scratch directory on the output volume and holds a cooperative lock on its output folder, so two runs can never overwrite each other's audio or delete each other's working files; a second run on the same folder is refused with an explanation rather than silently interleaved.
+- **Atomic results** — the FCPXML, the master WAV and every rendered voice track are written to a temporary beside their destination and moved into place only when complete, so a crash or a cancellation can never leave a fragment where a previous good result was.
+- **Alignment acceptance gate** — every clock map is checked for evidence, coverage, residual and a physically plausible clock ratio *before* anything is placed or rendered with it; a map that fails becomes a clearly reported unresolved clip instead of a confident wrong render.
+- **Fork safety** — the render pool never forks (Qt, CTranslate2 and CUDA native threads are invisible to any "am I single-threaded" check); forkserver/spawn are used instead.
 - **Early VRAM release** — the Whisper model is unloaded right after alignment, freeing GPU memory for rendering/separation.
-- **Cross-platform** — Windows, macOS, Linux; CI-tested on Python 3.10–3.14 with lock-file reproducibility.
+- **Configuration validated up front** — types, enums, ranges and finite numbers are checked once, after CLI/GUI overrides are merged and before transcription starts; a bad value is a one-line usage error (exit 2), not a strange result hours later.
+- **Cross-platform** — Windows, macOS, Linux; CI-tested on Python 3.10–3.14, plus a job that installs the built wheel into a clean environment outside the checkout and smoke-tests the entry points, late imports and packaged resources.
 
 ## Screenshots
 
@@ -271,7 +275,7 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav \
 | `--ambience-track` | flag | Voice-free camera-ambience lane (needs `.sep-venv`, see `setup_sep_venv.sh`; default **on**, skipped with a warning when `.sep-venv` is missing) |
 | `--voice-segment-minutes` | int | Split each rendered voice WAV into ~N-minute segments, cut at the quietest point near each boundary (`0` = one continuous file per clip, default). Lets the NLE's own audio sync re-align every few minutes. Typical: `1`/`2`/`3`/`5`/`10` |
 | `--render-master-wav` | flag | Also render one WAV spanning the whole timeline (voice + ambience mixed at their offsets over silence) next to the FCPXML (default off) |
-| `--detect-retakes` | flag | Find re-recorded lines and export them as Final Cut auditions instead of leaving every attempt on the timeline (default off) |
+| `--detect-retakes` | flag | Find re-recorded lines and mark each attempt on the timeline (default off) |
 | `--self-check {warn,repair}` | str | Re-transcribe each rendered clip and flag content/timing spans against the camera's own transcript; `repair` also re-aligns and re-renders each flagged span (default off; one extra Whisper pass per clip, two if a span needs repair) |
 | `--voice-enhance {denoise,denoise_dereverb,resemble,sgmse_denoise,sgmse_dereverb,reuse}` | str | Run a third-party model over the rendered voice monolith before self-check (default off) — see [Voice Enhancement](#voice-enhancement) |
 | `--reuse-source-dir` | Path | Directory with NVIDIA's own RE-USE inference source (see [Voice Enhancement](#voice-enhancement)); only used with `--voice-enhance reuse` |
@@ -332,17 +336,19 @@ Strategy 3        Video:  |== phrase ==| pause |== phrase ==| pause |== phrase =
 
 ## Retake Detection
 
-An unedited lecture or monologue recording is often full of flubbed lines that got re-recorded on the spot: the speaker stumbles, stops, and restarts the same line — sometimes several times — before continuing. `--detect-retakes` (off by default) finds these automatically and exports each set of attempts as a Final Cut **audition**: a non-destructive stack of alternative clips, with the last (presumably best) attempt active by default. Press <kbd>Q</kbd> in Final Cut Pro while an audition is selected to browse the other takes, or double-click it to open the audition browser.
+An unedited lecture or monologue recording is often full of flubbed lines that got re-recorded on the spot: the speaker stumbles, stops, and restarts the same line — sometimes several times — before continuing. `--detect-retakes` (off by default) finds these automatically and places a **marker** on each attempt, labelled `Retake N — keep` for the one the speaker settled on and `Retake N — take K` for the discarded ones. The timeline itself is untouched: markers tell you where to look, and the cutting stays yours.
+
+> **Why markers rather than auditions.** Earlier versions exported each group as a Final Cut *audition*. That desynchronised the result: the audition began at the group's start but played the keeper take's audio, which comes from later in the clip, while the picture did not switch at all — takes at [2 s, 4 s] and [5 s, 8 s] put the voice 3 s ahead of the image and left a hole in the clean track. A real audition has to switch the linked A/V ranges together and re-cut the surrounding material, which is a separate feature with its own timing model; a marker conveys exactly the same finding with no risk to the A/V relationship.
 
 ```bash
 python main.py --cli --video-dir ./videos --audio-file rec.wav --detect-retakes
 ```
 
-> **How it works.** Detection runs on the recorder's own transcript (already computed for sync), scanning at the word-token level for a short run of words that repeats verbatim shortly after it was first spoken — not just whole-sentence repeats, since a restart is usually a resumed sentence, not a cleanly bounded phrase. Consecutive restarts of the same line chain into one group (2 or more attempts); nothing is ever deleted or reordered — the algorithm only decides which spans to group into an audition.
+> **How it works.** Detection runs on the recorder's own transcript (already computed for sync), scanning at the word-token level for a short run of words that repeats verbatim shortly after it was first spoken — not just whole-sentence repeats, since a restart is usually a resumed sentence, not a cleanly bounded phrase. Consecutive restarts of the same line chain into one group (2 or more attempts, and three or more identical takes all belong to the same group); nothing is ever deleted or reordered — the algorithm only decides which spans to mark.
 >
 > **Tuning.** `retake_min_words` (default 4) sets how many words must repeat before it counts as a restart — raise it if short common phrases ("что это", "то есть") are being flagged as false positives. `retake_max_gap_s` (default 6.0s) caps how long a pause may separate two attempts of the same line before they're treated as an unrelated callback instead of a retake.
 >
-> **This is a heuristic, reviewed non-destructively.** Exact-repeat detection won't catch every paraphrased restart, and can occasionally group a coincidental phrase repetition that isn't really a retake — but since nothing is cut (every alternative stays available in the audition), a false positive just means one audition the editor dismisses, and a missed retake is no worse than not running the feature at all. A future LLM-based refinement pass (mirroring [Podcast Reels Forge](https://github.com/Bormotoon/Podcast-Reels-Forge)'s local llama.cpp moment-scoring) is planned to catch paraphrased restarts and judge which take was best-delivered, rather than just "the last one."
+> **This is a heuristic, reviewed non-destructively.** Exact-repeat detection won't catch every paraphrased restart, and can occasionally group a coincidental phrase repetition that isn't really a retake — but since nothing is cut, a false positive is one marker the editor ignores, and a missed retake is no worse than not running the feature at all. A future LLM-based refinement pass (mirroring [Podcast Reels Forge](https://github.com/Bormotoon/Podcast-Reels-Forge)'s local llama.cpp moment-scoring) is planned to catch paraphrased restarts and judge which take was best-delivered, rather than just "the last one."
 
 ## Self-Check
 
@@ -370,7 +376,7 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav --self-check repa
 |------|---------------|-------|-------|
 | `denoise` | Mel-Roformer noise removal | Fast | Same `.sep-venv` stack as the ambience track. Safest choice — barely touches the voice's own timbre. |
 | `denoise_dereverb` | + a second pass stripping room reflections | Fast | Can thin out consonant tails or room warmth on some material — A/B listen before committing to a project. |
-| `resemble` | Resemble Enhance (generative) | Fast | Can produce a studio-like timbre, at the risk of subtle generative artifacts on hard passages. **Experimental** — some upstream compatibility patches aren't fully documented yet. |
+| `resemble` | Resemble Enhance (generative) | ~2.5× realtime on a current GPU | Can produce a studio-like timbre, at the risk of subtle generative artifacts on hard passages. **Experimental**, and a **mono** model — a stereo monolith comes back as duplicated mono. Install it into the same `.sep-venv`: `.sep-venv/bin/pip install resemble-enhance`. |
 | `sgmse_denoise` / `sgmse_dereverb` | SGMSE+ diffusion denoise/de-reverb | **~5× slower than realtime** | The cleanest result of the six, but only realistic for short clips — needs a separate `.enh-venv`. |
 | `reuse` | NVIDIA RE-USE (denoise+dereverb+declip in one pass) | Fast | The strongest single-pass result, but its weights are **NSCLv1 (noncommercial-only)** and it runs via Docker with NVIDIA's own inference code, which you must supply yourself under their license — this project cannot redistribute it. Set `--reuse-source-dir` to where you cloned it. |
 
@@ -379,7 +385,7 @@ python main.py --cli --video-dir ./videos --audio-file rec.wav --voice-enhance d
 python main.py --cli --video-dir ./videos --audio-file rec.wav --voice-enhance denoise_dereverb
 ```
 
-> **Environments.** `denoise`/`denoise_dereverb` reuse the `.sep-venv` environment already used by `--ambience-track` (see `setup_sep_venv.sh`) — nothing extra to install if you already have ambience working. The other four modes need environments this repo doesn't bundle (a separate venv for the diffusion models, a Docker image plus NVIDIA's own source for RE-USE) — `whispersync-cli` (or `system_check.py`) reports which environments are set up. A mode whose environment isn't ready is skipped with a warning at the end of the run; your unenhanced audio is kept, never a failed run.
+> **Environments.** `denoise`/`denoise_dereverb` reuse the `.sep-venv` environment already used by `--ambience-track` (see `setup_sep_venv.sh`) — nothing extra to install if you already have ambience working. `resemble` goes into that same venv (`.sep-venv/bin/pip install resemble-enhance`); its own `resemble-enhance` console script is bypassed (as of torchaudio 2.9 it needs TorchCodec just to read a file), so WhisperSync drives its Python API directly and does the file I/O itself. `sgmse_*`/`reuse` need environments this repo doesn't bundle (a separate venv for the diffusion models, a Docker image plus NVIDIA's own source for RE-USE) and have no backend in this build yet — they are greyed out in the GUI. `python -m whispersync.engine.system_check` reports which environments are set up, and an unusable mode is now reported **at the start of a run**, not after it: a 3-hour sync no longer ends with "the mode you picked isn't available".
 >
 > **Sync safety.** Every backend's output is conformed (resampled/padded/trimmed) back to the exact duration, sample rate, and channel count of the original rendered monolith before it replaces it — the property was verified sample-exact across all six variants during the original listening test, and the conform step makes it structural rather than coincidental.
 
@@ -464,7 +470,7 @@ WhisperSync reads a JSON config via `--config config.json`. **Priority: CLI flag
 | `render_master_wav` | bool | Also render one WAV spanning the whole timeline (default off) |
 | `cache_max_age_days` | float | Delete cached transcripts older than N days at engine start; `0` (default) keeps them forever |
 | `voice_segment_minutes` | int | Split each voice WAV into ~N-minute segments cut in silence (`0` = monolith, default) |
-| `detect_retakes` | bool | Find re-recorded lines and export as Final Cut auditions (default off) |
+| `detect_retakes` | bool | Find re-recorded lines and mark each attempt on the timeline (default off) |
 | `retake_min_words` | int | Minimum token-run length to consider a restart candidate (default 4) |
 | `retake_max_gap_s` | float | Max pause between consecutive attempts of the same line (default 6.0s) |
 | `self_check_mode` | str | `off` / `warn` / `repair` — re-transcribe each rendered clip and flag (or additionally repair) content/timing spans vs. the camera transcript (default `off`) |
@@ -480,18 +486,29 @@ Everything lands next to the FCPXML (default: inside your video folder):
 | Path | What it is |
 |------|------------|
 | `sync_output.fcpxml` | The project file — import into Final Cut Pro / DaVinci Resolve |
-| `audio_synced/<clip>_voice.wav` | One continuous synced voice WAV per camera clip, at the recorder's native quality |
-| `transcripts/*.json`, `*.srt` | Full transcripts of every recorder and camera clip (word-level timestamps) |
-| `ambience/<clip>_ambience.wav` | Voice-free camera ambience (only with `--ambience-track`) |
+| `audio_synced/<source-id>_voice.wav` | One continuous synced voice WAV per camera clip, at the recorder's native quality |
+| `transcripts/<source-id>.json`, `.srt` | Full transcripts of every recorder and camera clip (word-level timestamps) |
+| `ambience/<source-id>_ambience.wav` | Voice-free camera ambience (only with `--ambience-track`) |
 | `sync_output_master.wav` | Single WAV spanning the whole timeline (only with `--render-master-wav`) |
 
 Source video and recorder files are never modified.
+
+> **`<source-id>`** is a short id derived from each input's role, camera folder
+> and filename (`cam_camA_DJI_0001`, `rec_take`), made unique automatically.
+> File stems alone are not identifiers: two recorders can both be `take.wav`,
+> one camera can hold `clip.mov` and `clip.mp4`, and two cameras routinely hold
+> identically named clips — each of those used to make one source's artifact
+> overwrite another's. Display names in the FCPXML are unaffected.
+
+While a run is in progress the output folder also holds `.whispersync-run.lock`
+and a `.whispersync-run-<id>/` scratch directory; both are removed when the run
+ends. A leftover lock from a crashed run is taken over automatically.
 
 ## Verifying the Result
 
 - **`--verify`** — after a successful run, measures the *realized* lag between each rendered voice WAV and its camera audio via GCC-PHAT cross-correlation, printing median/p90/max per clip (and embedding the numbers in `--json` output).
 - **`--self-check warn|repair`** — re-transcribes each rendered voice WAV and flags (or repairs) content/timing spans against the camera's own transcript — see [Self-Check](#self-check) for what `--verify` alone can't catch.
-- **`tools/verify_sync.py`** — the same measurement as a standalone tool for any pair of audio files: `python tools/verify_sync.py camera.wav voice.wav [--json]`.
+- **`tools/verify_sync.py`** — the same measurement as a standalone tool for any pair of audio files: `python -m tools.verify_sync --video camera.mov --voice voice.wav [--json]`. It is a thin wrapper; the measurement itself lives in the shipped package (`whispersync.engine.verify`), so `--verify` works from an installed wheel and not only from a checkout. Exit codes: `0` passed, `1` failed, `2` inconclusive or bad arguments — "inconclusive" is deliberately not a pass, because a clip that could not be measured has not been shown to be in sync.
 - **`python -m whispersync.engine.system_check`** — environment audit: ffmpeg, CUDA-via-ctranslate2, dependencies, `.sep-venv`, disk space.
 
 ## Troubleshooting
@@ -538,18 +555,22 @@ WhisperSync/
 │   ├── models.py                    # Word, Segment, Transcript, Anchor, AlignmentMap, MediaClip, Take, RetakeGroup, SyncPlan, SyncResult
 │   ├── engine/
 │   │   ├── pipeline.py              # End-to-end orchestration (incl. clip_pieces — the real strategy planner)
+│   │   ├── sources.py               # Stable per-input identity (sid) — artifacts are named from it, never from file stems
+│   │   ├── workspace.py             # Per-run scratch, output lock, atomic publication
 │   │   ├── transcriber.py           # WhisperEngine + SHA-256 cache (+ age pruning)
-│   │   ├── matcher.py               # Anchors + RANSAC + two-stage outlier filter + strategy recommendation
+│   │   ├── matcher.py               # Anchors + RANSAC + outlier filter + acceptance gate + strategy recommendation
 │   │   ├── strategies.py            # Strategy registry (id -> name/description)
-│   │   ├── retakes.py               # Retake detection (token-level restart matching) for Final Cut auditions
+│   │   ├── retakes.py               # Retake detection (token-level restart matching) → timeline markers
 │   │   ├── self_check.py            # Post-render word diagnostics: rendered voice vs. camera transcript
 │   │   ├── acoustic.py              # GCC-PHAT cross-correlation: Boundary Flex + acoustic fallback
 │   │   ├── separation.py            # Ambience track via the isolated .sep-venv
 │   │   ├── timestretch.py           # ffmpeg cut/resample-conform/atempo/assemble/master-mix wrappers
 │   │   ├── media.py                 # ffprobe, audio extraction, lossless master, atempo chains
-│   │   ├── export.py                # FCPXML generation + validation
+│   │   ├── export.py                # FCPXML generation + structural/reference validation + interval round-trip
 │   │   ├── naming.py                # Natural filename sort
 │   │   ├── transcript_export.py     # JSON + SRT transcript export
+│   │   ├── verify.py                # Realized lip-sync lag measurement (GCC-PHAT) — the --verify backend
+│   │   ├── proc.py                  # Long-running subprocesses with disk-backed, bounded logs
 │   │   └── system_check.py          # Environment audit
 │   └── gui/
 │       ├── main_window.py           # PyQt6 MainWindow
@@ -557,7 +578,7 @@ WhisperSync/
 │       ├── theme.qss                # Dark theme
 │       └── widgets/                 # DropZone, LogView, TimelinePreview, StrategyDiagram,
 │                                    #   SettingsDialog, HelpPage, SyncSimulator
-├── tools/verify_sync.py             # Standalone realized-lag measurement
+├── tools/verify_sync.py             # CLI wrapper around whispersync.engine.verify
 └── tests/                           # pytest suite (unit + ffmpeg integration markers)
 ```
 
