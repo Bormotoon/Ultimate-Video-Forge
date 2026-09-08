@@ -35,7 +35,7 @@ import bisect
 import difflib
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -46,7 +46,14 @@ from whispersync.models import AlignmentMap, Word
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SelfCheckSpan", "check_rendered_clip", "realign_span"]
+__all__ = [
+    "SelfCheckOutcome",
+    "SelfCheckSpan",
+    "check_rendered_clip",
+    "diagnose",
+    "diagnose_words",
+    "realign_span",
+]
 
 # A run of at least this many consecutive matched words with a median timing
 # delta above this many seconds is flagged as "shifted". Calibrated on a real
@@ -81,6 +88,34 @@ class SelfCheckSpan:
     end: float
     kind: str
     detail: str
+
+
+@dataclass
+class SelfCheckOutcome:
+    """What the check actually established — not just what it flagged.
+
+    An empty span list used to mean "no problems", which made the check's two
+    genuinely different failure modes indistinguishable from success:
+
+    * a render containing NO speech at all against a camera clip with six
+      words returned ``[]`` and was reported as clean. Total content loss —
+      the single worst defect this check exists to catch — read as a pass.
+    * a camera clip with no usable transcript also returned ``[]``, so "we
+      could not check this" and "we checked this and it is fine" were the same
+      answer.
+
+    ``status`` separates them: ``passed``, ``failed`` (defects found, listed in
+    ``spans``), or ``inconclusive`` (no trustworthy reference to compare
+    against — the user is told, and nothing is claimed).
+    """
+
+    status: str  # "passed" | "failed" | "inconclusive"
+    spans: list[SelfCheckSpan] = field(default_factory=list)
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "passed"
 
 
 @dataclass
@@ -233,11 +268,23 @@ def _content_spans(
             start = render_toks[i1].start
             end = render_toks[i2 - 1].end
         else:
-            # A pure insert on the camera side (nothing rendered at this
-            # point) has no render-side timestamps to anchor on; use the
-            # neighbouring rendered word's boundary instead.
-            start = render_toks[i1 - 1].end if i1 > 0 else 0.0
-            end = render_toks[i1].start if i1 < len(render_toks) else start
+            # A pure insert on the camera side: speech the camera heard that
+            # the render does not contain at all. It has no render-side
+            # timestamps, so the span must come from the CAMERA tokens that are
+            # missing — using the neighbouring rendered word's boundary instead
+            # collapsed the whole defect onto that word. A render keeping only
+            # [0, 0.2] of a clip whose camera has six more words out to 20 s
+            # reported a span of [0.2, 0.2]: a zero-length flag at the start of
+            # the clip for a twenty-second hole at the end, which no repair
+            # could act on. The missing words' own times say where the audio
+            # should have been.
+            start = cam_toks[j1].start
+            end = cam_toks[j2 - 1].end
+            if i1 > 0:
+                # Never claim the defect begins before the last word that DID
+                # render correctly.
+                start = max(start, render_toks[i1 - 1].end)
+            end = max(end, start)
         spans.append(
             SelfCheckSpan(
                 start=start,
@@ -252,22 +299,56 @@ def _content_spans(
     return spans
 
 
-def diagnose_words(
+def diagnose(
     render_words: list[Word],
     cam_words: list[Word],
     min_run_words: int = DEFAULT_MIN_RUN_WORDS,
     shift_threshold_s: float = DEFAULT_SHIFT_THRESHOLD_S,
     min_content_words: int = DEFAULT_MIN_CONTENT_WORDS,
-) -> list[SelfCheckSpan]:
-    """Compare a rendered clip's transcript words against the camera clip's
-    own transcript words (both already in the clip's local time) and return
-    flagged spans, sorted by start time. Pure function over word lists —
-    kept separate from ``check_rendered_clip`` (which does the transcription
-    I/O) so it's directly unit-testable against synthetic word lists."""
+    clip_duration: float | None = None,
+) -> SelfCheckOutcome:
+    """Compare a rendered clip's transcript against the camera clip's own and
+    say what was established: ``passed``, ``failed`` (with the offending spans)
+    or ``inconclusive``.
+
+    Pure function over word lists — kept separate from ``check_rendered_clip``
+    (which does the transcription I/O) so it's directly unit-testable against
+    synthetic word lists.
+
+    The three outcomes exist because "no spans" was previously used for all
+    three situations. In particular an EMPTY render against a camera clip full
+    of speech produced no spans and was reported as clean — the most severe
+    possible defect, total content loss, reading as a pass.
+    """
     render_toks = _tokens(render_words)
     cam_toks = _tokens(cam_words)
-    if not render_toks or not cam_toks:
-        return []
+
+    if not cam_toks:
+        # No reference: nothing can be concluded either way. Saying so is the
+        # honest answer; saying "passed" would be a claim the data cannot back.
+        return SelfCheckOutcome(
+            "inconclusive",
+            [],
+            "the camera clip has no usable transcript to check against",
+        )
+
+    if not render_toks:
+        end = clip_duration if clip_duration is not None else cam_toks[-1].end
+        return SelfCheckOutcome(
+            "failed",
+            [
+                SelfCheckSpan(
+                    start=0.0,
+                    end=end,
+                    kind="content",
+                    detail=(
+                        f"the rendered audio contains no speech at all, but the camera "
+                        f"clip has {len(cam_toks)} word(s) — the voice for this clip is missing"
+                    ),
+                )
+            ],
+            "empty render against a non-empty reference",
+        )
 
     matcher = difflib.SequenceMatcher(
         None, [t.norm for t in render_toks], [t.norm for t in cam_toks], autojunk=False
@@ -284,18 +365,42 @@ def diagnose_words(
         render_toks, cam_toks, equal_pairs, min_run_words, shift_threshold_s
     ) + _content_spans(render_toks, cam_toks, opcodes, min_content_words)
     spans.sort(key=lambda s: s.start)
-    return spans
+    if spans:
+        return SelfCheckOutcome("failed", spans, f"{len(spans)} flagged span(s)")
+    return SelfCheckOutcome("passed", [], f"{len(equal_pairs)} matched word(s)")
+
+
+def diagnose_words(
+    render_words: list[Word],
+    cam_words: list[Word],
+    min_run_words: int = DEFAULT_MIN_RUN_WORDS,
+    shift_threshold_s: float = DEFAULT_SHIFT_THRESHOLD_S,
+    min_content_words: int = DEFAULT_MIN_CONTENT_WORDS,
+) -> list[SelfCheckSpan]:
+    """``diagnose(...).spans`` — the flagged spans only.
+
+    Prefer ``diagnose``: an empty list here still cannot distinguish "clean"
+    from "could not be checked".
+    """
+    return diagnose(
+        render_words,
+        cam_words,
+        min_run_words=min_run_words,
+        shift_threshold_s=shift_threshold_s,
+        min_content_words=min_content_words,
+    ).spans
 
 
 def check_rendered_clip(
     rendered_words: list[Word],
     camera_words: list[Word],
     config: object,
-) -> list[SelfCheckSpan]:
+    clip_duration: float | None = None,
+) -> SelfCheckOutcome:
     """Convenience wrapper reading thresholds off ``config`` (duck-typed to
     avoid importing ``WhisperSyncConfig`` here and creating a cycle; the
     pipeline passes the real config)."""
-    return diagnose_words(
+    return diagnose(
         rendered_words,
         camera_words,
         min_run_words=getattr(config, "self_check_min_run_words", DEFAULT_MIN_RUN_WORDS),
@@ -305,6 +410,7 @@ def check_rendered_clip(
         min_content_words=getattr(
             config, "self_check_min_content_words", DEFAULT_MIN_CONTENT_WORDS
         ),
+        clip_duration=clip_duration,
     )
 
 
@@ -358,7 +464,40 @@ def _local_transcript_realign(
         return None
     residuals_ms = [abs((offset + k * a.rec_time) - a.cam_time) * 1000 for a in inliers]
     residual_ms = float(np.median(residuals_ms)) if residuals_ms else 0.0
-    return AlignmentMap(anchors=kept, offset=offset, k=k, residual_ms=residual_ms)
+
+    # A repair map re-renders real audio, so it faces the same bar as any other
+    # map: a local fit over a handful of anchors inside one flagged span is
+    # exactly the situation where a line can be fitted through noise. An
+    # implausible clock ratio here would re-render the span at a wrong tempo,
+    # replacing a defect the user could hear with one they cannot explain.
+    # Declining leaves the span reported as a warning, which is the correct
+    # outcome when nothing more trustworthy is available.
+    max_dev = config.alignment_max_k_deviation
+    if not k or abs(k - 1.0) > max_dev:
+        logger.info(
+            "Repair re-match rejected: implausible clock ratio k=%.4f (allowed 1±%g)",
+            k,
+            max_dev,
+        )
+        return None
+    if residual_ms > config.alignment_max_residual_ms:
+        logger.info(
+            "Repair re-match rejected: residual %.0f ms exceeds %.0f ms",
+            residual_ms,
+            config.alignment_max_residual_ms,
+        )
+        return None
+
+    rec_times = [a.rec_time for a in inliers]
+    return AlignmentMap(
+        anchors=kept,
+        offset=offset,
+        k=k,
+        residual_ms=residual_ms,
+        provenance="repair",
+        inliers=len(inliers),
+        evidence_span_s=max(rec_times) - min(rec_times),
+    )
 
 
 def _local_acoustic_realign(
@@ -405,7 +544,17 @@ def _local_acoustic_realign(
         return None
     rec_mid = rec_mid_guess - lag_s
     offset = cam_mid - prior_k * rec_mid
-    return AlignmentMap(anchors=[], offset=offset, k=prior_k, residual_ms=0.0)
+    # `prior_k` comes from the clip's own already-accepted map, so the ratio is
+    # inherited rather than re-estimated — only the offset is measured here.
+    return AlignmentMap(
+        anchors=[],
+        offset=offset,
+        k=prior_k,
+        residual_ms=0.0,
+        provenance="repair",
+        inliers=1,
+        evidence_span_s=win,
+    )
 
 
 def realign_span(

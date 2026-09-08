@@ -7,7 +7,7 @@ import logging
 import random
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -329,6 +329,14 @@ def _match_words(cam_words: list[Word], rec_words: list[Word]) -> list[Anchor]:
     return _anchors_from_words(cam_words, rec_words)
 
 
+# Upper bound on (camera words x recorder words) for the full-reference
+# re-match. difflib's matcher is ~quadratic on repetitive tokens; 4e6 pairs is
+# roughly a second of CPU on the measurements above, which is an acceptable
+# per-clip fallback cost, while an unbounded retry against a multi-hour
+# recorder is minutes of it.
+_FULL_RETRY_MAX_WORK = 4_000_000
+
+
 def align(
     cam_transcript: Transcript,
     rec_transcript: Transcript,
@@ -350,10 +358,36 @@ def align(
     rec_used = _window_recorder(cam_words, rec_words, config, rec_index)
     anchors = _match_words(cam_words, rec_used)
 
-    # If the coarse window was misleading, retry once against the full reference.
+    # If the coarse window was misleading, retry once against the full
+    # reference — but only when that is affordable.
+    #
+    # `SequenceMatcher(autojunk=False)` is roughly quadratic on repetitive
+    # tokens: measured at 500/1000/2000 words it took 0.060/0.219/0.949 s, so a
+    # multi-hour recorder against a long clip is minutes of un-cancellable CPU
+    # per clip, entered precisely when the cheap path already struggled. The
+    # cap bounds that instead of silently paying it.
+    #
+    # `autojunk` is deliberately NOT enabled: it would suppress tokens
+    # appearing in more than 1% of positions, which on this material includes
+    # ordinary vocabulary, and the effect on anchor recall has not been
+    # measured on a corpus with repeats, pauses and ASR hallucinations. Bounding
+    # the work is safe; changing which words can anchor is not, without that
+    # measurement.
     if len(anchors) < config.min_anchors and rec_used is not rec_words:
-        logger.info("Windowed match weak (%d anchors); retrying full reference", len(anchors))
-        anchors = _match_words(cam_words, rec_words)
+        work = len(cam_words) * len(rec_words)
+        if work > _FULL_RETRY_MAX_WORK:
+            logger.warning(
+                "Windowed match weak (%d anchors) but the full reference is too large to "
+                "re-match (%d x %d word pairs, limit %d) — keeping the windowed result. "
+                "Raise match_window_margin if this clip is genuinely misplaced.",
+                len(anchors),
+                len(cam_words),
+                len(rec_words),
+                _FULL_RETRY_MAX_WORK,
+            )
+        else:
+            logger.info("Windowed match weak (%d anchors); retrying full reference", len(anchors))
+            anchors = _match_words(cam_words, rec_words)
 
     if len(anchors) < 2:
         raise ValueError(
@@ -400,11 +434,19 @@ def align(
         residual_ms,
     )
 
+    span = 0.0
+    if len(line_inliers) >= 2:
+        rec_times = [a.rec_time for a in line_inliers]
+        span = max(rec_times) - min(rec_times)
+
     return AlignmentMap(
         anchors=kept,
         offset=offset,
         k=k,
         residual_ms=residual_ms,
+        provenance="text",
+        inliers=len(line_inliers),
+        evidence_span_s=span,
     )
 
 
@@ -468,3 +510,89 @@ def recommend_strategy(alignment: AlignmentMap) -> tuple[int, str]:
             )
 
     return 3, f"drift needs per-phrase correction (residual {alignment.residual_ms:.1f} ms)"
+
+
+# ---------------------------------------------------------------------------
+# Acceptance gate
+# ---------------------------------------------------------------------------
+#
+# A map is not "good" because it exists. Two anchors define a line exactly, so
+# a residual near zero proves nothing about a two-point fit — a synthetic pair
+# of falsely matched words reproduced k ~= 10 and offset ~= -1004 s with a
+# residual under a millisecond. Nor does a small residual over three seconds
+# of a ten-minute clip say anything about the other 597 seconds.
+#
+# So every use of a map — timeline placement AND the render itself, which used
+# to read straight from the raw per-recorder matrix and so could render from a
+# map placement had already rejected — passes through `evaluate_alignment`
+# first. It checks the four things a clock map can be wrong about
+# independently: how much evidence there is, how far that evidence reaches,
+# how well the line actually fits it, and whether the resulting clock ratio is
+# physically possible for two devices recording the same event.
+
+
+@dataclass
+class AlignmentVerdict:
+    """Whether a map may be used, and why not when it may not."""
+
+    accepted: bool
+    reasons: list[str] = field(default_factory=list)
+    # Coverage of the clip's own duration by the evidence, 0..1.
+    coverage: float = 0.0
+
+    @property
+    def reason_text(self) -> str:
+        return "; ".join(self.reasons)
+
+
+def evaluate_alignment(
+    am: AlignmentMap | None,
+    clip_duration: float,
+    config: WhisperSyncConfig,
+) -> AlignmentVerdict:
+    """Decide whether ``am`` is trustworthy enough to place AND render with.
+
+    The thresholds live on the config (``alignment_*``) rather than being
+    hard-coded, because the honest limits differ by material and device: a
+    ±5% clock-ratio bound is generous for two crystal-clocked recorders and
+    far too tight for deliberately speed-changed footage. What must not vary
+    is that the check happens at all, on every map, before any audio is cut.
+    """
+    if am is None:
+        return AlignmentVerdict(False, ["no alignment"])
+
+    reasons: list[str] = []
+
+    # Clock ratio: two devices recording the same event drift by parts per
+    # million, not by percent. k far from 1 is not drift, it is a wrong match.
+    max_dev = config.alignment_max_k_deviation
+    if not (am.k and abs(am.k - 1.0) <= max_dev):
+        reasons.append(f"implausible clock ratio k={am.k:.4f} (allowed 1±{max_dev:g})")
+
+    span = am.evidence_span_s
+    coverage = span / clip_duration if clip_duration > 0 else 0.0
+
+    if am.provenance == "acoustic":
+        # An acoustic map has no word anchors by construction; its evidence is
+        # the number of confident grid points behind the fit.
+        if am.inliers < config.alignment_min_acoustic_points:
+            reasons.append(
+                f"only {am.inliers} confident acoustic point(s) "
+                f"(minimum {config.alignment_min_acoustic_points})"
+            )
+    else:
+        if am.inliers < config.min_anchors:
+            reasons.append(f"only {am.inliers} inlier anchor(s) (minimum {config.min_anchors})")
+        if am.residual_ms > config.alignment_max_residual_ms:
+            reasons.append(
+                f"residual {am.residual_ms:.0f} ms exceeds "
+                f"{config.alignment_max_residual_ms:.0f} ms"
+            )
+
+    if clip_duration > 0 and coverage < config.alignment_min_coverage:
+        reasons.append(
+            f"evidence spans {span:.1f}s of a {clip_duration:.1f}s clip "
+            f"({coverage:.0%} < {config.alignment_min_coverage:.0%})"
+        )
+
+    return AlignmentVerdict(not reasons, reasons, coverage)

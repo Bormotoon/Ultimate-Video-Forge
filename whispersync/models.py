@@ -43,10 +43,32 @@ class Anchor:
 
 @dataclass
 class AlignmentMap:
+    """``t_camera = offset + k * t_recorder`` — one clip's clock map.
+
+    ``provenance`` records HOW the map was derived, because "how many anchors
+    does it have" is not the same question as "is it any good": the acoustic
+    fallback produces a perfectly usable map with an EMPTY anchor list, and
+    code that measured confidence by ``len(anchors)`` therefore threw away
+    every successful acoustic match while happily accepting a two-anchor text
+    fit (through two points any line fits with ~zero residual, including a
+    completely wrong one). ``evidence`` carries the numbers a gate needs —
+    see ``matcher.evaluate_alignment``.
+    """
+
     anchors: list[Anchor]
     offset: float
     k: float
     residual_ms: float
+    # "text" (transcript word anchors), "acoustic" (GCC-PHAT waveform scan),
+    # or "repair" (a local re-alignment of one flagged span).
+    provenance: str = "text"
+    # Anchors that survived the robust line fit (<= len(anchors)). For an
+    # acoustic map this is the number of confident grid points instead.
+    inliers: int = 0
+    # Recorder-time extent the supporting evidence actually spans, in seconds.
+    # A map fitted from evidence covering 3 s of a 10-minute clip is an
+    # extrapolation, however small its residual.
+    evidence_span_s: float = 0.0
 
 
 @dataclass
@@ -96,8 +118,29 @@ class MediaClip:
     role: str | None = None
     # Retake groups within THIS clip's own local time ([0, duration)), for
     # audio clips where detect_retakes found re-recorded lines. The exporter
-    # renders each group as an <audition> instead of a plain asset-clip.
+    # renders each group as MARKERS on the clip (see engine/export.py) — a
+    # review aid that leaves the synchronised A/V untouched.
     retake_groups: list[RetakeGroup] | None = None
+    # Whether this clip's OWN audio should play. A camera clip whose dialogue
+    # has been replaced by a synced recorder track must be video-only: leaving
+    # its built-in mic enabled puts two copies of the same voice, tens of
+    # milliseconds apart, on the timeline — the comb-filtered "doubled voice"
+    # the whole ambience feature exists to avoid. Left enabled for clips with
+    # no replacement, so unresolved footage keeps some usable sound.
+    # None = decide from context (the exporter treats it as enabled).
+    source_audio_enabled: bool | None = None
+    # For a RENDERED audio clip: which source it was made from and which
+    # stretch of that source it covers, as
+    # ``(source_path, source_start_s, source_duration_s)``.
+    #
+    # This is what post-run verification needs and could not previously get.
+    # Pairing was done by ``display_name.startswith(video_stem)``, which
+    # matched "A1" against "A10", collapsed two cameras' identically named
+    # clips into one dictionary entry, and — for a voice SEGMENT covering
+    # minutes 5-10 — compared the start of that segment against the start of
+    # the video. The measurement then reported the resulting five-minute
+    # disagreement as lip-sync lag.
+    source_ref: tuple[Path, float, float] | None = None
 
 
 @dataclass

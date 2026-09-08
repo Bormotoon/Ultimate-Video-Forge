@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,6 +13,21 @@ from platformdirs import user_cache_dir, user_config_dir
 logger = logging.getLogger(__name__)
 
 APP_NAME = "whispersync"
+
+
+class ConfigError(ValueError):
+    """A configuration value that would make the run wrong or impossible.
+
+    Raised by ``WhisperSyncConfig.validate`` before any expensive work starts.
+    Dataclass annotations are not validation — ``WhisperSyncConfig(**json)``
+    accepted ``seed_bin_width=0`` (a later division by zero), the string
+    ``"false"`` for a boolean (truthy, so the feature silently stayed ON),
+    ``NaN``/``Infinity`` for any float (poisoning every time calculation
+    downstream) and unknown enum values (a quietly different code path). Each
+    of those surfaced hours later, if at all, as a strange result rather than
+    an error anyone could act on.
+    """
+
 
 DEFAULT_VIDEO_EXTS = [".mp4", ".mov", ".mxf", ".avi", ".mkv"]
 DEFAULT_AUDIO_EXTS = [".wav", ".mp3", ".m4a", ".flac"]
@@ -72,6 +88,18 @@ PAUSE_DUCK_MIN_PAUSE_S = 0.6  # don't duck gaps shorter than this
 # The separator lives in the isolated ".sep-venv" environment (see separation.py);
 # MelBand-RoFormer Inst V2 is the chosen model (best ambience-detail retention).
 AMBIENCE_MODEL = "melband_roformer_inst_v2.ckpt"
+
+# Accepted values for ``voice_enhance``. Kept here (not imported from
+# engine.enhance) so validating a config never pulls in the heavy engine.
+VOICE_ENHANCE_MODES = (
+    "off",
+    "denoise",
+    "denoise_dereverb",
+    "resemble",
+    "sgmse_denoise",
+    "sgmse_dereverb",
+    "reuse",
+)
 
 
 @dataclass
@@ -202,6 +230,29 @@ class WhisperSyncConfig:
     acoustic_fallback_grid_s: float = 30.0
     acoustic_fallback_window_s: float = 8.0
     acoustic_fallback_min_sharpness: float = 50.0
+    # --- alignment acceptance gate (see matcher.evaluate_alignment) ---
+    # A clock map is checked against these BEFORE anything is placed or
+    # rendered with it. Existence is not quality: two anchors define a line
+    # exactly, so a near-zero residual over a two-point fit is evidence of
+    # nothing — a synthetic false match reproduced k=10 with sub-millisecond
+    # residual. A map that fails the gate becomes an explicit "unresolved"
+    # clip (placed by filename order, and reported) instead of a confident
+    # wrong render.
+    #
+    # Max |k - 1|. Two devices recording the same event drift by parts per
+    # million; percent-level ratios are wrong matches, not clock drift. Raise
+    # this only for deliberately speed-changed material.
+    alignment_max_k_deviation: float = 0.05
+    # Max median residual (ms) of a transcript fit. Whisper word timings are
+    # themselves ±50-100 ms, so this is deliberately well above that.
+    alignment_max_residual_ms: float = 250.0
+    # The supporting evidence must span at least this fraction of the clip.
+    # A fit whose anchors all sit in the first 3 s of a 10-minute clip is an
+    # extrapolation across the other 597 s, however tight it looks.
+    alignment_min_coverage: float = 0.25
+    # Minimum unambiguous grid points behind an ACOUSTIC map (its anchor list
+    # is empty by construction, so min_anchors cannot judge it).
+    alignment_min_acoustic_points: int = 3
     # Boundary Flex: acoustically nudge each piece's recorder start so speech
     # lands under the picture to sub-frame accuracy. On by default — it's the
     # best-out-of-the-box lip-sync setting (the GUI pre-checked this while the
@@ -309,6 +360,160 @@ class WhisperSyncConfig:
     # project into. Off by default (one extra full-length render).
     render_master_wav: bool = False
 
+    # --- validation ---------------------------------------------------
+
+    def validate(self) -> WhisperSyncConfig:
+        """Check the FINAL configuration (file + CLI/GUI overrides merged).
+
+        Runs once, in one place, before transcription begins: a bad value must
+        cost the user a message, not an hour of GPU time followed by a
+        traceback from somewhere deep in the render. Returns ``self`` so it can
+        be chained. Raises :class:`ConfigError` with a message naming the
+        field, what it got and what is allowed.
+        """
+        problems: list[str] = []
+
+        def _bool(name: str) -> None:
+            value = getattr(self, name)
+            if not isinstance(value, bool):
+                problems.append(
+                    f"{name}: expected true/false, got {value!r} — note that the "
+                    'STRING "false" is a true value in JSON-loaded config'
+                )
+
+        def _number(
+            name: str,
+            *,
+            minimum: float | None = None,
+            maximum: float | None = None,
+            allow_zero: bool = True,
+        ) -> None:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                problems.append(f"{name}: expected a number, got {value!r}")
+                return
+            if not math.isfinite(float(value)):
+                problems.append(f"{name}: must be a finite number, got {value!r}")
+                return
+            if not allow_zero and value == 0:
+                problems.append(f"{name}: must not be zero")
+            if minimum is not None and value < minimum:
+                problems.append(f"{name}: must be >= {minimum}, got {value!r}")
+            if maximum is not None and value > maximum:
+                problems.append(f"{name}: must be <= {maximum}, got {value!r}")
+
+        def _choice(name: str, allowed: tuple[str, ...]) -> None:
+            value = getattr(self, name)
+            if value not in allowed:
+                problems.append(f"{name}: {value!r} is not one of {', '.join(allowed)}")
+
+        _choice("timebase_source", TIMEBASE_SOURCES)
+        _choice("recorder_mode", ("best", "all"))
+        _choice("transcribe_mode", ("fast", "quality"))
+        _choice("self_check_transcribe_mode", ("fast", "quality"))
+        _choice("self_check_mode", ("off", "warn", "repair"))
+        _choice("stretch_method", ("auto", "atempo", "resample"))
+        _choice("output_audio_format", ("auto",))
+        _choice("voice_enhance", VOICE_ENHANCE_MODES)
+
+        if self.default_strategy not in (1, 2, 3):
+            problems.append(f"default_strategy: {self.default_strategy!r} is not one of 1, 2, 3")
+
+        for name in (
+            "vad_filter",
+            "condition_on_previous_text",
+            "use_cache",
+            "save_transcripts",
+            "crossfade_enabled",
+            "acoustic_fallback",
+            "boundary_flex",
+            "pause_duck_enabled",
+            "ambience_track",
+            "detect_retakes",
+            "render_master_wav",
+        ):
+            _bool(name)
+
+        # Anything used as a divisor, a bin width or a window must be strictly
+        # positive — zero turns into a division by zero or an infinite loop,
+        # and a negative value silently reverses a search direction.
+        for name in (
+            "seed_bin_width",
+            "phrase_gap_threshold",
+            "probe_timeout_s",
+            "flex_window_s",
+            "acoustic_fallback_grid_s",
+            "acoustic_fallback_window_s",
+            "acoustic_max_lag_s",
+            "gcc_eps",
+            "pause_duck_min_pause_s",
+        ):
+            _number(name, minimum=0.0, allow_zero=False)
+
+        _number("beam_size", minimum=1)
+        _number("quality_beam_size", minimum=1)
+        _number("batch_size", minimum=1)
+        _number("best_of", minimum=1)
+        _number("patience", minimum=0.0, allow_zero=False)
+        _number("min_anchors", minimum=2)
+        _number("anchor_min_confidence", minimum=0.0, maximum=1.0)
+        _number("match_window_margin", minimum=0.0)
+        _number("seed_max_occurrences", minimum=1)
+        _number("cache_max_age_days", minimum=0.0)
+        _number("crossfade_ms", minimum=0)
+        _number("seam_snap_max_s", minimum=0.0)
+        _number("render_workers", minimum=0)
+        _number("voice_segment_minutes", minimum=0)
+        _number("camera_av_offset_ms")
+        _number("pause_duck_db", maximum=0.0)
+        _number("pause_duck_fade_ms", minimum=0)
+        _number("flex_min_sharpness", minimum=0.0)
+        _number("flex_deadband_s", minimum=0.0)
+        _number("flex_max_shift_s", minimum=0.0)
+        _number("acoustic_fallback_min_sharpness", minimum=0.0)
+        _number("alignment_max_k_deviation", minimum=0.0, allow_zero=False)
+        _number("alignment_max_residual_ms", minimum=0.0)
+        _number("alignment_min_coverage", minimum=0.0, maximum=1.0)
+        _number("alignment_min_acoustic_points", minimum=2)
+        _number("retake_min_words", minimum=1)
+        _number("retake_similarity", minimum=0.0, maximum=1.0)
+        _number("retake_max_gap_s", minimum=0.0)
+        _number("self_check_min_run_words", minimum=1)
+        _number("self_check_shift_threshold_s", minimum=0.0, allow_zero=False)
+        _number("self_check_min_content_words", minimum=1)
+
+        # Mutual constraints — each of these is individually valid but the
+        # combination cannot do what it says.
+        if self.flex_deadband_s > self.flex_max_shift_s:
+            problems.append(
+                f"flex_deadband_s ({self.flex_deadband_s}) exceeds flex_max_shift_s "
+                f"({self.flex_max_shift_s}): every correction would be ignored"
+            )
+        if self.acoustic_fallback_window_s > self.acoustic_fallback_grid_s * 8:
+            problems.append(
+                f"acoustic_fallback_window_s ({self.acoustic_fallback_window_s}) is very "
+                f"large relative to acoustic_fallback_grid_s ({self.acoustic_fallback_grid_s})"
+            )
+
+        for name in ("video_exts", "audio_exts"):
+            value = getattr(self, name)
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                problems.append(f"{name}: expected a list of extension strings, got {value!r}")
+            elif not all(v.startswith(".") for v in value):
+                problems.append(f"{name}: every extension must start with '.', got {value!r}")
+
+        if not isinstance(self.camera_av_offset_ms_by_camera, dict) or not all(
+            isinstance(k, str) and isinstance(v, (int, float)) and math.isfinite(float(v))
+            for k, v in self.camera_av_offset_ms_by_camera.items()
+        ):
+            problems.append(
+                "camera_av_offset_ms_by_camera: expected {camera name: finite milliseconds}"
+            )
+
+        if problems:
+            raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(problems))
+        return self
+
     @property
     def resolved_cache_dir(self) -> Path:
         if self.cache_dir:
@@ -327,8 +532,21 @@ class WhisperSyncConfig:
 
     @classmethod
     def from_file(cls, path: Path) -> WhisperSyncConfig:
-        with open(path) as f:
-            data = json.load(f)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except OSError as e:
+            raise ConfigError(f"Could not read config file {path}: {e}") from e
+        except UnicodeDecodeError as e:
+            raise ConfigError(f"Config file {path} is not valid UTF-8: {e}") from e
+        except json.JSONDecodeError as e:
+            raise ConfigError(
+                f"Config file {path} is not valid JSON (line {e.lineno}, column {e.colno}): {e.msg}"
+            ) from e
+        if not isinstance(data, dict):
+            raise ConfigError(
+                f"Config file {path} must contain a JSON object, got {type(data).__name__}"
+            )
         # Silently dropping unknown keys used to hide typos (e.g. a config
         # written with "pause_duck_dB" instead of "pause_duck_db" would just
         # never take effect, with no indication why). Warn about anything that
@@ -349,7 +567,18 @@ class WhisperSyncConfig:
                 setattr(self, key, value)
 
 
-def load_config(config_path: Path | None = None, **cli_overrides: object) -> WhisperSyncConfig:
+def load_config(
+    config_path: Path | None = None,
+    validate: bool = True,
+    **cli_overrides: object,
+) -> WhisperSyncConfig:
+    """Load, merge and (by default) VALIDATE the effective configuration.
+
+    Validation happens after the overrides are merged, because that merged
+    object is what the run will actually use — validating the file alone would
+    miss a bad CLI flag, and validating each source separately would miss the
+    combinations only the merge produces.
+    """
     if config_path is not None:
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -357,4 +586,6 @@ def load_config(config_path: Path | None = None, **cli_overrides: object) -> Whi
     else:
         cfg = WhisperSyncConfig()
     cfg.merge_cli_args(**cli_overrides)
+    if validate:
+        cfg.validate()
     return cfg

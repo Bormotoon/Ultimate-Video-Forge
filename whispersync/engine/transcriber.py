@@ -13,7 +13,10 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
+import re
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -35,6 +38,21 @@ except ImportError:  # pragma: no cover - torch optional at import time
     _TORCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+
+def _finite(value: object) -> float:
+    """``float(value)`` when it is a real, finite number; else ``ValueError``.
+
+    JSON happily round-trips ``NaN`` and ``Infinity``, and a cached transcript
+    carrying either would propagate silently into every downstream time
+    calculation — producing pieces of infinite length rather than an error
+    anyone could act on.
+    """
+    number = float(value)  # type: ignore[arg-type]
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite value {value!r}")
+    return number
+
 
 # CUDA compute capability at/above which float16 is the sensible default.
 _CUDA_FLOAT16_MAJOR = 7
@@ -114,24 +132,64 @@ def _local_model_path(model: str) -> str | None:
         return None
 
 
+# Cache entries are named "<64 hex chars>.json" and carry this marker, so
+# pruning can prove an entry is ours before deleting it.
+CACHE_SCHEMA = "whispersync/transcript-cache/1"
+_CACHE_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
+
+
+def transcripts_cache_dir(cache_dir: Path) -> Path:
+    """The subdirectory this app owns inside ``cache_dir``.
+
+    ``cache_dir`` is user-configurable and may well be a directory holding
+    other things. Writing (and especially pruning) directly in it treated the
+    whole directory as ours: with ``cache_max_age_days`` set, retention deleted
+    every old ``*.json`` it found there — an unrelated ``/shared/report.json``
+    included. Everything lives under our own subdirectory now, and pruning
+    still verifies each file before removing it.
+    """
+    return cache_dir / "transcripts"
+
+
+def _is_own_cache_entry(entry: Path) -> bool:
+    """Whether ``entry`` is a transcript cache file this app wrote.
+
+    Two independent proofs are required — the name shape AND the schema marker
+    inside — because either alone can coincide with somebody else's file.
+    """
+    if not _CACHE_NAME_RE.match(entry.name):
+        return False
+    try:
+        with entry.open("rb") as fh:
+            head = fh.read(4096).decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    return CACHE_SCHEMA in head
+
+
 def _prune_cache(cache_dir: Path, max_age_days: float) -> int:
     """Delete cached transcripts older than ``max_age_days`` (by mtime).
 
-    Called once per engine start when ``config.cache_max_age_days > 0`` —
-    transcripts are cheap to store but a machine churning through many
-    one-off projects can cap growth this way. Returns the number of entries
-    removed; any filesystem error on an individual entry is skipped (a
-    half-pruned cache is still a valid cache). See PROJECT_ANALYSIS.md §6.6.
+    Called once per engine start when ``config.cache_max_age_days > 0``.
+    Only files this app can prove it wrote are removed (see
+    ``_is_own_cache_entry``); anything else in the directory is left alone.
+    Returns the number of entries removed; a filesystem error on an individual
+    entry is skipped (a half-pruned cache is still a valid cache).
     """
-    if not cache_dir.is_dir():
+    own_dir = transcripts_cache_dir(cache_dir)
+    if not own_dir.is_dir():
         return 0
     cutoff = time.time() - max_age_days * 86400.0
     removed = 0
-    for entry in cache_dir.glob("*.json"):
+    for entry in own_dir.glob("*.json"):
         try:
-            if entry.stat().st_mtime < cutoff:
-                entry.unlink()
-                removed += 1
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            if not _is_own_cache_entry(entry):
+                logger.debug("Cache prune: skipping unrecognised file %s", entry)
+                continue
+            entry.unlink()
+            removed += 1
         except OSError:
             continue
     if removed:
@@ -298,7 +356,22 @@ class WhisperEngine:
         self,
         audio_path: Path,
         progress_callback: Callable[[float], None] | None = None,
+        identity: Path | None = None,
+        stream_index: int | None = None,
     ) -> Transcript:
+        """Transcribe ``audio_path``, using (and filling) the on-disk cache.
+
+        ``identity`` is the file the transcript really BELONGS to, when
+        ``audio_path`` is a throw-away decode of it. Camera clips are always
+        transcribed from a scratch WAV extracted into a fresh tempfile, and the
+        cache key was built from that scratch file's path, size and mtime — all
+        three different on every run. The key therefore never repeated: a
+        second run over unchanged footage re-did the entire (expensive)
+        transcription and left another single-use entry behind, so the cache
+        grew without ever being read. Keying on the ORIGINAL clip plus the
+        chosen ``stream_index`` makes a re-run with different render settings
+        a cache hit, which is the whole point of having one.
+        """
         # Cache lookup uses the RESOLVED device/compute_type (self._device /
         # self._compute_type, resolved in __init__ from config.device/
         # compute_type — cheap, no model load), not config.compute_type
@@ -307,12 +380,15 @@ class WhisperEngine:
         # on the same cache key despite producing different transcripts. This
         # lookup intentionally happens BEFORE _ensure_model() so a cache hit
         # still avoids loading the model at all. See PROJECT_ANALYSIS.md §2.7.
-        key = self._cache_key(audio_path, self.config, self._device, self._compute_type)
+        key_source = identity or audio_path
+        key = self._cache_key(
+            key_source, self.config, self._device, self._compute_type, stream_index
+        )
         cache_file = self._cache_path(self.config.resolved_cache_dir, key)
         if self.config.use_cache:
             cached = self._load_cache(cache_file)
             if cached is not None:
-                logger.info("Loaded transcript from cache for %s", audio_path)
+                logger.info("Loaded transcript from cache for %s", key_source)
                 return cached
 
         self._ensure_model()
@@ -333,17 +409,26 @@ class WhisperEngine:
             except RuntimeError as exc:
                 if not (self._device == "cuda" and _is_cuda_oom(exc)):
                     raise
-                self._cleanup_cuda()
                 if cur_batch > 1:
+                    self._cleanup_cuda()
                     cur_batch = max(1, cur_batch // 2)
                     logger.warning("CUDA OOM; retrying on GPU with batch_size=%d", cur_batch)
                     continue
                 logger.warning("CUDA OOM at batch_size=1; switching to CPU")
+                # Release the GPU model BEFORE building the CPU one. Loading
+                # the replacement while `self._model` still referenced the old
+                # one kept both alive simultaneously — on a machine that just
+                # ran out of memory, which is the least affordable moment to
+                # hold two copies. The traceback of the OOM we are handling can
+                # also pin inference tensors, so it is dropped too.
+                self._model = None
+                exc.__traceback__ = None
+                self._cleanup_cuda()
                 self._device, self._compute_type = "cpu", "float32"
                 self._model = self._load(self._device, self._compute_type)
 
         transcript = Transcript(
-            source_path=audio_path.resolve(),
+            source_path=key_source.resolve(),
             language=language,
             duration=total,
             segments=segments,
@@ -352,7 +437,9 @@ class WhisperEngine:
             # Re-derive the key in case an in-flight OOM fallback changed
             # device/compute_type after the lookup above, so the saved cache
             # entry is keyed by what actually produced this transcript.
-            final_key = self._cache_key(audio_path, self.config, self._device, self._compute_type)
+            final_key = self._cache_key(
+                key_source, self.config, self._device, self._compute_type, stream_index
+            )
             self._save_cache(
                 self._cache_path(self.config.resolved_cache_dir, final_key), transcript
             )
@@ -360,14 +447,22 @@ class WhisperEngine:
 
     @staticmethod
     def _cache_key(
-        audio_path: Path, config: WhisperSyncConfig, device: str, compute_type: str
+        audio_path: Path,
+        config: WhisperSyncConfig,
+        device: str,
+        compute_type: str,
+        stream_index: int | None = None,
     ) -> str:
         stat = audio_path.stat()
         parts = "|".join(
             [
+                CACHE_SCHEMA,
                 str(audio_path.resolve()),
                 str(stat.st_size),
                 str(stat.st_mtime),
+                # Which audio stream was decoded: the same container read on a
+                # different track is different audio and must not share a key.
+                str(stream_index),
                 config.model,
                 device,
                 compute_type,
@@ -389,38 +484,71 @@ class WhisperEngine:
 
     @staticmethod
     def _cache_path(cache_dir: Path, key: str) -> Path:
-        return cache_dir / f"{key}.json"
+        return transcripts_cache_dir(cache_dir) / f"{key}.json"
 
     def _load_cache(self, cache_file: Path) -> Transcript | None:
-        if not cache_file.exists():
+        """A cached transcript, or None to re-transcribe.
+
+        EVERY failure here is a cache miss, never an exception: a cache exists
+        to save work, so a corrupt or unreadable entry must cost one
+        re-transcription, not the run. Invalid UTF-8 in an entry used to raise
+        ``UnicodeDecodeError`` straight out of the pipeline, and an
+        unreadable-but-present file did the same — the cache could destroy the
+        very work it was meant to preserve. Contents are validated too: a
+        structurally valid JSON file with nonsense timestamps would otherwise
+        be handed to the matcher as fact.
+        """
+        try:
+            raw = cache_file.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as e:
+            logger.warning("Unreadable cache file %s (%s) — will re-transcribe", cache_file, e)
             return None
         try:
-            data = json.loads(cache_file.read_text())
+            data = json.loads(raw)
+            if data.get("schema") != CACHE_SCHEMA:
+                logger.info("Cache file %s has a different schema — re-transcribing", cache_file)
+                return None
+            duration = _finite(data["duration"])
             segments = []
             for seg in data["segments"]:
                 words = [
                     Word(
-                        text=w["text"],
-                        start=w["start"],
-                        end=w["end"],
-                        probability=w["probability"],
+                        text=str(w["text"]),
+                        start=_finite(w["start"]),
+                        end=_finite(w["end"]),
+                        probability=_finite(w["probability"]),
                     )
                     for w in seg["words"]
                 ]
-                segments.append(Segment(start=seg["start"], end=seg["end"], words=words))
+                if any(w.end < w.start for w in words):
+                    raise ValueError("word end before start")
+                segments.append(
+                    Segment(start=_finite(seg["start"]), end=_finite(seg["end"]), words=words)
+                )
             return Transcript(
                 source_path=Path(data["source_path"]),
-                language=data["language"],
-                duration=data["duration"],
+                language=str(data["language"]),
+                duration=duration,
                 segments=segments,
             )
-        except (json.JSONDecodeError, KeyError, TypeError):
-            logger.warning("Corrupt cache file %s, will re-transcribe", cache_file)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning("Corrupt cache file %s (%s) — will re-transcribe", cache_file, e)
             return None
 
     def _save_cache(self, cache_file: Path, transcript: Transcript) -> None:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        """Write a transcript to the cache. A failure is a warning, never a
+        raise: the transcript is already computed and the caller needs it —
+        losing an hour of inference because the cache directory is full or
+        read-only would be the worst possible trade.
+
+        The write is atomic (unique temp file in the same directory, then
+        ``os.replace``), so a crash or a concurrent run can never leave a
+        half-written entry that a later run would read back as a valid one.
+        """
         data = {
+            "schema": CACHE_SCHEMA,
             "source_path": str(transcript.source_path),
             "language": transcript.language,
             "duration": transcript.duration,
@@ -441,11 +569,30 @@ class WhisperEngine:
                 for seg in transcript.segments
             ],
         }
-        cache_file.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=cache_file.parent, prefix=f".{cache_file.stem}.", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, ensure_ascii=False, indent=2)
+                os.replace(tmp_name, cache_file)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name)
+                raise
+        except OSError as e:
+            logger.warning("Could not cache transcript to %s (%s)", cache_file, e)
+            return
         logger.info("Transcript cached to %s", cache_file)
 
     def unload(self) -> None:
-        if self._model is not None:
+        # getattr, not attribute access: __del__ can run on an instance whose
+        # __init__ raised part-way (a bad cache dir, an unresolvable device),
+        # and an AttributeError raised from a destructor becomes an unraisable
+        # exception printed to stderr — noise that hides the real failure.
+        if getattr(self, "_model", None) is not None:
             del self._model
             self._model = None
             gc.collect()

@@ -11,8 +11,11 @@ short run of words that repeats a run spoken shortly before, without assuming
 any sentence structure around it.
 
 This module groups consecutive restarts of the same material into "takes" so
-the exporter can offer them as a Final Cut *audition* (the alternatives stacked
-under one active pick) instead of leaving every flubbed attempt on the timeline.
+the exporter can MARK them for the editor (see engine/export.py) instead of
+leaving every flubbed attempt unlabelled on the timeline. Marking, not
+restructuring: an audition that switches audio without switching the linked
+picture desynchronises the result, so grouping is a review aid here and any
+automatic re-cutting is a separate feature with its own timing model.
 
 The detector is deterministic and dependency-free (exact token-run matching,
 normalized). It is intentionally the FIRST tier of a two-tier design: an
@@ -66,7 +69,9 @@ def _find_restart(toks: list[_Tok], i: int, k: int, max_lookahead: int) -> int:
     return -1
 
 
-def _match_extent(toks: list[_Tok], i: int, j: int, k: int) -> tuple[int, int, int, int]:
+def _match_extent(
+    toks: list[_Tok], i: int, j: int, k: int, min_index: int = 0
+) -> tuple[int, int, int, int]:
     """Extend a verified ``k``-token match at ``(i, j)`` to its maximal span.
 
     A restart usually repeats more than just the ``k`` tokens used to find it
@@ -81,11 +86,21 @@ def _match_extent(toks: list[_Tok], i: int, j: int, k: int) -> tuple[int, int, i
     independent extent first — then judging timing on THAT — makes the
     decision the same regardless of which offset happened to be tried.
 
+    ``min_index`` bounds the BACKWARD extension, and it is what makes three or
+    more identical attempts work. With the same phrase spoken at 0 s, 3 s and
+    6 s, extending the 3 s -> 6 s match backwards found that the tokens before
+    3 s also matched — they are the SAME phrase, at 0 s — and walked the span
+    all the way into the first attempt. The two occurrences then overlapped,
+    the gap between them came out NEGATIVE, the match was rejected as
+    implausible, and the group stopped at two attempts with the middle one
+    kept. Passing the current attempt's own start keeps the extension inside
+    it.
+
     Returns ``(lo_i, hi_i, lo_j, hi_j)``: the first occurrence spans
     ``[lo_i, hi_i)``, the second (the repeat) spans ``[lo_j, hi_j)``.
     """
     lo_i, lo_j = i, j
-    while lo_i > 0 and toks[lo_i - 1].norm == toks[lo_j - 1].norm:
+    while lo_i > min_index and toks[lo_i - 1].norm == toks[lo_j - 1].norm:
         lo_i -= 1
         lo_j -= 1
     hi_i, hi_j = i + k, j + k
@@ -110,19 +125,29 @@ def _span_text(toks: list[_Tok], a: int, b: int) -> str:
 
 
 def _extended_restart(
-    toks: list[_Tok], i: int, k: int, max_gap_s: float, max_lookahead: int
+    toks: list[_Tok], i: int, k: int, max_gap_s: float, max_lookahead: int, min_index: int = 0
 ) -> tuple[int, int] | None:
     """Find a restart of the phrase beginning at ``i`` and validate it by its
-    EXTENDED span (see ``_match_extent``): accepted only when the pause between
-    where the first occurrence's matched span ends and the second begins is
-    within ``max_gap_s``. Returns ``(lo_i, lo_j)`` — the (possibly earlier than
-    ``i``) true start of the first occurrence, and the start of the restart —
-    or ``None`` if no candidate in range passes.
+    EXTENDED span (see ``_match_extent``): accepted only when the two
+    occurrences do not overlap and the pause between where the first one's
+    matched span ends and the second begins is within ``max_gap_s``. Returns
+    ``(lo_i, lo_j)`` — the (possibly earlier than ``i``) true start of the
+    first occurrence, and the start of the restart — or ``None`` if no
+    candidate in range passes.
+
+    ``min_index`` is the earliest token the backward extension may reach: when
+    chaining a third or fourth attempt, that is the current attempt's own
+    start, so the extension cannot reach back into an attempt already assigned
+    to this group.
     """
     j = _find_restart(toks, i, k, max_lookahead)
     if j < 0:
         return None
-    lo_i, hi_i, lo_j, _hi_j = _match_extent(toks, i, j, k)
+    lo_i, hi_i, lo_j, _hi_j = _match_extent(toks, i, j, k, min_index)
+    if lo_j < hi_i:
+        # Overlapping occurrences are not two attempts at a line, they are one
+        # span counted twice. (Their "gap" would be negative.)
+        return None
     gap = toks[lo_j].start - toks[hi_i - 1].end
     if 0.0 <= gap <= max_gap_s:
         return lo_i, lo_j
@@ -165,10 +190,18 @@ def detect_retakes(words: list[Word], config: WhisperSyncConfig) -> list[RetakeG
         starts = [lo_i, lo_j]
         cur = lo_j
         while True:
-            nxt = _extended_restart(toks, cur, k, config.retake_max_gap_s, max_lookahead)
+            # `cur` bounds the backward extension: without it, matching the
+            # 2nd attempt against the 3rd extended back through the 1st and
+            # produced overlapping spans with a negative gap, which was then
+            # rejected — so three identical takes yielded a group of two.
+            nxt = _extended_restart(
+                toks, cur, k, config.retake_max_gap_s, max_lookahead, min_index=cur
+            )
             if nxt is None:
                 break
             _cur_lo, nxt_j = nxt
+            if nxt_j <= cur:
+                break  # never move backwards; that would re-add an attempt
             starts.append(nxt_j)
             cur = nxt_j
         # The keeper's own extent uses phrase_gap_threshold (the same
@@ -183,6 +216,11 @@ def detect_retakes(words: list[Word], config: WhisperSyncConfig) -> list[RetakeG
         # Final Cut — whereas a keeper stretching minutes past the actual
         # retake is a much worse practical outcome.
         last_end = _run_end(toks, cur, config.phrase_gap_threshold)
+        # Attempts must tile without overlapping: each take runs from its own
+        # start to the next attempt's start, and the last to the end of its
+        # speech run. A `last_end` that did not clear the final start would
+        # make the keeper zero- or negative-length.
+        last_end = max(last_end, cur + 1)
         bounds = [*starts, last_end]
         takes = [
             Take(

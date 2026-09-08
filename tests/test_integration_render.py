@@ -11,6 +11,7 @@ PATH; run explicitly with `pytest -m integration` or excluded with
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 from whispersync.engine.media import probe
 from whispersync.engine.timestretch import (
     assemble_continuous,
+    conform_wav_to,
     extract_segment,
     mix_clips_on_timeline,
     render_piece,
@@ -351,3 +353,263 @@ def test_cut_wav_segment_is_bit_exact(stereo24_source: Path, tmp_path: Path) -> 
     ).stdout
     assert len(joined) == len(original)
     assert joined == original
+
+
+def _astats(path: Path) -> dict[str, float]:
+    """ffmpeg's own measurement of a file: peak level and flat factor.
+
+    "Flat factor" counts consecutive samples pinned at the same extreme value —
+    the signature of hard clipping, and the thing a peak reading alone cannot
+    distinguish from a track that simply reaches full scale.
+    """
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-i", str(path), "-af", "astats=metadata=1", "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    stats: dict[str, float] = {}
+    for line in result.stderr.splitlines():
+        for key in ("Peak level dB", "Flat factor"):
+            if key in line and key not in stats:
+                with contextlib.suppress(ValueError):
+                    stats[key] = float(line.split(":")[-1].strip())
+    return stats
+
+
+def test_master_mix_does_not_clip_correlated_sources(tmp_path: Path) -> None:
+    """Two hot, correlated tracks must not hard-clip when summed.
+
+    `amix` with `normalize=0` (right for level consistency) sums straight past
+    full scale, and an integer PCM output then clips silently — the realistic
+    case being two correlated microphones in `recorder_mode="all"`, or voice
+    plus ambience. Measured on this exact material, the unprotected path
+    produced a flat factor of ~30 (long runs of samples pinned at full scale);
+    the mix must instead reach full scale without flattening.
+    """
+    hot = tmp_path / "hot.wav"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2:sample_rate=48000",
+            # ffmpeg's sine generator peaks at 0.125; 6.4x puts it at 0.8 FS,
+            # so two of them sum to 1.6 — well past full scale.
+            "-af",
+            "volume=6.4",
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_s24le",
+            str(hot),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    hot_b = tmp_path / "hot_b.wav"
+    shutil.copy(hot, hot_b)
+
+    out = tmp_path / "master.wav"
+    mix_clips_on_timeline(
+        [(hot, 0.0), (hot_b, 0.0)], 2.0, 48000, out, channels=1, codec="pcm_s24le"
+    )
+
+    stats = _astats(out)
+    assert stats, "astats produced no measurement"
+    # Full scale is fine; flat-topped samples are not.
+    assert stats["Flat factor"] < 1.0, f"master mix is clipped (flat factor {stats['Flat factor']})"
+    assert stats["Peak level dB"] <= 0.01
+
+
+def test_float_sources_keep_their_headroom_end_to_end(tmp_path: Path) -> None:
+    """A 32-bit float recorder must stay float through the render path.
+
+    The whole point of float recording is that samples above ±1.0 remain
+    recoverable. Choosing a codec from bit depth alone sent a float source to
+    `pcm_s32le`, and ffmpeg hard-clips at full scale on the way in: measured on
+    real ffmpeg, [0, 0.5, 1, 1.5, 2, -1.5] came back as [0, 0.5, 1, 1, 1, -1].
+    Those peaks are gone for good — no later gain reduction restores them.
+    """
+    from whispersync.engine.media import pcm_codec_for, probe
+
+    # A float32 source that genuinely exceeds full scale.
+    src = tmp_path / "hot_float.wav"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1:sample_rate=48000",
+            "-af",
+            "volume=16.0",  # sine peaks at 0.125 -> 2.0 full scale
+            "-ac",
+            "1",
+            "-acodec",
+            "pcm_f32le",
+            str(src),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    info = probe(src)
+    assert info.audio_sample_fmt and info.audio_sample_fmt.startswith("flt")
+
+    # The codec the render path would pick for this source.
+    codec = pcm_codec_for(info)
+    assert codec == "pcm_f32le", f"a float source was conformed to {codec}"
+
+    # And a real conform through that codec preserves the over-unity peak.
+    out = tmp_path / "conformed.wav"
+    conform_wav_to(src, out, info.duration, 48000, 1, codec)
+    stats = _astats(out)
+    assert stats["Peak level dB"] > 3.0, (
+        f"peak came back at {stats['Peak level dB']:.1f} dBFS — headroom above "
+        "full scale was clipped away"
+    )
+
+
+def _make_two_stream_file(path: Path) -> None:
+    """A Matroska file with TWO audio streams: a quiet mono track first, then a
+    loud stereo one, with NO `default` disposition on either.
+
+    That last detail is what makes the fixture meaningful. Given no `-map` and
+    no default flag, ffmpeg picks the stream with the most channels — the
+    stereo one — while a caller reading "the first audio stream" gets the mono
+    one. (With a default flag set, ffmpeg honours it and the two agree, which
+    is why the flag has to be cleared here.)
+    """
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            # 0: mono, quiet
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=300:duration=2:sample_rate=48000",
+            # 1: stereo, loud
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=900:duration=2:sample_rate=48000",
+            "-filter_complex",
+            "[0:a]volume=0.2[a0];[1:a]volume=8.0,pan=stereo|c0=c0|c1=c0[a1]",
+            "-map",
+            "[a0]",
+            "-map",
+            "[a1]",
+            # Clear the default flag on both: with one set, ffmpeg honours it
+            # and automatic selection coincides with "the first stream",
+            # making the fixture unable to show the divergence.
+            "-disposition:a:0",
+            "0",
+            "-disposition:a:1",
+            "0",
+            "-c:a",
+            "pcm_s16le",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+
+
+def test_probing_and_decoding_agree_on_the_audio_stream(tmp_path: Path) -> None:
+    """The stream ffprobe reports must be the stream ffmpeg decodes.
+
+    These are different rules: ffprobe's caller reads "the first audio stream",
+    while ffmpeg given no `-map` picks the *best* one — most channels wins. A
+    camera file holding a mono on-board mic plus a stereo scratch track was
+    therefore probed on one stream and decoded from the other. Reproduced on
+    real media: automatic selection yielded peak 0 where `-map 0:a:0` yielded
+    a real signal.
+    """
+    import numpy as np
+
+    from whispersync.engine.acoustic import load_mono16k_track
+    from whispersync.engine.media import extract_audio_to_wav, probe
+
+    src = tmp_path / "two_streams.mkv"
+    _make_two_stream_file(src)
+
+    info = probe(src)
+    # Whatever the policy chose, it must be recorded — not left implicit.
+    assert info.audio_stream_index is not None
+    assert info.audio_channels is not None
+
+    # Decode the stream the probe reported, and both streams explicitly.
+    as_reported = tmp_path / "as_reported.wav"
+    extract_audio_to_wav(src, as_reported, stream_index=info.audio_stream_index)
+
+    def dominant_hz(p: Path) -> float:
+        track = load_mono16k_track(p)
+        seg = track[4000:20000]
+        spec = np.abs(np.fft.rfft(seg.astype(np.float64)))
+        return float(np.fft.rfftfreq(seg.size, d=1.0 / 16000)[int(np.argmax(spec))])
+
+    stream0 = tmp_path / "s0.wav"
+    extract_audio_to_wav(src, stream0, stream_index=0)
+
+    # The decode of "the stream we reported" must match that stream's content,
+    # not whatever ffmpeg would have picked on its own.
+    expected = dominant_hz(stream0) if info.audio_stream_index == 0 else None
+    if expected is not None:
+        assert (
+            abs(dominant_hz(as_reported) - expected) < 20
+        ), "the decoded audio is not the stream that was probed"
+    # And the channel count agrees with the reported stream.
+    assert probe(as_reported).audio_channels == info.audio_channels
+
+
+def test_automatic_stream_selection_would_have_disagreed(tmp_path: Path) -> None:
+    """Demonstrates WHY the explicit `-map` matters, on real media.
+
+    Without `-map`, ffmpeg picks the stereo stream; the probe reports the mono
+    one. If these ever coincide the test is vacuous, so it asserts they differ.
+    """
+    from whispersync.engine.media import probe
+
+    src = tmp_path / "two_streams.mkv"
+    _make_two_stream_file(src)
+
+    auto = tmp_path / "auto.wav"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            str(auto),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    info = probe(src)
+    auto_info = probe(auto)
+    assert (
+        info.audio_channels != auto_info.audio_channels
+    ), "the fixture no longer distinguishes automatic from explicit selection"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib.resources
 import sys
 from pathlib import Path
 
@@ -64,6 +65,9 @@ class MainWindow(QMainWindow):
         self._worker: SyncWorker | None = None
         self._thread: QThread | None = None
         self._output_user_set = False  # has the user picked an explicit output folder?
+        # Set once the user has asked to close while a run is still going; the
+        # actual close happens when the worker thread reports it has stopped.
+        self._closing = False
 
         self._setup_ui()
         self._restore_state()
@@ -256,16 +260,16 @@ class MainWindow(QMainWindow):
         options_layout.addRow("Voice file split:", self.segment_combo)
 
         # Retake detection (off by default): find lines the speaker
-        # re-recorded back-to-back and export them as Final Cut auditions
-        # (press Q in FCPX to browse takes) instead of leaving every flubbed
-        # attempt on the timeline. A non-destructive heuristic — nothing is
-        # ever cut; the editor reviews/picks in Final Cut.
-        self.retakes_check = QCheckBox("Detect retakes (export as Final Cut auditions)")
+        # re-recorded back-to-back and MARK each attempt on the timeline.
+        # Markers rather than auditions: an audition switched the audio to the
+        # keeper take without switching the picture, putting the voice seconds
+        # ahead of the image. Nothing is cut, moved or re-timed.
+        self.retakes_check = QCheckBox("Detect retakes (mark attempts on the timeline)")
         self.retakes_check.setChecked(self.config.detect_retakes)
         self.retakes_check.setToolTip(
-            "Find lines re-recorded back-to-back (flub, stop, restart) and group "
-            "each set of attempts into a Final Cut audition — a non-destructive "
-            "stack of alternatives you browse with Q. Off by default."
+            "Find lines re-recorded back-to-back (flub, stop, restart) and place a "
+            "marker on each attempt, labelled with the one the speaker kept. "
+            "Nothing is cut or re-timed. Off by default."
         )
         options_layout.addRow(self.retakes_check)
 
@@ -298,9 +302,11 @@ class MainWindow(QMainWindow):
         # were compared in a listening test; each trades speed/quality/license
         # differently (see the Help tab for the full pros/cons breakdown), so
         # this is a per-project choice rather than a single recommended default.
-        # A mode whose environment isn't set up is skipped with a warning at
-        # the end of the run (same UX as ambience_track on a missing .sep-venv)
-        # rather than disabling combo entries individually.
+        # A mode whose ENVIRONMENT merely isn't set up stays selectable (it is
+        # skipped with a warning, same UX as ambience_track on a missing
+        # .sep-venv), but a mode with no backend in this build at all is
+        # disabled outright: picking one used to cost a whole run before
+        # "not available yet in this build" appeared as the last log line.
         self.voice_enhance_combo = QComboBox()
         self.voice_enhance_combo.addItem("Off", "off")
         self.voice_enhance_combo.addItem("Denoise (fast, safest)", "denoise")
@@ -311,7 +317,16 @@ class MainWindow(QMainWindow):
         self.voice_enhance_combo.addItem("SGMSE+ Denoise (slow, cleanest)", "sgmse_denoise")
         self.voice_enhance_combo.addItem("SGMSE+ De-reverb (slow)", "sgmse_dereverb")
         self.voice_enhance_combo.addItem("RE-USE (fastest, noncommercial license only)", "reuse")
-        idx = self.voice_enhance_combo.findData(self.config.voice_enhance)
+        self._disable_unimplemented_enhance_modes()
+        # A saved config can still name a greyed-out mode; don't restore it
+        # into the combo, or the run would set off with a mode that can't run.
+        from whispersync.engine.enhance import IMPLEMENTED_MODES as _IMPL
+
+        idx = (
+            self.voice_enhance_combo.findData(self.config.voice_enhance)
+            if self.config.voice_enhance in _IMPL
+            else -1
+        )
         self.voice_enhance_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.voice_enhance_combo.setToolTip(
             "Run a third-party model over the rendered voice monolith before "
@@ -322,7 +337,8 @@ class MainWindow(QMainWindow):
             "cleanest but run ~5x slower than realtime (diffusion) — needs a "
             "separate '.enh-venv'. 'RE-USE' is the fastest all-in-one option "
             "but its model is NSCLv1 (noncommercial use only) and needs "
-            "Docker plus NVIDIA's own RE-USE source under their license. Off "
+            "Docker plus NVIDIA's own RE-USE source under their license — no "
+            "backend for it in this build yet, so it is greyed out. Off "
             "by default; a mode whose environment isn't set up is skipped "
             "with a warning, keeping the unenhanced audio."
         )
@@ -463,6 +479,28 @@ class MainWindow(QMainWindow):
 
         self._on_strategy_changed()
 
+    def _disable_unimplemented_enhance_modes(self) -> None:
+        """Grey out voice-enhancement modes that have no backend in this build.
+
+        A mode whose environment just isn't installed stays selectable — the
+        run warns and keeps the unenhanced audio, and the user may well be
+        about to install it. A mode with no backend at all can never work, and
+        selecting one silently cost a full multi-hour run before the pipeline
+        said so at the end."""
+        from whispersync.engine import enhance
+
+        model = self.voice_enhance_combo.model()
+        for i in range(self.voice_enhance_combo.count()):
+            mode = self.voice_enhance_combo.itemData(i)
+            if mode in enhance.IMPLEMENTED_MODES:
+                continue
+            self.voice_enhance_combo.setItemText(
+                i, f"{self.voice_enhance_combo.itemText(i)} — not in this build"
+            )
+            item = model.item(i) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(False)
+
     def _get_strategy_id(self) -> int:
         if self.radio2.isChecked():
             return 2
@@ -495,6 +533,12 @@ class MainWindow(QMainWindow):
     def _on_duck_db_changed(self, value: int) -> None:
         self.duck_value.setText(self._duck_db_text(value))
 
+    # Source selection goes through ONE handler per kind, whichever way it was
+    # chosen. Browsing for a video folder used to skip the persistence the
+    # drop-zone did, and only the FIRST recorder was ever saved — so a restart
+    # could restore last week's folder, or silently start a multi-recorder run
+    # with one file. What is persisted is also what is restored.
+
     def _on_video_dropped(self, path: str) -> None:
         self.settings.setValue("last_video_dir", path)
         self.log_view.append_log(f"Video folder: {path}")
@@ -506,6 +550,11 @@ class MainWindow(QMainWindow):
 
     def _on_audio_paths_dropped(self, paths: list) -> None:
         self.recorder_mode_combo.setEnabled(len(paths) > 1)
+        # The whole set, not just the first: a two-recorder project restored as
+        # one recorder runs happily and produces a different, wrong result.
+        self.settings.setValue("last_audio_files", [str(p) for p in paths])
+        if paths:
+            self.settings.setValue("last_audio_file", str(paths[0]))
         if len(paths) > 1:
             self.log_view.append_log(f"{len(paths)} recorder audio files selected")
 
@@ -520,19 +569,22 @@ class MainWindow(QMainWindow):
             self.output_drop.set_path(video_path)
 
     def _browse_video(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select Video Folder")
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Video Folder", str(self.settings.value("last_video_dir", "") or "")
+        )
         if path:
             self.video_drop.set_path(path)
-            self._maybe_default_output(path)
+            self._on_video_dropped(path)
 
     def _browse_audio(self) -> None:
         exts = " ".join(f"*{e}" for e in self.config.audio_exts)
+        last = str(self.settings.value("last_audio_file", "") or "")
+        start_dir = str(Path(last).parent) if last else ""
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select Audio File(s)", "", f"Audio Files ({exts})"
+            self, "Select Audio File(s)", start_dir, f"Audio Files ({exts})"
         )
         if paths:
             self.audio_drop.set_paths(paths)
-            self._on_audio_dropped(paths[0])
             self._on_audio_paths_dropped(paths)
 
     def _browse_output(self) -> None:
@@ -611,15 +663,27 @@ class MainWindow(QMainWindow):
         self._worker.timeline.connect(self.timeline_preview.set_tracks)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
+        self._worker.cancelled.connect(self._on_cancelled)
+        # All THREE terminal outcomes stop the thread. Cancellation used to be
+        # reported only as a log line, so the thread kept running and the
+        # buttons stayed disabled — the window looked busy forever.
         self._worker.finished.connect(self._thread.quit)
         self._worker.error.connect(self._thread.quit)
+        self._worker.cancelled.connect(self._thread.quit)
+        # Deferred close (see closeEvent) waits for this, and a re-run needs
+        # the previous objects gone before new ones are wired up.
+        self._thread.finished.connect(self._on_thread_finished)
 
         self._thread.start()
 
     def _cancel_sync(self) -> None:
         if self._worker:
             self._worker.cancel()
-            self.log_view.append_log("Cancellation requested...", "WARNING")
+            self.btn_cancel.setEnabled(False)
+            self.stage_label.setText("Cancelling…")
+            self.log_view.append_log(
+                "Cancellation requested — finishing the current step...", "WARNING"
+            )
 
     def _on_progress(self, value: int) -> None:
         # Animate toward the new value (skip the tween for resets to 0).
@@ -637,8 +701,7 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(stage)
 
     def _on_finished(self, result: object) -> None:
-        self.btn_sync.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
+        self._restore_idle_ui()
         self._on_progress(100)
         self.stage_label.setText("Done!")
 
@@ -667,9 +730,32 @@ class MainWindow(QMainWindow):
         self.log_view.append_log("Sync complete!", "INFO")
         self.status_bar.showMessage("Sync complete!")
 
-    def _on_error(self, msg: str) -> None:
+    def _on_cancelled(self) -> None:
+        """Restore the window after a cancelled run — the same job `_on_finished`
+        and `_on_error` do for the other two outcomes."""
+        self._restore_idle_ui()
+        self.stage_label.setText("Cancelled")
+        self._on_progress(0)
+        self.log_view.append_log("Sync cancelled.", "WARNING")
+        self.status_bar.showMessage("Cancelled")
+
+    def _on_thread_finished(self) -> None:
+        """The worker thread has actually stopped.
+
+        Anything that must not happen while a pipeline is still running — a
+        deferred window close, dropping references to the worker — belongs
+        here, not at the moment cancellation was merely *requested*.
+        """
+        self._restore_idle_ui()
+        if self._closing:
+            self.close()
+
+    def _restore_idle_ui(self) -> None:
         self.btn_sync.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+
+    def _on_error(self, msg: str) -> None:
+        self._restore_idle_ui()
         self.stage_label.setText("Error!")
         self.log_view.append_log(f"ERROR: {msg}", "ERROR")
         self.status_bar.showMessage("Error!")
@@ -683,20 +769,78 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._output_path)))
 
     def _restore_state(self) -> None:
-        last_video = self.settings.value("last_video_dir", "")
-        last_audio = self.settings.value("last_audio_file", "")
-        if last_video and Path(str(last_video)).exists():
-            self.video_drop.set_path(str(last_video))
-            self._maybe_default_output(str(last_video))
-        if last_audio and Path(str(last_audio)).exists():
-            self.audio_drop.set_path(str(last_audio))
+        """Re-select the previous session's sources, and SAY what is missing.
+
+        A restored selection that silently dropped the files that no longer
+        exist (an unmounted card, a moved folder) would start a run over an
+        incomplete set of recorders and produce a quietly different result.
+        Anything that cannot be restored is named in the log and left
+        unselected, so the user chooses rather than the app guessing.
+        """
+        last_video = str(self.settings.value("last_video_dir", "") or "")
+        if last_video:
+            if Path(last_video).exists():
+                self.video_drop.set_path(last_video)
+                self._maybe_default_output(last_video)
+            else:
+                self.log_view.append_log(
+                    f"Previous video folder is no longer available: {last_video}", "WARNING"
+                )
+
+        stored = self.settings.value("last_audio_files", None)
+        if isinstance(stored, str):
+            stored = [stored]
+        if not stored:
+            single = str(self.settings.value("last_audio_file", "") or "")
+            stored = [single] if single else []
+
+        present = [str(p) for p in stored if Path(str(p)).exists()]
+        missing = [str(p) for p in stored if not Path(str(p)).exists()]
+        if missing:
+            self.log_view.append_log(
+                f"{len(missing)} previously selected recorder file(s) are no longer "
+                f"available: {', '.join(missing[:3])}"
+                f"{', …' if len(missing) > 3 else ''}",
+                "WARNING",
+            )
+        if present and not missing:
+            self.audio_drop.set_paths(present)
+            self.recorder_mode_combo.setEnabled(len(present) > 1)
 
     def closeEvent(self, event: object) -> None:
+        """Close only once the pipeline has really stopped.
+
+        `quit()` asks a thread's EVENT LOOP to exit; it does nothing to a slot
+        that is still executing, which is exactly where `run_pipeline` spends
+        the entire run. So the old code asked politely, ignored the result of
+        `wait(3000)`, and closed anyway — destroying a QThread with a live
+        worker and abandoning half-written outputs.
+
+        Instead: request cancellation, refuse this close, and close for real
+        from `_on_thread_finished`. The window stays responsive meanwhile
+        (blocking on `wait()` would freeze it), the user sees that shutdown is
+        in progress, and a second close press force-quits if they would rather
+        not wait.
+        """
         if self._thread and self._thread.isRunning():
+            if self._closing:
+                # Second attempt: the user has chosen not to wait.
+                self.log_view.append_log(
+                    "Closing without waiting for the pipeline to stop.", "WARNING"
+                )
+                self._thread.quit()
+                self._thread.wait(2000)
+                super().closeEvent(event)  # type: ignore[arg-type]
+                return
+            self._closing = True
             if self._worker:
                 self._worker.cancel()
-            self._thread.quit()
-            self._thread.wait(3000)
+            self.log_view.append_log(
+                "Stopping the pipeline before closing… (close again to force)", "WARNING"
+            )
+            self.stage_label.setText("Stopping…")
+            event.ignore()  # type: ignore[attr-defined]
+            return
         super().closeEvent(event)  # type: ignore[arg-type]
 
 
@@ -720,6 +864,25 @@ def _install_quiet_message_handler() -> None:
     qInstallMessageHandler(handler)
 
 
+def load_stylesheet() -> str:
+    """The GUI stylesheet, read as a PACKAGE RESOURCE.
+
+    ``Path(__file__).parent / "theme.qss"`` assumes the package is a directory
+    of real files. That holds in a checkout and inside a PyInstaller bundle,
+    but a wheel that does not DECLARE the file simply will not contain it — and
+    the old code, finding no file, silently skipped the stylesheet, so an
+    installed WhisperSync started unstyled with nothing logged. Reading it
+    through ``importlib.resources`` works for every packaging form, and a
+    missing resource is reported instead of ignored.
+    """
+    try:
+        return importlib.resources.files("whispersync.gui").joinpath("theme.qss").read_text("utf-8")
+    except (FileNotFoundError, ModuleNotFoundError, OSError) as e:
+        # Not fatal — the app is usable unstyled — but never silent.
+        print(f"warning: GUI stylesheet could not be loaded ({e})", file=sys.stderr)
+        return ""
+
+
 def main() -> None:
     _install_quiet_message_handler()
 
@@ -735,9 +898,9 @@ def main() -> None:
     app_font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     app.setFont(app_font)
 
-    qss_path = Path(__file__).parent / "theme.qss"
-    if qss_path.exists():
-        app.setStyleSheet(qss_path.read_text())
+    stylesheet = load_stylesheet()
+    if stylesheet:
+        app.setStyleSheet(stylesheet)
 
     window = MainWindow()
     window.show()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from whispersync.config import WhisperSyncConfig
@@ -177,3 +179,125 @@ def test_realign_span_gives_up_without_enough_local_words() -> None:
 
 def test_self_check_mode_defaults_off() -> None:
     assert WhisperSyncConfig().self_check_mode == "off"
+
+
+# --- outcomes: passed / failed / inconclusive are three different answers ----
+
+
+def test_empty_render_against_real_speech_is_a_failure() -> None:
+    """The worst possible defect must not read as a pass.
+
+    `diagnose_words([], camera_words)` returned `[]` — the same value a clean
+    render produces — even when the camera clip held six words. Total content
+    loss, the single thing this check exists to catch, was reported as no
+    problems found.
+    """
+    from whispersync.engine.self_check import diagnose
+
+    cam = _words("раз два три четыре пять шесть", start=0.0)
+    outcome = diagnose([], cam, clip_duration=20.0)
+    assert outcome.status == "failed"
+    assert outcome.spans
+    span = outcome.spans[0]
+    assert span.kind == "content"
+    # The span must cover the clip, not collapse to a point.
+    assert span.start == 0.0
+    assert span.end >= 5.0
+
+
+def test_empty_reference_is_inconclusive_not_passed() -> None:
+    """ "We could not check this" and "we checked this and it is fine" are
+    different answers, and only one of them justifies shipping the render."""
+    from whispersync.engine.self_check import diagnose
+
+    render = _words("раз два три четыре пять", start=0.0)
+    outcome = diagnose(render, [])
+    assert outcome.status == "inconclusive"
+    assert not outcome.spans
+
+
+def test_both_empty_is_inconclusive() -> None:
+    from whispersync.engine.self_check import diagnose
+
+    assert diagnose([], []).status == "inconclusive"
+
+
+def test_matching_transcripts_pass() -> None:
+    from whispersync.engine.self_check import diagnose
+
+    words = _words("раз два три четыре пять шесть семь восемь", start=0.0)
+    outcome = diagnose(words, words)
+    assert outcome.status == "passed"
+    assert not outcome.spans
+
+
+def test_lost_tail_is_reported_where_the_speech_is_missing() -> None:
+    """A missing tail must be flagged AT THE TAIL, not at the clip's start.
+
+    With a render keeping only [0, 0.2] and a camera clip holding six more
+    words out to 20 s, the diagnosis returned a span of [0.2, 0.2] — a
+    zero-length flag at the beginning of the clip for a twenty-second hole at
+    the end. No repair could act on that.
+    """
+    from whispersync.engine.self_check import diagnose
+
+    render = [Word(text="раз", start=0.0, end=0.2, probability=0.9)]
+    cam = [Word(text="раз", start=0.0, end=0.2, probability=0.9)]
+    for i, text in enumerate(["два", "три", "четыре", "пять", "шесть", "семь"]):
+        t = 20.0 + i * 0.5
+        cam.append(Word(text=text, start=t, end=t + 0.4, probability=0.9))
+
+    outcome = diagnose(render, cam, min_content_words=5)
+    assert outcome.status == "failed"
+    span = outcome.spans[-1]
+    assert span.end > span.start, "zero-length span cannot be repaired"
+    assert span.end >= 20.0, f"span {span.start}-{span.end} does not reach the missing tail"
+
+
+def test_repair_rejects_an_implausible_local_fit() -> None:
+    """A repair map re-renders real audio, so it faces the same bar as any other.
+
+    A local fit over a handful of anchors inside one flagged span is exactly
+    where a line can be fitted through noise. An implausible clock ratio would
+    re-render the span at a wrong tempo — replacing a defect the user could
+    hear with one they cannot explain. Declining leaves the span reported.
+    """
+    cfg = WhisperSyncConfig()
+    am = AlignmentMap(anchors=[], offset=0.0, k=1.0, residual_ms=0.0)
+    span = SelfCheckSpan(start=10.0, end=14.0, kind="content", detail="x")
+
+    # Camera and recorder words whose only consistent reading is a ~5x ratio.
+    cam = [
+        Word(text=f"w{i}", start=8.0 + i * 0.4, end=8.0 + i * 0.4 + 0.2, probability=0.9)
+        for i in range(10)
+    ]
+    rec = [
+        Word(text=f"w{i}", start=8.0 + i * 2.0, end=8.0 + i * 2.0 + 0.2, probability=0.9)
+        for i in range(10)
+    ]
+
+    result = realign_span(span, am, cam, rec, None, Path("rec.wav"), rec_duration=120.0, config=cfg)
+    assert result is None, f"accepted an implausible repair map (k={result.k if result else '-'})"
+
+
+def test_a_sound_repair_fit_is_accepted_and_labelled() -> None:
+    """The gate must not reject good repairs — it only rejects implausible ones."""
+    cfg = WhisperSyncConfig()
+    am = AlignmentMap(anchors=[], offset=0.0, k=1.0, residual_ms=0.0)
+    span = SelfCheckSpan(start=10.0, end=14.0, kind="shifted", detail="x")
+
+    # Same speech on both sides, shifted by a constant 0.5 s (offset only).
+    cam = [
+        Word(text=f"w{i}", start=6.0 + i * 0.5, end=6.0 + i * 0.5 + 0.3, probability=0.9)
+        for i in range(20)
+    ]
+    rec = [
+        Word(text=f"w{i}", start=5.5 + i * 0.5, end=5.5 + i * 0.5 + 0.3, probability=0.9)
+        for i in range(20)
+    ]
+
+    result = realign_span(span, am, cam, rec, None, Path("rec.wav"), rec_duration=120.0, config=cfg)
+    assert result is not None
+    assert result.provenance == "repair"
+    assert abs(result.k - 1.0) < 0.01
+    assert result.inliers >= 4

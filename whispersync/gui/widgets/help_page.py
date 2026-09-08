@@ -168,12 +168,13 @@ class HelpPage(QWidget):
         self._para(
             "<b>Detect retakes</b> (off by default) — finds lines the speaker "
             "re-recorded back-to-back in an unedited take (flub, stop, restart, "
-            "sometimes several times) and groups each set of attempts into a "
-            "Final Cut <i>audition</i>: a non-destructive stack of alternatives, "
-            "with the last attempt active by default. Press <b>Q</b> in Final Cut "
-            "while an audition is selected to browse the other takes. Nothing is "
-            "ever deleted or reordered — a false positive just means one audition "
-            "to dismiss."
+            "sometimes several times) and places a <i>marker</i> on each attempt, "
+            "labelled <i>keep</i> for the one the speaker settled on. The timeline "
+            "itself is untouched: nothing is cut, moved or re-timed, so a false "
+            "positive is one marker to ignore. (Earlier versions exported these as "
+            "Final Cut auditions, which switched the audio to a take from later in "
+            "the clip without switching the picture — putting the voice seconds "
+            "ahead of the image.)"
         )
 
         self._heading("Self-check")
@@ -211,8 +212,11 @@ class HelpPage(QWidget):
             "warmth on some material — worth an A/B listen before committing.</li>"
             "<li><b>Resemble Enhance</b> — a generative model that can produce a "
             "studio-like timbre, at the risk of subtle generative artifacts on hard "
-            "passages. <i>Experimental</i>: some of its upstream compatibility "
-            "patches aren't fully documented yet.</li>"
+            "passages. Roughly <b>2.5&times; slower than realtime</b> on a current "
+            "GPU, and it is a <b>mono</b> model — a stereo track comes back as "
+            "duplicated mono. <i>Experimental</i>. Install it into the same "
+            "<code>.sep-venv</code>: "
+            "<code>.sep-venv/bin/pip install resemble-enhance</code>.</li>"
             "<li><b>SGMSE+ Denoise / De-reverb</b> — diffusion models that produce "
             "the cleanest result of the six, but run roughly <b>5&times; slower "
             "than realtime</b> — realistic only for short clips, not a multi-hour "
@@ -224,8 +228,10 @@ class HelpPage(QWidget):
             "their license (this project can't redistribute it).</li>"
             "</ul>"
             "Off by default. A mode whose environment isn't set up yet on your "
-            "machine is skipped with a warning at the end of the run — your "
-            "unenhanced audio is always kept, never a failed run."
+            "machine is skipped with a warning — your unenhanced audio is always "
+            "kept, never a failed run — and you are told in the first seconds of "
+            "the run, not at the end of it. The SGMSE+ and RE-USE entries have no "
+            "backend in this build yet and are greyed out."
         )
 
         self._heading("Tips")

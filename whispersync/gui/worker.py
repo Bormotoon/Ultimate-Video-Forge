@@ -58,6 +58,14 @@ class SyncWorker(QObject):
     timeline = pyqtSignal(object)  # list[dict] timeline snapshot
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
+    # Cancellation is a THIRD terminal outcome, not a log line. It used to emit
+    # only `log`, so neither `finished` nor `error` ever fired — and those are
+    # the two signals wired to `thread.quit()` and to re-enabling the buttons.
+    # A cancelled run therefore left the QThread running forever and the window
+    # stuck with Sync greyed out and Cancel lit: the user could neither start
+    # again nor tell that anything had stopped. A real QThread probe confirmed
+    # `isRunning() == True` after cancelling.
+    cancelled = pyqtSignal()
 
     def __init__(
         self,
@@ -97,6 +105,13 @@ class SyncWorker(QObject):
 
     @pyqtSlot()
     def run(self) -> None:
+        """Run the pipeline and emit EXACTLY ONE terminal signal.
+
+        Every path out of here — success, cancellation, failure — must end in
+        `finished`, `cancelled` or `error`, because those are what stop the
+        thread and restore the window. A path that emits none of them leaves
+        the UI permanently mid-run.
+        """
         try:
             result = run_pipeline(
                 config=self.config,
@@ -107,11 +122,18 @@ class SyncWorker(QObject):
                 progress_callback=self._on_progress,
                 cancel_event=self._cancel_event,
             )
-            self.finished.emit(result)
         except InterruptedError:
             self.log.emit("Pipeline cancelled by user")
-        except Exception as e:
+            self.cancelled.emit()
+        except Exception as e:  # noqa: BLE001 - a worker must never let an
+            # exception escape into the Qt event loop; it is reported instead.
             self.error.emit(str(e))
+        else:
+            self.finished.emit(result)
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
 
     def cancel(self) -> None:
         self._cancel_event.set()

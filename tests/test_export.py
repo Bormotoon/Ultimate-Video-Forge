@@ -7,8 +7,11 @@ from fractions import Fraction
 from pathlib import Path
 
 from whispersync.engine.export import (
+    check_fcpxml,
+    fcpxml_intervals,
     fps_to_frame_duration,
     generate_fcpxml,
+    parse_rational,
     to_rational,
     validate_fcpxml,
 )
@@ -358,7 +361,15 @@ def test_no_retakes_emits_plain_asset_clip_not_audition(tmp_path: Path) -> None:
     assert len(connected) == 1
 
 
-def test_single_retake_group_wraps_in_audition(tmp_path: Path) -> None:
+def test_retakes_are_exported_as_markers(tmp_path: Path) -> None:
+    """Retakes must be reported WITHOUT restructuring the timeline.
+
+    They used to become an ``<audition>`` over the alternate takes' audio: the
+    audition began at the group's start but played the keeper take's audio,
+    which comes from later in the clip, and the picture did not switch at all.
+    Two takes at [2,4] and [5,8] put the voice 3 s ahead of the picture and left
+    a hole in the clean track. A marker says the same thing and moves nothing.
+    """
     from whispersync.models import RetakeGroup, Take
 
     group = RetakeGroup(
@@ -378,33 +389,47 @@ def test_single_retake_group_wraps_in_audition(tmp_path: Path) -> None:
     assert validate_fcpxml(result)
 
     root = ET.parse(out).getroot()
+    assert root.find(".//audition") is None
+
     video_clip = root.find(".//asset-clip")
-    stories = list(video_clip)
-    # plain [0,10) clip, then <audition>, then plain [15,30) clip
-    tags = [el.tag for el in stories]
-    assert tags == ["asset-clip", "audition", "asset-clip"]
+    connected = video_clip.findall("asset-clip")
+    # Exactly ONE audio clip, spanning the whole thing — not a chopped-up
+    # sequence of plain clips and auditions.
+    assert len(connected) == 1
+    audio_el = connected[0]
 
-    lead, audition, tail = stories
-    assert float(lead.get("duration").split("/")[0]) > 0  # non-zero lead-in
-
-    takes = audition.findall("asset-clip")
-    assert len(takes) == 2
-    # keeper (last take, per keeper_index=-1) is FIRST/active in the audition
-    assert "Keep" in takes[0].get("name")
-    assert "так далее" not in takes[0].get("name")  # name is a label, not full text
-    assert takes[1].get("name") != takes[0].get("name")
-    # keeper's own duration is 3s (12..15), the discarded take's is 2s (10..12)
-    assert takes[0].get("duration") is not None
-    assert takes[1].get("duration") is not None
-
-    # audition children carry no offset/lane of their own (they're alternates,
-    # not independently positioned) — only the audition wrapper is positioned.
-    assert takes[0].get("offset") is None
-    assert audition.get("offset") is not None
-    assert audition.get("lane") == "-1"
+    markers = audio_el.findall("marker")
+    assert len(markers) == 2
+    labels = [m.get("value") for m in markers]
+    assert any("keep" in v for v in labels)
+    assert all("Retake 1" in v for v in labels)
+    for m in markers:
+        assert m.get("start") is not None
+        assert m.get("duration") is not None
 
 
-def test_multiple_retake_groups_produce_multiple_auditions(tmp_path: Path) -> None:
+def test_retake_markers_do_not_move_the_audio(tmp_path: Path) -> None:
+    """The audition regression, stated as an interval check: an audio clip with
+    retakes must occupy exactly the same timeline span as one without."""
+    from whispersync.models import RetakeGroup, Take
+
+    plain_plan, infos = _retake_plan(tmp_path, None)
+    plain_out = tmp_path / "plain.fcpxml"
+    generate_fcpxml(plain_plan, infos, plain_out)
+
+    groups = [
+        RetakeGroup(takes=[Take(2.0, 4.0, "a a a a"), Take(5.0, 8.0, "a a a a")], keeper_index=-1)
+    ]
+    retake_plan, infos2 = _retake_plan(tmp_path, groups)
+    retake_out = tmp_path / "retake_intervals.fcpxml"
+    generate_fcpxml(retake_plan, infos2, retake_out)
+
+    plain_iv = fcpxml_intervals(plain_out)
+    retake_iv = fcpxml_intervals(retake_out)
+    assert plain_iv["clip_voice"] == retake_iv["clip_voice"]
+
+
+def test_multiple_retake_groups_produce_markers_for_each(tmp_path: Path) -> None:
     from whispersync.models import RetakeGroup, Take
 
     groups = [
@@ -419,44 +444,227 @@ def test_multiple_retake_groups_produce_multiple_auditions(tmp_path: Path) -> No
     out = tmp_path / "two_retakes.fcpxml"
     generate_fcpxml(plan, infos, out)
     root = ET.parse(out).getroot()
-    auditions = root.findall(".//audition")
-    assert len(auditions) == 2
+    markers = root.findall(".//marker")
+    assert len(markers) == 4  # two attempts in each of two groups
+    assert {v.get("value").split(" — ")[0] for v in markers} == {"Retake 1", "Retake 2"}
 
 
-def test_retake_group_at_clip_start_has_no_leading_plain_clip(tmp_path: Path) -> None:
-    from whispersync.models import RetakeGroup, Take
+# --- multicam, source audio and document validity --------------------------
 
-    group = RetakeGroup(
-        takes=[Take(0.0, 1.0, "a a a a"), Take(1.0, 2.5, "a a a a a")], keeper_index=-1
-    )
-    plan, infos = _retake_plan(tmp_path, [group])
-    out = tmp_path / "retake_at_start.fcpxml"
+
+def test_simultaneous_cameras_stay_simultaneous(tmp_path: Path) -> None:
+    """Two cameras rolling at once must be STACKED, not queued.
+
+    The spine is one sequential track, so putting every camera in it turned two
+    cameras both covering [0,10] into A at [0,10] and B at [10,20] — twenty
+    seconds of footage from ten seconds of shoot, with the audio still at its
+    true positions and the sequence still claiming 10 s. Camera B belongs on
+    its own lane as a connected clip.
+    """
+    infos = [_vinfo("/v/A/a.mov", 10.0), _vinfo("/v/B/b.mov", 10.0)]
+    clips = [
+        MediaClip(
+            path=Path("/v/A/a.mov"),
+            kind="video",
+            offset=0.0,
+            in_point=0.0,
+            duration=10.0,
+            lane=1,
+            display_name="camA",
+        ),
+        MediaClip(
+            path=Path("/v/B/b.mov"),
+            kind="video",
+            offset=0.0,
+            in_point=0.0,
+            duration=10.0,
+            lane=2,
+            display_name="camB",
+        ),
+    ]
+    plan = SyncPlan(strategy_id=3, clips=clips, total_duration=10.0)
+    out = tmp_path / "multicam.fcpxml"
+    generate_fcpxml(plan, infos, out)
+
+    intervals = fcpxml_intervals(out)
+    a_start, a_end = intervals["camA"]
+    b_start, b_end = intervals["camB"]
+    assert abs(a_start - b_start) < 0.05, f"cameras not simultaneous: {a_start} vs {b_start}"
+    assert abs(a_end - b_end) < 0.05
+
+    root = ET.parse(out).getroot()
+    spine = root.find(".//spine")
+    # Only ONE camera sits directly in the spine; the other is connected.
+    assert len(spine.findall("asset-clip")) == 1
+    connected = spine.find("asset-clip").findall("asset-clip")
+    assert [c.get("name") for c in connected] == ["camB"]
+    assert connected[0].get("lane") == "2"
+
+
+def test_multicam_roundtrip_matches_the_plan(tmp_path: Path) -> None:
+    """Every clip's absolute interval in the document must match the plan."""
+    infos = [_vinfo("/v/A/a.mov", 10.0), _vinfo("/v/B/b.mov", 6.0)]
+    clips = [
+        MediaClip(
+            path=Path("/v/A/a.mov"),
+            kind="video",
+            offset=0.0,
+            in_point=0.0,
+            duration=10.0,
+            lane=1,
+            display_name="camA",
+        ),
+        MediaClip(
+            path=Path("/v/B/b.mov"),
+            kind="video",
+            offset=3.0,
+            in_point=0.0,
+            duration=6.0,
+            lane=2,
+            display_name="camB",
+        ),
+        MediaClip(
+            path=Path("/a/voice.wav"),
+            kind="audio",
+            offset=1.0,
+            in_point=0.0,
+            duration=8.0,
+            lane=-1,
+            display_name="voice",
+            role="Dialogue",
+        ),
+    ]
+    plan = SyncPlan(strategy_id=3, clips=clips, total_duration=10.0)
+    out = tmp_path / "roundtrip.fcpxml"
+    generate_fcpxml(plan, infos, out)
+
+    intervals = fcpxml_intervals(out)
+    for clip in clips:
+        name = clip.display_name
+        start, end = intervals[name]
+        assert abs(start - clip.offset) < 0.05, f"{name}: {start} != {clip.offset}"
+        assert abs((end - start) - clip.duration) < 0.05, f"{name}: length {end - start}"
+
+    # The sequence must cover every clip, not just the primary storyline.
+    assert not check_fcpxml(out, check_media=False)
+
+
+def test_replaced_camera_audio_is_disabled(tmp_path: Path) -> None:
+    """A camera clip whose dialogue was replaced must be video-only.
+
+    `videoRole` does not disable audio; without `srcEnable="video"` the camera's
+    own microphone plays underneath the clean synced voice — two copies of the
+    same speech tens of milliseconds apart.
+    """
+    infos = [_vinfo("/v/clip.mov", 10.0)]
+    clips = [
+        MediaClip(
+            path=Path("/v/clip.mov"),
+            kind="video",
+            offset=0.0,
+            in_point=0.0,
+            duration=10.0,
+            lane=1,
+            role="Video",
+            source_audio_enabled=False,
+        ),
+        MediaClip(
+            path=Path("/a/clip_voice.wav"),
+            kind="audio",
+            offset=0.0,
+            in_point=0.0,
+            duration=10.0,
+            lane=-1,
+            role="Dialogue",
+        ),
+    ]
+    plan = SyncPlan(strategy_id=3, clips=clips, total_duration=10.0)
+    out = tmp_path / "muted.fcpxml"
     generate_fcpxml(plan, infos, out)
     root = ET.parse(out).getroot()
-    stories = list(root.find(".//asset-clip"))
-    tags = [el.tag for el in stories]
-    assert tags == ["audition", "asset-clip"]  # no zero-length lead-in clip
+    video_el = root.find(".//spine/asset-clip")
+    assert video_el.get("srcEnable") == "video"
 
 
-def test_audition_is_valid_per_dtd_anchor_item(tmp_path: Path) -> None:
-    # audition must be nested under the video asset-clip (a valid anchor_item
-    # position), each of its own children must be an asset-clip referencing a
-    # declared asset, and none of them may carry their own offset/lane.
-    from whispersync.models import RetakeGroup, Take
-
-    group = RetakeGroup(
-        takes=[Take(5.0, 6.0, "x x x x"), Take(6.0, 7.5, "x x x x x")], keeper_index=-1
-    )
-    plan, infos = _retake_plan(tmp_path, [group])
-    out = tmp_path / "dtd_check.fcpxml"
+def test_unresolved_camera_keeps_its_own_audio(tmp_path: Path) -> None:
+    """A clip with no replacement dialogue must stay audible — muting it would
+    leave the editor with silent footage and no way back."""
+    infos = [_vinfo("/v/clip.mov", 10.0)]
+    clips = [
+        MediaClip(
+            path=Path("/v/clip.mov"),
+            kind="video",
+            offset=0.0,
+            in_point=0.0,
+            duration=10.0,
+            lane=1,
+            source_audio_enabled=True,
+        )
+    ]
+    plan = SyncPlan(strategy_id=3, clips=clips, total_duration=10.0)
+    out = tmp_path / "unresolved.fcpxml"
     generate_fcpxml(plan, infos, out)
     root = ET.parse(out).getroot()
-    asset_ids = {a.get("id") for a in root.findall(".//asset")}
-    audition = root.find(".//audition")
-    assert audition is not None
-    for child in audition:
-        assert child.tag == "asset-clip"
-        assert child.get("ref") in asset_ids
-        assert child.get("offset") is None
-        assert child.get("lane") is None
-        assert child.get("duration") is not None
+    assert root.find(".//spine/asset-clip").get("srcEnable") is None
+
+
+def test_silent_camera_asset_declares_no_audio(tmp_path: Path) -> None:
+    info = _vinfo("/v/silent.mov", 10.0)
+    info.audio_codec = None
+    clips = [
+        MediaClip(
+            path=Path("/v/silent.mov"),
+            kind="video",
+            offset=0.0,
+            in_point=0.0,
+            duration=10.0,
+            lane=1,
+        )
+    ]
+    plan = SyncPlan(strategy_id=3, clips=clips, total_duration=10.0)
+    out = tmp_path / "silent.fcpxml"
+    generate_fcpxml(plan, [info], out)
+    root = ET.parse(out).getroot()
+    asset = root.find(".//asset")
+    assert asset.get("hasAudio") == "0"
+
+
+def test_validation_rejects_dangling_refs_and_bad_times(tmp_path: Path) -> None:
+    """The old check passed this document; it is unusable.
+
+    It looked for a root tag, a spine and an asset-clip — all present here —
+    and never asked whether the reference resolved or the times parsed.
+    """
+    bad = tmp_path / "bad.fcpxml"
+    bad.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<fcpxml><resources/><spine>"
+        '<asset-clip ref="missing" duration="nonsense"/>'
+        "</spine></fcpxml>"
+    )
+    problems = check_fcpxml(bad, check_media=False)
+    assert problems
+    assert any("missing" in p for p in problems)
+    assert any("nonsense" in p for p in problems)
+    assert validate_fcpxml(bad) is False
+
+
+def test_validation_rejects_a_sequence_shorter_than_its_spine(tmp_path: Path) -> None:
+    doc = tmp_path / "short.fcpxml"
+    doc.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<fcpxml><resources><asset id="r1"><media-rep src="x.wav"/></asset></resources>'
+        '<library><event><project><sequence duration="10s"><spine>'
+        '<asset-clip ref="r1" offset="0s" duration="20s"/>'
+        "</spine></sequence></project></event></library></fcpxml>"
+    )
+    problems = check_fcpxml(doc, check_media=False)
+    assert any("shorter than its spine" in p for p in problems)
+
+
+def test_parse_rational_handles_ntsc_and_rejects_nonsense() -> None:
+    assert abs(parse_rational("1001/30000s") - 1001 / 30000) < 1e-12
+    assert parse_rational("5s") == 5.0
+    assert parse_rational("nonsense") is None
+    assert parse_rational("1/0s") is None
+    assert parse_rational("") is None

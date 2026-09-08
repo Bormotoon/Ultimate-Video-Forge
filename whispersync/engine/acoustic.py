@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,24 @@ from whispersync.engine.media import extract_audio_to_wav
 logger = logging.getLogger(__name__)
 
 _REFINE_SR = 16000  # all acoustic analysis happens on mono 16 kHz
+
+
+@dataclass
+class AcousticFit:
+    """A waveform-derived clock map plus the evidence that produced it.
+
+    Returning the evidence (not just ``offset, k``) is what lets the caller's
+    acceptance gate treat an acoustic match on the same footing as a text one:
+    a fit from three unambiguous points spanning ten minutes and a fit from two
+    points three seconds apart are both "a line", and only the evidence tells
+    them apart.
+    """
+
+    offset: float
+    k: float
+    points: int
+    inliers: int
+    span_s: float
 
 
 def read_wav_mono16k(path: Path) -> tuple[np.ndarray, int]:
@@ -41,11 +60,16 @@ def read_wav_mono16k(path: Path) -> tuple[np.ndarray, int]:
         raw = w.readframes(n)
     if sampwidth != 2:
         raise ValueError(f"expected pcm_s16le (2-byte) wav, got sampwidth={sampwidth}")
-    data = np.frombuffer(raw, dtype=np.int16).astype(np.float64)
+    # float32, not float64: these arrays are only ever used for correlation
+    # and windowing, where 24 bits of mantissa is far more precision than
+    # 16-bit source samples carry — and they are LARGE. A one-hour recorder is
+    # ~230 MB at float32 against ~461 MB at float64, per decode, before
+    # intermediate copies. The FFTs promote to complex64 accordingly.
+    data = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
     # If the file is stereo, fold to mono.
     if nchannels == 2 and data.size:
         data = data.reshape(-1, 2).mean(axis=1)
-    return data / 32768.0, sr
+    return data / np.float32(32768.0), sr
 
 
 def load_mono16k_track(
@@ -151,6 +175,189 @@ def gcc_phat(
     return lag_samples / sr, sharpness
 
 
+def _fit_robust_line(
+    points: list[tuple[float, float]], max_k_deviation: float
+) -> tuple[float, float, int] | None:
+    """Least-squares ``(offset, k)`` for ``cam = offset + k * rec`` over
+    ``points`` (``(cam_time, rec_time)``), after dropping points more than
+    twice the median residual away from a first pass.
+
+    ``np.polyfit`` on raw points is ill-conditioned when the recorder times
+    barely vary (every window matching near the same place) and happily
+    returns nonsense slopes — a periodic test signal produced ``k ~= 4.25``.
+    So the span is checked first, a plain offset-only fit is used when the
+    evidence is too concentrated to support a slope, and the resulting ratio
+    must stay physically plausible.
+
+    Returns ``(offset, k, n_inliers)`` or ``None``.
+    """
+    if len(points) < 2:
+        return None
+    cam = np.array([p[0] for p in points], dtype=np.float64)
+    rec = np.array([p[1] for p in points], dtype=np.float64)
+    rec_span = float(rec.max() - rec.min())
+
+    def _offset_only() -> tuple[float, float, int]:
+        return float(np.median(cam - rec)), 1.0, len(points)
+
+    # Fitting a slope through evidence spanning a few seconds turns GCC noise
+    # into a wild clock ratio. Below this span, only the offset is estimated
+    # and k is left at 1 — honest about what the data can support.
+    if rec_span < _MIN_SLOPE_FIT_SPAN_S:
+        return _offset_only()
+
+    coeffs = np.polyfit(rec, cam, 1)
+    k, offset = float(coeffs[0]), float(coeffs[1])
+    residuals = np.abs((offset + k * rec) - cam)
+    med = float(np.median(residuals))
+    keep = residuals <= max(2.0 * med, 0.05)
+    if keep.sum() >= 3 and keep.sum() < len(points):
+        coeffs = np.polyfit(rec[keep], cam[keep], 1)
+        k, offset = float(coeffs[0]), float(coeffs[1])
+        residuals = np.abs((offset + k * rec) - cam)
+        keep = residuals <= max(2.0 * float(np.median(residuals)), 0.05)
+
+    if abs(k - 1.0) > max_k_deviation:
+        # An implausible ratio means the points don't describe one clock; fall
+        # back to the offset-only reading rather than exporting the nonsense.
+        return _offset_only()
+    return offset, k, int(keep.sum())
+
+
+# Below this recorder-time span, grid evidence cannot support a slope estimate
+# (GCC jitter dominates), so only the offset is fitted and k stays 1.0.
+_MIN_SLOPE_FIT_SPAN_S = 60.0
+
+# A camera window's best recorder match must beat its runner-up (measured at a
+# different part of the recorder) by this ratio to count as unambiguous. On
+# periodic or repetitive material several places correlate nearly as well, and
+# picking the argmax of a near-tie is how a scan "confidently" lands on the
+# wrong minute.
+_AMBIGUITY_MARGIN = 1.25
+
+# Recorder block length for the coarse scan. Each camera window is correlated
+# against a whole block at once, so every alignment position inside the block
+# is examined — there is no per-probe lag limit to leave holes between probes.
+_SCAN_BLOCK_S = 64.0
+
+
+def _plan_blocks(rec_len: int, block_n: int, win_n: int) -> list[int]:
+    """Start sample of each recorder block, overlapping by one camera window.
+
+    The overlap is what makes coverage total: a camera window that would
+    straddle two blocks is wholly contained in at least one of them, so no
+    alignment position is examined only partially.
+    """
+    if rec_len <= block_n:
+        return [0]
+    step = max(1, block_n - win_n)
+    starts = list(range(0, rec_len - block_n + 1, step))
+    if starts[-1] != rec_len - block_n:
+        starts.append(rec_len - block_n)
+    return starts
+
+
+def _correlate_in_block(
+    cam_win: np.ndarray,
+    block_fft: np.ndarray,
+    nfft: int,
+    block_n: int,
+    eps: float,
+    separation_n: int,
+) -> tuple[int, float, float, float]:
+    """Best alignment of ``cam_win`` anywhere inside one recorder block.
+
+    Returns ``(offset_samples, peak, rival, noise_floor)``: where in the block
+    the camera window starts, how strong the PHAT correlation is there, how
+    strong the best RIVAL peak at least ``separation_n`` samples away is, and
+    the median |correlation| used as the confidence denominator.
+
+    The rival is not a detail — it is the whole ambiguity test. A single block
+    covering the entire recorder would otherwise report its argmax as a
+    confident answer even when a second, unrelated place in the recording
+    correlates just as well (a repeated phrase, a loop of music, a retake).
+
+    This is a single FFT correlation of a SHORT signal against a LONG one —
+    not the equal-length ``gcc_phat`` — which is what removes the old scan's
+    blind spots. The old design probed the recorder on a coarse grid and
+    searched only ±``max_lag_s`` around each probe, so with a 30 s step and a
+    ±1 s search it never even looked at 28 of every 30 seconds.
+    """
+    win_n = len(cam_win)
+    a = cam_win - cam_win.mean()
+    fa = np.fft.rfft(a, nfft)
+    r = block_fft * np.conj(fa)
+    r /= np.abs(r) + eps
+    cc = np.abs(np.fft.irfft(r, nfft))
+    valid = cc[: max(1, block_n - win_n + 1)]
+    peak_idx = int(np.argmax(valid))
+    peak = float(valid[peak_idx])
+
+    lo = max(0, peak_idx - separation_n)
+    hi = min(len(valid), peak_idx + separation_n + 1)
+    rival = 0.0
+    if lo > 0:
+        rival = max(rival, float(valid[:lo].max()))
+    if hi < len(valid):
+        rival = max(rival, float(valid[hi:].max()))
+
+    floor = float(np.median(cc[:block_n])) or eps
+    return peak_idx, peak, rival, floor
+
+
+def _scan_camera_window(
+    cam_win: np.ndarray,
+    block_starts: list[int],
+    block_ffts: list[np.ndarray],
+    nfft: int,
+    block_n: int,
+    min_sharpness: float,
+    eps: float,
+    separation_n: int,
+) -> tuple[float, float] | None:
+    """Best recorder time (seconds) for one camera window, or None.
+
+    ``None`` covers both "nothing correlated well enough" and "two unrelated
+    places correlated about equally well" — the second is the important one:
+    on periodic material the argmax of a near-tie is a coin flip dressed up as
+    a confident answer, and it is how a scan reports the wrong minute.
+    """
+    win_n = len(cam_win)
+    if win_n < 8:
+        return None
+    best_sharp = 0.0
+    best_pos: int | None = None
+    runner_up = 0.0
+    for start, block_fft in zip(block_starts, block_ffts, strict=True):
+        off, peak, rival, floor = _correlate_in_block(
+            cam_win, block_fft, nfft, block_n, eps, separation_n
+        )
+        sharp = peak / floor
+        pos = start + off
+        # A rival inside this block always counts: overlapping blocks see the
+        # same event twice, but a second peak within ONE block is genuinely a
+        # different place in the recording.
+        runner_up = max(runner_up, rival / floor)
+        if sharp > best_sharp:
+            if best_pos is not None and abs(pos - best_pos) > separation_n:
+                runner_up = max(runner_up, best_sharp)
+            best_sharp, best_pos = sharp, pos
+        elif best_pos is not None and abs(pos - best_pos) > separation_n:
+            runner_up = max(runner_up, sharp)
+
+    if best_pos is None or best_sharp < min_sharpness:
+        return None
+    if runner_up > 0 and best_sharp < runner_up * _AMBIGUITY_MARGIN:
+        logger.debug(
+            "Acoustic scan: ambiguous match (%.0f vs runner-up %.0f) — declining",
+            best_sharp,
+            runner_up,
+        )
+        return None
+    # The window's CENTRE is the time being located.
+    return (best_pos + win_n / 2.0) / _REFINE_SR, best_sharp
+
+
 def acoustic_coarse_align(
     cam_audio_wav: Path,
     rec_audio_path: Path,
@@ -161,66 +368,103 @@ def acoustic_coarse_align(
     max_lag_s: float = 1.0,
     min_sharpness: float = 50.0,
     gcc_eps: float = 1e-8,
-) -> tuple[float, float] | None:
+    max_k_deviation: float = 0.05,
+    min_points: int = 3,
+) -> AcousticFit | None:  # noqa: PLR0913
     """Acoustic fallback offset/K estimate when there's no usable transcript
     match (too little speech, music, a foreign language Whisper garbles, or
     near-silence) — the alignment paths in ``matcher.py`` all fail without at
     least a couple of matched words. This works directly on the waveforms,
     exactly like Boundary Flex, but coarsely: cross-correlate a window of the
-    camera's own audio against the recorder at each point on a grid across
-    the WHOLE recorder span (assuming the clip could start anywhere in it),
-    then fit an ``offset, K`` line through the confident (sharp-peak) points
-    the same way ``ransac_linear_fit`` does for text anchors.
+    camera's own audio against the recorder across the WHOLE recorder span
+    (the clip could start anywhere in it), then fit an ``offset, K`` line
+    through the confident, UNAMBIGUOUS points.
 
-    Returns ``(offset, k)`` such that ``t_cam = offset + k * t_rec``, or
-    ``None`` if too few grid points were confident to fit a line. This is
-    the "Strategy 0" acoustic fallback (see PROJECT_ANALYSIS.md §10.2): it
-    turns WhisperSync from "works when there's transcribable speech" into
-    "works on anything with correlated audio between the two tracks" —
-    music, ambient noise, or a language Whisper can't transcribe well, as
-    long as the same physical event reaches both mics.
+    Returns an :class:`AcousticFit` (``t_cam = offset + k * t_rec`` plus the
+    evidence behind it) or ``None``.
+
+    Two properties matter more than speed here, and the previous version had
+    neither.
+
+    **Coverage.** Every camera window is correlated against whole overlapping
+    blocks of the recorder, so every possible alignment position is examined.
+    The old scan probed the recorder on a ``grid_s`` grid and searched only
+    ±``max_lag_s`` around each probe: at the defaults that inspected 2 s out of
+    every 30, and a clip whose true offset fell in one of the 28-second holes
+    was reported as "no acoustic match" — reproduced with shifts of 0 s and
+    30 s found and 10 s not.
+
+    **Unambiguity.** A window whose best match barely beats a rival elsewhere
+    in the recording is discarded rather than resolved by argmax: on periodic
+    material the argmax is a coin flip presented as a confident answer.
+
+    ``max_lag_s`` is accepted for signature compatibility but no longer bounds
+    the search — the block correlation has no per-probe lag limit, which is
+    precisely what closed the blind spots. ``grid_s`` now only controls how
+    many CAMERA windows are sampled (how much evidence is gathered), not how
+    much of the recorder is looked at.
     """
     cam_track = load_mono16k_track(cam_audio_wav)
     rec_track = load_mono16k_track(rec_audio_path)
-
-    half = window_s / 2.0
-    points: list[tuple[float, float]] = []  # (cam_time, rec_time) of confident matches
-    t_cam = half
-    while t_cam <= clip_duration - half:
-        t_rec = half
-        best_sharp = 0.0
-        best_rec_time: float | None = None
-        while t_rec <= rec_duration - half:
-            cam_win = _window_slice(cam_track, t_cam, window_s, _REFINE_SR)
-            rec_win = _window_slice(rec_track, t_rec, window_s, _REFINE_SR)
-            # ref=camera window (fixed content), query=recorder window: a
-            # sharp peak means these two windows' content actually matches.
-            # Same convention as acoustic._measure_boundary (Boundary Flex):
-            # the true recorder time for this camera moment is the probed
-            # window center corrected by -lag_s.
-            lag_s, sharp = gcc_phat(cam_win, rec_win, _REFINE_SR, max_lag_s, gcc_eps)
-            if sharp > best_sharp:
-                best_sharp, best_rec_time = sharp, t_rec - lag_s
-            t_rec += grid_s
-        if best_rec_time is not None and best_sharp >= min_sharpness:
-            points.append((t_cam, best_rec_time))
-        t_cam += grid_s
-
-    if len(points) < 2:
-        logger.info("Acoustic coarse align: only %d confident point(s), giving up", len(points))
+    if rec_track.size < 8 or cam_track.size < 8:
         return None
 
-    cam_times = np.array([p[0] for p in points])
-    rec_times = np.array([p[1] for p in points])
-    coeffs = np.polyfit(rec_times, cam_times, 1)
-    k, offset = float(coeffs[0]), float(coeffs[1])
+    half = window_s / 2.0
+    win_n = max(8, int(round(window_s * _REFINE_SR)))
+    block_n = min(len(rec_track), max(int(round(_SCAN_BLOCK_S * _REFINE_SR)), 4 * win_n))
+    nfft = 1 << int(np.ceil(np.log2(2 * block_n)))
+    block_starts = _plan_blocks(len(rec_track), block_n, win_n)
+    # The recorder's block FFTs depend only on the recorder, so they are
+    # computed ONCE and reused for every camera window — the old nested loop
+    # re-transformed recorder audio for every (camera window, probe) pair.
+    block_ffts = [
+        np.fft.rfft(rec_track[s0 : s0 + block_n] - rec_track[s0 : s0 + block_n].mean(), nfft)
+        for s0 in block_starts
+    ]
+    separation_n = max(win_n, int(round(window_s * _REFINE_SR)))
+
+    points: list[tuple[float, float]] = []  # (cam_time, rec_time) of confident matches
+    t_cam = half
+    while t_cam <= max(half, clip_duration - half):
+        cam_win = _window_slice(cam_track, t_cam, window_s, _REFINE_SR)
+        found = _scan_camera_window(
+            cam_win,
+            block_starts,
+            block_ffts,
+            nfft,
+            block_n,
+            min_sharpness,
+            gcc_eps,
+            separation_n,
+        )
+        if found is not None:
+            rec_time, _sharp = found
+            if 0.0 <= rec_time <= rec_duration + window_s:
+                points.append((t_cam, rec_time))
+        t_cam += grid_s
+
+    if len(points) < max(2, min_points):
+        logger.info(
+            "Acoustic coarse align: only %d unambiguous point(s) (need %d), giving up",
+            len(points),
+            max(2, min_points),
+        )
+        return None
+
+    fit = _fit_robust_line(points, max_k_deviation)
+    if fit is None:
+        return None
+    offset, k, inliers = fit
+    rec_times = [p[1] for p in points]
+    span = max(rec_times) - min(rec_times)
     logger.info(
-        "Acoustic coarse align: offset=%.3fs k=%.6f from %d confident point(s)",
+        "Acoustic coarse align: offset=%.3fs k=%.6f from %d point(s) spanning %.1fs",
         offset,
         k,
         len(points),
+        span,
     )
-    return offset, k
+    return AcousticFit(offset=offset, k=k, points=len(points), inliers=inliers, span_s=span)
 
 
 # (rec_start, rec_in_duration, atempo_factor) — the piece tuple produced by clip_pieces.
@@ -256,6 +500,9 @@ def _measure_boundary(
 
 
 _FLEX_MIN_PIECE_S = 0.05
+# Tempo bounds a re-timed predecessor must stay inside (atempo's own range).
+_FLEX_MIN_FACTOR = 0.5
+_FLEX_MAX_FACTOR = 2.0
 
 
 def refine_piece_boundaries(
@@ -268,6 +515,7 @@ def refine_piece_boundaries(
     config: WhisperSyncConfig,
     tmp_dir: Path | None = None,
     workers: int = 1,
+    rec_track: np.ndarray | None = None,
 ) -> tuple[float, list[Piece]]:
     """Acoustically nudge each piece's onset so its speech lands under the
     picture, independent of Whisper's word timings ("Boundary Flex").
@@ -300,6 +548,14 @@ def refine_piece_boundaries(
     the geometry is deterministic, so the result is identical regardless of
     worker count. ``tmp_dir`` is accepted for backward compatibility but is
     unused now that no scratch files are written.
+
+    ``rec_track`` lets the caller supply an ALREADY-DECODED recorder array.
+    Every render job used to decode the whole recorder again: at 16 kHz mono
+    float64 that is ~461 MB per hour of recorder for the final array alone,
+    before intermediate copies — repeated once per clip, so a shoot of many
+    clips against one long recorder paid that I/O and allocation over and over.
+    One decode per recorder, reused across its jobs, removes the repetition
+    entirely.
     """
     if not pieces:
         return lead, pieces
@@ -325,9 +581,11 @@ def refine_piece_boundaries(
         return lead, pieces
 
     # Decode both full tracks to mono 16k once; every boundary below just
-    # slices these arrays.
+    # slices these arrays. The recorder's decode is reused across jobs when the
+    # caller hands one in (see `rec_track`).
     cam_track = load_mono16k_track(cam_audio_wav)
-    rec_track = load_mono16k_track(rec_audio_path)
+    if rec_track is None:
+        rec_track = load_mono16k_track(rec_audio_path)
 
     args = (
         win,
@@ -350,50 +608,72 @@ def refine_piece_boundaries(
             for fut, idx in futs.items():
                 corrections[idx] = fut.result()
 
-    # Apply each correction as a BOUNDARY move (content stays contiguous):
-    #   piece i:   onset += δ, duration −= δ, factor kept → its speech rate is
-    #              untouched, its output shortens/lengthens by δ/factor;
-    #   piece i−1: duration += δ (covers the ceded/vacated recorder content),
-    #              factor recomputed so its output length changes by exactly
-    #              +δ/factor_i — every later piece's output position is
-    #              preserved. For piece 0 the lead absorbs the output change.
-    refined: list[list[float]] = [list(p) for p in pieces]
+    # Apply the corrections by RE-TARGETING each piece's read boundary.
+    #
+    # The previous scheme moved the boundary and let the predecessor absorb the
+    # change in BOTH its source and its output length: piece i's onset went to
+    # s+δ while its output start went to L+δ/f. Those cancel exactly — an event
+    # at recorder time R was output at L + δ/f + (R − s − δ)/f, which is
+    # L + (R − s)/f, its original position. Boundary Flex logged "nudged N
+    # onsets" and moved no audio at all; a −80 ms correction on the middle of
+    # three pieces left a recorder event at 107 s on camera 7 s exactly where
+    # it started.
+    #
+    # What actually moves speech is to change WHERE each piece reads while
+    # leaving WHERE and HOW LONG it plays alone. Every piece keeps its output
+    # window, so the plan's total length and every later piece's position are
+    # invariant by construction (see pipeline.validate_pieces); each piece's
+    # source window becomes [t_i, t_{i+1}) with t_i = s_i + δ_i, so the recorder
+    # content stays exactly contiguous — no skipped audio and no double-played
+    # sliver, which is what the boundary scheme existed to avoid. The tempo
+    # factor absorbs the difference. An event then shifts by −δ_i/f at the
+    # piece's start, easing linearly to the next boundary's own correction —
+    # which is precisely what a piecewise-linear time warp should do.
+    n = len(pieces)
+    starts = [p[0] for p in pieces]
+    src_end = pieces[-1][0] + pieces[-1][1]
     out_durs = [rec_dur / factor if factor else rec_dur for (_s, rec_dur, factor) in pieces]
-    new_lead = lead
-    n_shifted = 0
-    for idx in sorted(corrections):
-        delta = corrections[idx]
-        if delta == 0.0:
-            continue
-        start, dur, factor = refined[idx]
-        # Clamps: this piece keeps a sliver of duration; the neighbour (or the
-        # lead) must be able to absorb; the shifted onset stays in the recorder.
-        delta = min(delta, dur - _FLEX_MIN_PIECE_S)
-        delta = max(delta, -start)
-        if idx > 0:
-            delta = max(delta, -(refined[idx - 1][1] - _FLEX_MIN_PIECE_S))
-        else:
-            f = factor or 1.0
-            if new_lead + delta / f < 0.0:
-                delta = -new_lead * f
-        if abs(delta) < 1e-6:
-            continue
-        n_shifted += 1
-        f = factor or 1.0
-        refined[idx] = [start + delta, dur - delta, factor]
-        out_durs[idx] -= delta / f
-        if idx > 0:
-            p_start, p_dur, _p_factor = refined[idx - 1]
-            new_p_dur = p_dur + delta
-            new_p_out = out_durs[idx - 1] + delta / f
-            refined[idx - 1] = [
-                p_start,
-                new_p_dur,
-                max(0.25, min(4.0, new_p_dur / new_p_out)) if new_p_out > 1e-6 else 1.0,
-            ]
-            out_durs[idx - 1] = new_p_out
-        else:
-            new_lead += delta / f
 
-    logger.info("Boundary Flex: nudged %d/%d piece onsets", n_shifted, len(pieces))
-    return new_lead, [(s, d, f) for s, d, f in refined]
+    deltas = [corrections.get(i, 0.0) for i in range(n)]
+
+    def _build(ds: list[float]) -> tuple[list[float], list[float]] | None:
+        """(read boundaries, durations) for a delta set, or None if unusable."""
+        targets = [
+            min(max(starts[i] + ds[i], 0.0), rec_duration) if i else max(starts[0] + ds[0], 0.0)
+            for i in range(n)
+        ]
+        end = min(max(src_end + ds[-1], 0.0), rec_duration)
+        bounds = [*targets, end]
+        for i in range(n):
+            if bounds[i + 1] - bounds[i] < _FLEX_MIN_PIECE_S:
+                return None
+        return targets, [bounds[i + 1] - bounds[i] for i in range(n)]
+
+    built = _build(deltas)
+    # A single unusable correction must not throw away all the others: retry
+    # with the largest offenders zeroed rather than abandoning the pass.
+    while built is None and any(d != 0.0 for d in deltas):
+        worst = max(range(n), key=lambda i: abs(deltas[i]))
+        deltas[worst] = 0.0
+        built = _build(deltas)
+    if built is None:
+        return lead, pieces
+    targets, durations = built
+
+    refined: list[tuple[float, float, float]] = []
+    for i in range(n):
+        out_dur = out_durs[i]
+        factor = durations[i] / out_dur if out_dur > 1e-9 else pieces[i][2]
+        if not (_FLEX_MIN_FACTOR <= factor <= _FLEX_MAX_FACTOR):
+            # This correction would need a tempo outside atempo's range; keep
+            # the original piece rather than clamping the factor, which would
+            # silently break the source/output length relationship.
+            refined.append(pieces[i])
+            continue
+        refined.append((targets[i], durations[i], factor))
+    n_shifted = sum(1 for i in range(n) if refined[i][0] != pieces[i][0])
+
+    logger.info("Boundary Flex: shifted %d/%d piece read positions", n_shifted, len(pieces))
+    # The lead is untouched: piece 0's OUTPUT start is what defines it, and no
+    # correction moves an output start any more.
+    return lead, refined

@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from whispersync.engine.media import build_atempo_chain
+from whispersync.engine.media import WAV_MUX_ARGS, build_atempo_chain
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,17 @@ _DEFAULT_CODEC = "pcm_s24le"
 # avoids WSOLA's phase/texture artifacts entirely. Real clock drift between a
 # camera and a recorder is typically 0.01-0.5%, well under this threshold.
 RESAMPLE_CONFORM_MAX_DEVIATION = 0.005
+
+
+# Plain RIFF/WAV stores sizes in 32-bit fields, so it cannot describe a file
+# larger than 4 GiB — which stereo 48 kHz/24-bit reaches in about 4.14 hours,
+# and a multichannel recorder reaches sooner. Past that, ffmpeg's output is a
+# WAV whose header lies about its own length: readers see a truncated file, or
+# refuse it. `-rf64 auto` writes a normal RIFF header when the file fits and
+# transparently promotes to RF64 when it does not, so long-form projects come
+# out intact and short ones are byte-identical to before. Applied to every
+# WAV this project writes, because "this one is always short" is exactly the
+# assumption that fails on someone's four-hour lecture.
 
 
 def edge_fade_filters(out_duration: float, fade_ms: int) -> list[str]:
@@ -167,6 +178,7 @@ def apply_atempo_segment(
         str(channels),
         "-acodec",
         codec,
+        *WAV_MUX_ARGS,
         str(output_path),
     ]
     logger.info("Running: %s", " ".join(cmd))
@@ -226,6 +238,7 @@ def resample_conform_segment(
         str(channels),
         "-acodec",
         codec,
+        *WAV_MUX_ARGS,
         str(output_path),
     ]
     logger.info("Running: %s", " ".join(cmd))
@@ -308,6 +321,7 @@ def conform_wav_to(
         str(channels),
         "-acodec",
         codec,
+        *WAV_MUX_ARGS,
         str(output_path),
     ]
     logger.info("Running: %s", " ".join(cmd))
@@ -412,6 +426,7 @@ def generate_silence(
         str(duration),
         "-acodec",
         codec,
+        *WAV_MUX_ARGS,
         str(output_path),
     ]
     logger.info("Running: %s", " ".join(cmd))
@@ -502,6 +517,7 @@ def assemble_continuous(
             str(channels),
             "-acodec",
             codec,
+            *WAV_MUX_ARGS,
             str(output_path),
         ]
         logger.info(
@@ -549,6 +565,7 @@ def cut_wav_segment(
         f"{end_s:.6f}",
         "-acodec",
         codec,
+        *WAV_MUX_ARGS,
         str(dst),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -574,6 +591,17 @@ def mix_clips_on_timeline(
     recorders with different native formats); ``amix`` sums without
     normalizing volume (``normalize=0``) so overlapping clips don't get
     quieter than a non-overlapping single clip would.
+
+    ``normalize=0`` is right for level consistency and wrong for headroom: two
+    correlated microphones in ``recorder_mode="all"``, or voice plus ambience,
+    sum straight past full scale, and an integer PCM output then hard-clips
+    with no warning anywhere. The mix therefore runs in FLOAT internally and a
+    limiter catches only the peaks that would actually clip
+    (``alimiter`` with a 0 dBFS ceiling): below full scale the samples are
+    untouched, so nothing is quietly turned down, and above it the result is a
+    controlled peak rather than square-wave distortion. Choosing between
+    "silently distorted" and "silently quieter" is not a choice a mix should
+    make on its own — this preserves the level and bounds the damage.
     """
     if not clips or total_duration <= 0:
         return generate_silence(output_path, max(total_duration, 0.0), sample_rate, channels, codec)
@@ -584,6 +612,19 @@ def mix_clips_on_timeline(
     mix_labels: list[str] = []
     for i, (path, offset) in enumerate(clips):
         inputs += ["-i", str(path)]
+        if offset < -1e-6:
+            # The caller must have normalised the plan's origin already
+            # (pipeline.normalize_plan_origin). Silently clamping here is what
+            # made a negative lip-sync calibration vanish: the mix delivered
+            # exactly the uncalibrated result while reporting success. Clamping
+            # is still what has to happen — a delay cannot be negative — but it
+            # is a bug in the caller, not a routine adjustment, so say so.
+            logger.warning(
+                "Clip %s has a negative timeline offset (%.3fs); clamping to 0. "
+                "The plan's origin should have been normalised before mixing.",
+                path.name,
+                offset,
+            )
         delay_ms = max(0, round(offset * 1000))
         delay_arg = "|".join([str(delay_ms)] * channels) if channels > 1 else str(delay_ms)
         filter_parts.append(
@@ -594,6 +635,10 @@ def mix_clips_on_timeline(
         mix_labels.append(f"[a{i}]")
     filter_parts.append(
         f"{''.join(mix_labels)}amix=inputs={len(clips)}:duration=longest:normalize=0,"
+        # Sum in float so the mix itself never clips, then bound the result at
+        # full scale before it reaches an integer codec.
+        "aformat=sample_fmts=fltp,"
+        "alimiter=level_in=1:level_out=1:limit=1.0:attack=5:release=50:level=disabled,"
         f"apad,atrim=0:{total_duration:.6f},asetpts=PTS-STARTPTS[out]"
     )
     filter_complex = ";".join(filter_parts)
@@ -612,6 +657,7 @@ def mix_clips_on_timeline(
         str(channels),
         "-acodec",
         codec,
+        *WAV_MUX_ARGS,
         str(output_path),
     ]
     logger.info("Mixing %d clip(s) onto master timeline -> %s", len(clips), output_path)

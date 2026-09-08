@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 GREEN = "\033[92m"
@@ -25,21 +26,44 @@ def _fail(msg: str) -> None:
 
 
 def check_ffmpeg() -> dict:
+    """Probe ffmpeg and ffprobe, reporting every way each can be unusable.
+
+    A diagnostic must never fail in the same way as the thing it is
+    diagnosing. Only ``FileNotFoundError`` was handled here, so an ffmpeg that
+    hung (``TimeoutExpired``) or was not executable (``PermissionError``) took
+    the whole system check down with a traceback — abandoning the CUDA, disk,
+    dependency and environment checks the user was about to read, and telling
+    them nothing about the ffmpeg problem either. Each outcome is now a
+    reported status: ok / not found / permission denied / timeout / error.
+    """
     result: dict = {"ffmpeg": False, "ffprobe": False, "details": {}}
     for cmd in ("ffmpeg", "ffprobe"):
         try:
             r = subprocess.run([cmd, "-version"], capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                line = r.stdout.split("\n")[0]
-                _ok(f"{cmd} — {line}")
-                result[cmd] = True
-                result["details"][cmd] = line
-            else:
-                _fail(f"{cmd} not working")
-                result["details"][cmd] = r.stderr.strip()
         except FileNotFoundError:
             _fail(f"{cmd} not found in PATH")
             result["details"][cmd] = "not found"
+            continue
+        except PermissionError as e:
+            _fail(f"{cmd} found but not executable ({e})")
+            result["details"][cmd] = f"permission denied: {e}"
+            continue
+        except subprocess.TimeoutExpired:
+            _fail(f"{cmd} did not respond within 10s")
+            result["details"][cmd] = "timeout"
+            continue
+        except OSError as e:  # pragma: no cover - platform dependent
+            _fail(f"{cmd} could not be started ({e})")
+            result["details"][cmd] = f"error: {e}"
+            continue
+        if r.returncode == 0:
+            line = r.stdout.split("\n")[0]
+            _ok(f"{cmd} — {line}")
+            result[cmd] = True
+            result["details"][cmd] = line
+        else:
+            _fail(f"{cmd} not working (exit {r.returncode})")
+            result["details"][cmd] = r.stderr.strip() or f"exit {r.returncode}"
     return result
 
 
@@ -135,11 +159,11 @@ def check_ambience_separator() -> dict:
 def check_voice_enhance_environments() -> dict:
     """Whether each ``voice_enhance`` backend's environment is set up.
 
-    Only "denoise"/"denoise_dereverb" are wired up today (they reuse
-    ``.sep-venv`` — see ``check_ambience_separator``); the rest (resemble,
-    sgmse_denoise/dereverb, reuse) are reported as "not yet available in this
-    build" rather than probed, since their engine backends don't exist yet.
-    Not fatal either way — the feature is opt-in."""
+    "denoise"/"denoise_dereverb" reuse ``.sep-venv`` (see
+    ``check_ambience_separator``) and "resemble" needs the ``resemble-enhance``
+    CLI installed into that same venv — all three are probed. The rest
+    (sgmse_denoise/dereverb, reuse) have no engine backend in this build yet
+    and are reported as such. Not fatal either way — the feature is opt-in."""
     from whispersync.engine import enhance
 
     repo_root = Path(__file__).resolve().parents[2]
@@ -156,20 +180,91 @@ def check_voice_enhance_environments() -> dict:
                 f"Voice enhancement '{mode}' — not set up "
                 "(optional; run setup_sep_venv.sh to enable --voice-enhance)"
             )
+        elif mode in enhance.RESEMBLE_MODES:
+            _warn(
+                f"Voice enhancement '{mode}' — not set up (optional; "
+                ".sep-venv/bin/pip install resemble-enhance to enable it)"
+            )
         else:
             _warn(f"Voice enhancement '{mode}' — not available in this build yet")
     return result
 
 
-def check_disk_space(min_gb: int = 10) -> dict:
-    usage = shutil.disk_usage("/")
-    free_gb = usage.free / (1024**3)
-    ok = free_gb >= min_gb
-    if ok:
-        _ok(f"Disk space: {free_gb:.1f} GB free")
-    else:
-        _fail(f"Disk space: {free_gb:.1f} GB free (min {min_gb} GB)")
-    return {"free_gb": round(free_gb, 1), "ok": ok}
+def check_disk_space(min_gb: int = 10, paths: dict[str, Path] | None = None) -> dict:
+    """Free space on the filesystems this app actually writes to.
+
+    Checking ``/`` answered a question nobody asked: renders go to the output
+    folder, transcripts to the cache directory and scratch to the temp
+    directory, and on a typical setup at least one of those is a different
+    filesystem (a media volume, a small tmpfs). A green "500 GB free" on the
+    root while the output volume has 2 GB is worse than no check at all.
+    Filesystems are de-duplicated by device so one mount is not reported
+    three times.
+    """
+    import tempfile
+
+    from whispersync.config import WhisperSyncConfig
+
+    if paths is None:
+        cfg = WhisperSyncConfig()
+        paths = {
+            "output": cfg.resolved_output_dir,
+            "cache": cfg.resolved_cache_dir,
+            "temp": Path(tempfile.gettempdir()),
+        }
+
+    result: dict = {"ok": True, "filesystems": {}}
+    seen_devices: set[int] = set()
+    for label, path in paths.items():
+        # An output directory that does not exist yet still lives on some
+        # filesystem: walk up to the nearest existing ancestor.
+        probe_path = path
+        while not probe_path.exists() and probe_path != probe_path.parent:
+            probe_path = probe_path.parent
+        try:
+            device = probe_path.stat().st_dev
+            if device in seen_devices:
+                continue
+            seen_devices.add(device)
+            usage = shutil.disk_usage(probe_path)
+        except OSError as e:
+            _warn(f"Disk space ({label}): could not be checked — {e}")
+            result["filesystems"][label] = {"error": str(e)}
+            continue
+        free_gb = usage.free / (1024**3)
+        ok = free_gb >= min_gb
+        result["filesystems"][label] = {
+            "path": str(probe_path),
+            "free_gb": round(free_gb, 1),
+            "ok": ok,
+        }
+        if ok:
+            _ok(f"Disk space ({label}, {probe_path}): {free_gb:.1f} GB free")
+        else:
+            _fail(f"Disk space ({label}, {probe_path}): {free_gb:.1f} GB free (min {min_gb} GB)")
+            result["ok"] = False
+    # Kept for compatibility with existing report readers.
+    frees = [
+        fs["free_gb"]
+        for fs in result["filesystems"].values()
+        if isinstance(fs.get("free_gb"), float)
+    ]
+    result["free_gb"] = min(frees) if frees else None
+    return result
+
+
+def _isolated(label: str, fn: Callable[[], dict]) -> dict:
+    """Run one check, converting ANY failure into a reported status.
+
+    The point of a system check is to tell the user what is wrong. A check that
+    raises stops every check after it, so the one broken component hides the
+    state of everything else — the opposite of what was asked for.
+    """
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001 - a diagnostic must not fail
+        _fail(f"{label} check could not be completed: {e}")
+        return {"status": "error", "error": str(e)}
 
 
 def run_all_checks() -> dict:
@@ -177,25 +272,25 @@ def run_all_checks() -> dict:
     print("=" * 40)
 
     print("\n[FFmpeg]")
-    ff = check_ffmpeg()
+    ff = _isolated("FFmpeg", check_ffmpeg)
 
     print("\n[CUDA]")
-    cu = check_cuda()
+    cu = _isolated("CUDA", check_cuda)
 
     print("\n[Disk]")
-    ds = check_disk_space()
+    ds = _isolated("Disk", check_disk_space)
 
     print("\n[Python]")
-    py = check_python()
+    py = _isolated("Python", check_python)
 
     print("\n[Dependencies]")
-    deps = check_dependencies()
+    deps = _isolated("Dependencies", check_dependencies)
 
     print("\n[Ambience separator]")
-    sep = check_ambience_separator()
+    sep = _isolated("Ambience separator", check_ambience_separator)
 
     print("\n[Voice enhancement]")
-    enh = check_voice_enhance_environments()
+    enh = _isolated("Voice enhancement", check_voice_enhance_environments)
 
     report = {
         "ffmpeg": ff,
@@ -214,9 +309,15 @@ def run_all_checks() -> dict:
     # user has no reason to go looking inside site-packages for it. See
     # PROJECT_ANALYSIS.md §3.6.
     path = Path.cwd() / "report.json"
-    with open(path, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"\nReport saved to {path}")
+    try:
+        with open(path, "w") as f:
+            json.dump(report, f, indent=2)
+    except OSError as e:
+        # A read-only working directory must not swallow the report the user
+        # just watched being produced.
+        _warn(f"Could not write {path}: {e}")
+    else:
+        print(f"\nReport saved to {path}")
 
     return report
 

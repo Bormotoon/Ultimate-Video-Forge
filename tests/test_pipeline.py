@@ -510,3 +510,86 @@ def test_quiet_cut_points_no_tiny_tail(monkeypatch, tmp_path: Path) -> None:
 
     cuts = _quiet_cut_points(tmp_path / "v.wav", duration_s=125.0, segment_s=60.0)
     assert len(cuts) == 1  # only the ~60s cut; no second cut near 120
+
+
+def test_head_trim_is_measured_so_the_caller_can_report_it() -> None:
+    """A dropped head is forced by the geometry, but it may not be silence.
+
+    The planner compresses the room tone before the first RECOGNISED sentence
+    and leaves out whatever still will not fit. Whisper drops quiet, accented
+    or overlapping speech, so that region can hold a real opening phrase — and
+    from inside the planner (word timings, no audio) "trimmed room tone" and
+    "deleted speech" look identical. Measuring it is what lets the pipeline say
+    so instead of the user finding a missing sentence in the edit.
+    """
+    from whispersync.engine.pipeline import head_trim_seconds
+
+    # First piece starts 8 s into the recorder while the plan's span began at 0.
+    pieces = [(8.0, 4.0, 1.0), (12.0, 4.0, 1.0)]
+    assert head_trim_seconds(pieces, rec0=0.0) == 8.0
+    # Nothing dropped when the first piece starts where the span does.
+    assert head_trim_seconds([(3.0, 4.0, 1.0)], rec0=3.0) == 0.0
+    assert head_trim_seconds([], rec0=0.0) == 0.0
+
+
+# --- time geometry with a non-identity map ---------------------------------
+
+
+def test_clip_pieces_geometry_holds_with_nonzero_offset_and_k() -> None:
+    """The invariants must hold on a REAL map, not just an identity one.
+
+    Every geometry bug in this area was invisible at offset=0, k=1 — the case
+    the old tests used. `sum(in_dur / factor)` is the only thing deciding where
+    the last piece's speech lands, so a plan whose total output length
+    disagrees with the clip has already lost sync somewhere in the middle.
+    """
+    from whispersync.engine.pipeline import validate_pieces
+
+    cfg = WhisperSyncConfig()
+    for k in (0.999, 1.0, 1.001):
+        for offset in (-120.0, -0.5, 0.0, 37.25):
+            anchors = [
+                Anchor(
+                    cam_time=offset + k * (t + 5.0),
+                    rec_time=t + 5.0,
+                    token=f"w{i}",
+                    confidence=0.9,
+                )
+                for i, t in enumerate(range(0, 55, 5))
+            ]
+            am = AlignmentMap(anchors=anchors, offset=offset, k=k, residual_ms=5.0)
+            lead, pieces = clip_pieces(am, 60.0, 600.0, 2, cfg)
+            if not pieces:
+                continue
+            problems = validate_pieces(lead, pieces, 60.0, 600.0)
+            assert not problems, f"offset={offset} k={k}: {problems}"
+            # Pieces tile the recorder span with no gap or overlap.
+            for (s0, d0, _f0), (s1, _d1, _f1) in zip(pieces, pieces[1:], strict=False):
+                assert abs((s0 + d0) - s1) < 1e-6, f"offset={offset} k={k}: discontinuity"
+
+
+def test_clip_pieces_rejects_rather_than_clamps_an_impossible_breakpoint() -> None:
+    """A stray anchor implying an out-of-range tempo must DROP the breakpoint.
+
+    Clamping kept the bad anchor and silently broke the length relationship: a
+    10 s clip came out with 9.8 s of pieces, and the trailing pad hid the gap
+    without putting any speech back where it belonged.
+    """
+    from whispersync.engine.pipeline import MAX_TEMPO_FACTOR, MIN_TEMPO_FACTOR, validate_pieces
+
+    cfg = WhisperSyncConfig()
+    # A middle anchor that demands ~10x compression between its neighbours.
+    anchors = [
+        Anchor(cam_time=0.0, rec_time=0.0, token="a", confidence=0.9),
+        Anchor(cam_time=0.5, rec_time=5.0, token="b", confidence=0.9),
+        Anchor(cam_time=10.0, rec_time=10.0, token="c", confidence=0.9),
+    ]
+    am = AlignmentMap(anchors=anchors, offset=0.0, k=1.0, residual_ms=5.0)
+    lead, pieces = clip_pieces(am, 10.0, 60.0, 2, cfg)
+    assert pieces
+    for _s, _d, factor in pieces:
+        assert MIN_TEMPO_FACTOR - 1e-9 <= factor <= MAX_TEMPO_FACTOR + 1e-9
+    assert not validate_pieces(lead, pieces, 10.0, 60.0)
+    # And the total output still fills the clip rather than falling short.
+    total_out = lead + sum(d / f for _s, d, f in pieces)
+    assert abs(total_out - 10.0) < 0.05, f"pieces occupy {total_out}s of a 10s clip"

@@ -177,3 +177,49 @@ def test_seam_fades_discontinuity_fades_both_sides() -> None:
 
 def test_seam_fades_single_piece_fades_both_edges() -> None:
     assert pipeline._piece_seam_fades([(0.0, 1.0, 1.0)]) == [(True, True)]
+
+
+def test_collect_distinguishes_a_worker_timeout_from_a_wait_timeout() -> None:
+    """A task that RAISED TimeoutError must surface, not spin forever.
+
+    `concurrent.futures.TimeoutError` IS `TimeoutError` on Python 3.11+, so a
+    worker whose own task timed out looked exactly like "the 0.5 s poll
+    elapsed": the loop treated a permanently failed piece as still pending and
+    never made progress.
+    """
+    import pytest
+
+    from whispersync.engine.pipeline import _collect_piece_futures
+
+    class _FailedFuture:
+        def done(self):
+            return True
+
+        def result(self, timeout=None):
+            raise TimeoutError("ffmpeg exceeded its own timeout")
+
+    with pytest.raises(TimeoutError, match="ffmpeg exceeded"):
+        _collect_piece_futures([_FailedFuture()], poll_s=0.01)
+
+
+def test_collect_keeps_waiting_while_a_piece_is_genuinely_running() -> None:
+    """The other side of the same distinction: a future that is not done yet
+    must be waited for, not mistaken for a failure."""
+    from concurrent.futures import TimeoutError as FutureTimeoutError
+
+    from whispersync.engine.pipeline import _collect_piece_futures
+
+    class _SlowFuture:
+        def __init__(self):
+            self.polls = 0
+
+        def done(self):
+            return self.polls >= 2
+
+        def result(self, timeout=None):
+            if self.polls >= 2:
+                return Path("piece.wav")
+            self.polls += 1
+            raise FutureTimeoutError()
+
+    assert _collect_piece_futures([_SlowFuture()], poll_s=0.01) == [Path("piece.wav")]

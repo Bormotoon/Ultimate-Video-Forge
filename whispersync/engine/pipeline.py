@@ -12,8 +12,6 @@ import logging
 import multiprocessing as mp
 import os
 import shutil
-import tempfile
-import threading
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -25,10 +23,11 @@ import numpy as np
 
 from whispersync.config import WhisperSyncConfig
 from whispersync.engine.acoustic import acoustic_coarse_align, refine_piece_boundaries
-from whispersync.engine.export import generate_fcpxml, validate_fcpxml
+from whispersync.engine.export import check_fcpxml, generate_fcpxml
 from whispersync.engine.matcher import (
     align,
     build_recorder_index,
+    evaluate_alignment,
     normalize_words,
     recommend_strategy,
 )
@@ -36,11 +35,12 @@ from whispersync.engine.media import (
     MediaInfo,
     extract_audio_master,
     extract_audio_to_wav,
-    pcm_codec_for_bit_depth,
+    pcm_codec_for,
     probe,
 )
 from whispersync.engine.naming import natural_key
 from whispersync.engine.retakes import detect_retakes
+from whispersync.engine.sources import assign_source_ids
 from whispersync.engine.strategies import strategy_name
 from whispersync.engine.timestretch import (
     assemble_continuous,
@@ -50,6 +50,7 @@ from whispersync.engine.timestretch import (
 )
 from whispersync.engine.transcriber import WhisperEngine
 from whispersync.engine.transcript_export import save_transcript
+from whispersync.engine.workspace import RunWorkspace, output_lock, published
 from whispersync.models import (
     AlignmentMap,
     Anchor,
@@ -224,12 +225,22 @@ def scan_video_clips(
 
 
 def compute_master_offsets(
-    alignments: list[AlignmentMap | None], durations: list[float]
+    alignments: list[AlignmentMap | None],
+    durations: list[float],
+    clip_camera: list[int] | None = None,
 ) -> tuple[list[float], list[int]]:
     """Place each clip on the master timeline (recorder seconds) from its
     matched recorder start time ``-offset/k``, anchored so the earliest clip
-    sits at 0. Clips that could not be aligned fall back to following the
-    previous clip and are reported by index.
+    sits at 0.
+
+    A clip with no accepted alignment has NO measured position. It is placed
+    after the previous clip OF ITS OWN CAMERA and reported, so the caller can
+    mark it unresolved. A single shared cursor (the previous behaviour) put
+    camera B's first unplaceable clip after camera A's last clip — a position
+    invented out of an unrelated camera's running time, presented on the
+    timeline exactly like a measured one. ``clip_camera`` (camera index per
+    clip) is optional only so existing callers/tests keep working; without it
+    every clip is treated as one camera.
 
     Returns (offsets, unaligned_indices).
     """
@@ -242,18 +253,19 @@ def compute_master_offsets(
 
     aligned = [r for r in rec_starts if r is not None]
     ref = min(aligned) if aligned else 0.0
+    cams = clip_camera if clip_camera is not None else [0] * len(durations)
 
     offsets: list[float] = []
     unaligned: list[int] = []
-    prev_end = 0.0
-    for i, (rs, dur) in enumerate(zip(rec_starts, durations, strict=True)):
+    prev_end: dict[int, float] = {}
+    for i, (rs, dur, cam) in enumerate(zip(rec_starts, durations, cams, strict=True)):
         if rs is not None:
             off = rs - ref
         else:
-            off = prev_end
+            off = prev_end.get(cam, 0.0)
             unaligned.append(i)
         offsets.append(off)
-        prev_end = off + dur
+        prev_end[cam] = off + dur
     return offsets, unaligned
 
 
@@ -366,6 +378,9 @@ _PAUSE_FACTOR_MIN = 0.5
 _PAUSE_FACTOR_MAX = 2.0
 _MIN_PIECE_S = 0.02
 
+# Report a dropped head longer than this. See `head_trim_seconds`.
+HEAD_TRIM_WARN_S = 1.0
+
 
 def _smoothed_map_at(
     am: AlignmentMap, rec_t: float, window_s: float = _MAP_WINDOW_S
@@ -455,6 +470,10 @@ def _sentence_pieces(
     if head_out <= _MIN_PIECE_S:
         head_in = 0.0
     elif head_in > _MIN_PIECE_S:
+        # Whatever will not fit in the available output at maximum compression
+        # is necessarily left out — the geometry allows nothing else. See
+        # `head_trim_seconds`: the caller reports how much was dropped, because
+        # "no transcribed words here" is not the same as "silence here".
         used = min(head_in, head_out * _PAUSE_FACTOR_MAX)
         head_start = padded[0][0] - used
         factor = max(_PAUSE_FACTOR_MIN, min(_PAUSE_FACTOR_MAX, used / head_out))
@@ -566,6 +585,114 @@ def _retake_groups_in_segment(
     return kept
 
 
+# atempo's usable range. A piece outside it is not "a piece that needs
+# clamping" — it is evidence that the two anchors bounding it disagree.
+MIN_TEMPO_FACTOR = 0.5
+MAX_TEMPO_FACTOR = 2.0
+
+
+def _drop_implausible_breakpoints(
+    bps: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Remove interior breakpoints whose piece would need an out-of-range tempo.
+
+    Removing a breakpoint merges the two pieces it separated, so the surviving
+    plan still tiles exactly the same recorder span onto exactly the same
+    output span — the invariant a clamp destroys. Repeats until every remaining
+    piece is plausible or only the two clip edges are left (which is the Global
+    Linear fallback, and is always self-consistent).
+    """
+    if len(bps) <= 2:
+        return bps
+    kept = list(bps)
+    changed = True
+    while changed and len(kept) > 2:
+        changed = False
+        for i in range(len(kept) - 1):
+            (ra, la), (rb, lb) = kept[i], kept[i + 1]
+            in_dur, out_dur = rb - ra, lb - la
+            factor = float("inf") if out_dur <= 1e-4 else in_dur / out_dur
+            if MIN_TEMPO_FACTOR <= factor <= MAX_TEMPO_FACTOR:
+                continue
+            # Drop whichever endpoint of this piece is interior; prefer the
+            # later one so earlier (already-validated) pieces stay put.
+            drop = i + 1 if i + 1 < len(kept) - 1 else i
+            if drop == 0 or drop == len(kept) - 1:
+                # Both endpoints are clip edges: nothing left to drop. The
+                # global stretch itself is out of range, which the caller
+                # surfaces via validate_pieces.
+                return kept
+            del kept[drop]
+            changed = True
+            break
+    return kept
+
+
+def validate_pieces(
+    lead: float,
+    pieces: list[tuple[float, float, float]],
+    clip_duration: float,
+    rec_duration: float,
+    tol_s: float = 1e-3,
+) -> list[str]:
+    """Structural problems in a render plan, as human-readable strings.
+
+    The invariants a piece list must satisfy for the rendered audio to land
+    where the plan says it does:
+
+    * every source duration and tempo factor is positive and finite;
+    * every piece reads inside the recorder;
+    * the output tiles ``[lead, lead + sum(in_dur / factor)]`` without exceeding
+      the clip — ``sum(in_dur / factor)`` is the ONLY thing that decides where
+      the last piece's speech lands, so a plan whose total output length
+      disagrees with the clip has already lost sync somewhere in the middle.
+
+    Returns an empty list when the plan is sound. Used as a runtime guard and
+    directly in tests, where checking "the boundary moved" is not the same
+    question as "the audio ends up in the right place".
+    """
+    problems: list[str] = []
+    if lead < -tol_s:
+        problems.append(f"negative lead silence ({lead:.4f}s)")
+    total_out = lead
+    for i, (rs, rd, factor) in enumerate(pieces):
+        if not (rd > 0 and factor > 0):
+            problems.append(f"piece {i}: non-positive duration/factor ({rd:.4f}s, {factor:.4f})")
+            continue
+        if not (MIN_TEMPO_FACTOR - 1e-9 <= factor <= MAX_TEMPO_FACTOR + 1e-9):
+            problems.append(f"piece {i}: tempo factor {factor:.4f} outside atempo range")
+        if rs < -tol_s or rs + rd > rec_duration + tol_s:
+            problems.append(
+                f"piece {i}: reads [{rs:.3f}, {rs + rd:.3f}]s outside the "
+                f"{rec_duration:.3f}s recorder"
+            )
+        total_out += rd / factor
+    if total_out > clip_duration + tol_s:
+        problems.append(
+            f"pieces occupy {total_out:.4f}s of a {clip_duration:.4f}s clip "
+            f"(overflow {total_out - clip_duration:.4f}s)"
+        )
+    return problems
+
+
+def head_trim_seconds(pieces: list[tuple[float, float, float]], rec0: float) -> float:
+    """Recorder seconds the plan never reads, before its first piece.
+
+    The sentence planner places the first recognised sentence on its target and
+    compresses the room tone before it; whatever cannot fit even at maximum
+    compression is left out. That is forced by the geometry — there is nowhere
+    else for it to go — but it is NOT necessarily silence. Whisper drops quiet,
+    accented or overlapping speech, so a dropped head can contain a real
+    opening phrase, and the difference between "trimmed room tone" and "deleted
+    speech" is invisible from inside the planner (which has no audio, only word
+    timings). Measuring it lets the caller say so rather than the user
+    discovering a missing sentence in the edit.
+    """
+    if not pieces:
+        return 0.0
+    return max(0.0, pieces[0][0] - rec0)
+
+
 def clip_pieces(
     am: AlignmentMap,
     clip_duration: float,
@@ -665,6 +792,18 @@ def clip_pieces(
         if not bps or (rt > bps[-1][0] + 1e-3 and lt > bps[-1][1] + 1e-3):
             bps.append((rt, lt))
 
+    # An interior breakpoint implying a tempo outside atempo's usable range is
+    # not a piece to be clamped — it is an anchor pair that disagrees with its
+    # neighbours, i.e. a bad match. Clamping it kept the WRONG breakpoint and
+    # silently broke the timeline geometry instead: a piece asked to play
+    # `in_dur` of recorder at a clamped factor no longer occupies `out_dur` of
+    # output, so the pieces stopped tiling the clip (a synthetic 10 s clip came
+    # out 9.8 s long) and the trailing pad papered over the gap without putting
+    # any speech back where it belonged. Dropping the breakpoint MERGES its two
+    # neighbours, which keeps `sum(in_dur / factor) == total output` exact by
+    # construction. See ``validate_pieces``.
+    bps = _drop_implausible_breakpoints(bps)
+
     pieces: list[tuple[float, float, float]] = []
     for i in range(len(bps) - 1):
         (ra, la), (rb, lb) = bps[i], bps[i + 1]
@@ -672,9 +811,7 @@ def clip_pieces(
         out_dur = lb - la
         if in_dur <= 1e-4 or out_dur <= 1e-4:
             continue
-        # Safety clamp: a stray anchor can never blow the stretch past atempo's range.
-        factor = max(0.5, min(2.0, in_dur / out_dur))
-        pieces.append((ra, in_dur, factor))
+        pieces.append((ra, in_dur, in_dur / out_dur))
 
     lead = max(0.0, bps[0][1])
     return lead, pieces
@@ -747,9 +884,17 @@ def pause_spans_local(
     if cam_words is not None and rec_words is not None:
         cam_silence = _silence_spans(cam_words, clip_duration, gap_threshold)
         k = am.k or 1.0
-        rec_local = [((s - am.offset) / k, (e - am.offset) / k) for s, e in rec_words]
+        # The map is t_cam = offset + k * t_rec, so recorder -> local is
+        # `offset + k*t`, NOT `(t - offset)/k` (that is the INVERSE, local ->
+        # recorder). With the inverse, a recorder word at 104-105 s under
+        # offset=-100, k=1 — which really lands at camera 4-5 s — was projected
+        # to camera 204-205 s, i.e. outside the clip, so its speech left no
+        # silence gap and the whole 3-8 s stretch was marked "pause" and
+        # ducked. Real speech was attenuated by 18 dB. The bug is invisible on
+        # an identity map (offset 0, k 1), which is what the old tests used.
+        rec_local = [(am.offset + k * s, am.offset + k * e) for s, e in rec_words]
         rec_local_duration = (
-            (rec_duration - am.offset) / k if rec_duration is not None else clip_duration
+            am.offset + k * rec_duration if rec_duration is not None else clip_duration
         )
         rec_silence_local = _silence_spans(
             [(min(s, e), max(s, e)) for s, e in rec_local], rec_local_duration, gap_threshold
@@ -785,24 +930,24 @@ def resolve_workers(requested: int) -> int:
 
 
 def _pool_context() -> Any:
-    """Multiprocessing context for the render pool: fork only when it's safe.
+    """Multiprocessing context for the render pool. Never ``fork``.
 
-    fork is the fastest start method (children inherit the already-imported
-    modules), but forking a MULTI-threaded process is a classic deadlock
-    source — the child inherits a snapshot of other threads' malloc/logging/
-    CUDA lock state (see PROJECT_ANALYSIS.md §3.3; Python 3.12+ warns about
-    exactly this, and 3.14 changed the Linux default away from fork). The GUI
-    always renders from a Qt worker thread, so it must never fork. fork is
-    used only when this process is single-threaded (the CLI path); otherwise
-    prefer forkserver (fresh single-threaded template process, cheap-ish
-    per-worker) and fall back to spawn/default where unavailable. The one
-    shared pool per run amortizes the slower non-fork startup.
+    Forking a process that has ANY other thread is a classic deadlock source:
+    the child inherits a snapshot of the other threads' malloc/logging/CUDA
+    lock state, with no thread alive to release it. The old heuristic —
+    ``threading.active_count() == 1`` — cannot see the threads that matter.
+    It counts PYTHON threads only, so Qt's own event/worker threads, and the
+    native thread pools inside CTranslate2 and CUDA, are all invisible to it:
+    probed from inside a real ``QThread`` the count was 1, and ``fork`` was
+    duly selected in exactly the situation the check existed to prevent.
+
+    There is no reliable way to ask "is this process really single-threaded",
+    so the answer is to stop asking. ``forkserver`` gets the same cheap startup
+    from a template process that is genuinely single-threaded by construction,
+    and ``spawn`` is the portable fallback. The one shared pool per run
+    amortises the difference. Python 3.12+ warns about fork-in-threads and 3.14
+    changed the Linux default away from it for the same reason.
     """
-    if threading.active_count() == 1:
-        try:
-            return mp.get_context("fork")
-        except ValueError:  # pragma: no cover - platform dependent
-            pass
     for method in ("forkserver", "spawn"):
         try:
             return mp.get_context(method)
@@ -928,24 +1073,74 @@ def _collect_piece_futures(
     Waits with a short timeout so ``cancel_event`` is honoured mid-job even
     while pieces are rendering in pool workers — the old per-job pool only
     checked cancellation on the sequential path, so cancelling during a big
-    multi-core render job silently waited for the whole job to finish. A
-    worker exception re-raises here, on the piece that failed.
+    multi-core render job silently waited for the whole job to finish.
+
+    Completion is decided by ``future.done()``, NOT by catching
+    ``TimeoutError``. Those are two different events that Python spells the
+    same way: ``concurrent.futures.TimeoutError`` is ``TimeoutError`` on 3.11+,
+    so a worker whose own task raised ``TimeoutError`` (an ffmpeg call that
+    exceeded its limit, say) was indistinguishable from "the 0.5 s wait
+    elapsed" — the loop treated a permanently failed piece as still pending and
+    spun on it forever. Asking whether the future is done first makes the
+    distinction unambiguous, and a worker exception then re-raises here, on the
+    piece that failed.
     """
     results: list[Path] = []
     for fut in futures:
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("Cancelled by user")
-            try:
-                results.append(fut.result(timeout=poll_s))
+            if fut.done():
+                # Re-raises the worker's own exception, whatever its type.
+                results.append(fut.result())
                 break
+            try:
+                fut.result(timeout=poll_s)
             except FutureTimeoutError:
+                # Genuinely still running: `done()` was False before the wait.
+                continue
+            except BaseException:
+                # The task failed; let `done()` above hand the real exception
+                # to the caller on the next pass.
                 continue
     return results
 
 
 def _timeline_end(clips: list[MediaClip]) -> float:
     return max((c.offset + c.duration for c in clips), default=0.0)
+
+
+def normalize_plan_origin(clips: list[MediaClip]) -> float:
+    """Shift the whole plan so nothing starts before time zero. Returns the shift.
+
+    A negative ``camera_av_offset_ms`` asks for the synced voice to run AHEAD
+    of the picture, which puts the first audio clip at a negative timeline
+    offset. Nothing on a timeline can start before zero, so both serializers
+    independently clamped it — ``mix_clips_on_timeline`` with
+    ``max(0, delay_ms)`` and the FCPXML exporter with ``max(0.0, rel)``. Two
+    independent clamps are two chances to disagree, and both are wrong the same
+    way: clamping DROPS the requested lead rather than delivering it, so a
+    -100 ms calibration produced exactly the un-calibrated result while
+    reporting that it had been applied.
+
+    Moving the ORIGIN instead preserves every clip's position relative to every
+    other, which is the only thing that matters for sync, and leaves nothing
+    for a downstream clamp to do. Applied once, here, to the whole plan.
+    """
+    if not clips:
+        return 0.0
+    earliest = min(c.offset for c in clips)
+    if earliest >= 0.0:
+        return 0.0
+    shift = -earliest
+    for clip in clips:
+        clip.offset += shift
+    logger.info(
+        "Timeline origin shifted by %+.3fs so no clip starts before zero "
+        "(negative A/V calibration)",
+        shift,
+    )
+    return shift
 
 
 # Extra local-time margin added on each side of a flagged span before
@@ -1141,6 +1336,21 @@ def _anchor_count(am: AlignmentMap | None) -> int:
     return len(am.anchors) if am is not None else 0
 
 
+def _map_evidence(am: AlignmentMap | None) -> float:
+    """How much a map is actually worth, comparably across provenances.
+
+    ``len(anchors)`` is not that number. An acoustic map has no anchors at all
+    and would score zero next to a two-anchor text fit that happens to be
+    nonsense, which is how a working waveform match lost every contest it
+    entered. Inliers times the recorder span they cover rewards evidence that
+    is both plentiful AND spread out — the two things that make a line fit mean
+    something — and is defined the same way for both kinds of map.
+    """
+    if am is None:
+        return 0.0
+    return float(max(am.inliers, len(am.anchors))) * (1.0 + am.evidence_span_s)
+
+
 def _try_acoustic_fallback(
     clip_audio: Path,
     clip_duration: float,
@@ -1150,11 +1360,17 @@ def _try_acoustic_fallback(
 ) -> AlignmentMap | None:
     """Acoustic fallback ("Strategy 0") for a clip the transcript couldn't
     align to this recorder: estimate offset/K directly from the waveforms via
-    a coarse GCC-PHAT grid scan. Returns an ``AlignmentMap`` with an empty
-    anchor list on success (so ``clip_pieces`` falls back to one global tempo
-    conform for this clip, regardless of the chosen strategy — there are no
-    text breakpoints to build a piecewise warp from), or ``None`` if even the
-    acoustic scan found no confident match. See PROJECT_ANALYSIS.md §10.2.
+    a GCC-PHAT scan covering the whole recorder. Returns an ``AlignmentMap``
+    with ``provenance="acoustic"`` and an EMPTY anchor list (so ``clip_pieces``
+    falls back to one global tempo conform — there are no text breakpoints to
+    build a piecewise warp from), or ``None`` when the scan found no confident,
+    unambiguous match.
+
+    The empty anchor list is why ``provenance`` exists: code that measured a
+    map's quality by ``len(anchors)`` scored every successful acoustic match as
+    zero and discarded it, so this fallback never actually reached a render.
+    The evidence the scan DID gather (points, inliers, span) rides along on the
+    map instead, and ``matcher.evaluate_alignment`` judges it on those.
 
     ``clip_audio`` is the 16kHz mono WAV already extracted for transcription
     (reused here instead of re-extracting, same as Boundary Flex's cam_audio).
@@ -1170,13 +1386,22 @@ def _try_acoustic_fallback(
             max_lag_s=config.acoustic_max_lag_s,
             min_sharpness=config.acoustic_fallback_min_sharpness,
             gcc_eps=config.gcc_eps,
+            max_k_deviation=config.alignment_max_k_deviation,
+            min_points=config.alignment_min_acoustic_points,
         )
     except (RuntimeError, ValueError, OSError):
         return None
     if result is None:
         return None
-    offset, k = result
-    return AlignmentMap(anchors=[], offset=offset, k=k, residual_ms=0.0)
+    return AlignmentMap(
+        anchors=[],
+        offset=result.offset,
+        k=result.k,
+        residual_ms=0.0,
+        provenance="acoustic",
+        inliers=result.inliers,
+        evidence_span_s=result.span_s,
+    )
 
 
 def run_pipeline(
@@ -1200,12 +1425,29 @@ def run_pipeline(
     PROJECT_ANALYSIS.md §3.5.
     """
 
+    def _check_cancel() -> None:
+        """Raise if the user asked to stop.
+
+        Cancellation used to depend on the progress callback choosing to raise,
+        which meant it only took effect where a callback happened to be
+        installed and only between whole stages. Extraction, the Flex scan,
+        enhancement, self-check and segmentation each ran to completion first,
+        so pressing Cancel could appear to do nothing for many minutes. This is
+        the one check, called on every stage transition and inside every long
+        loop. It cannot interrupt a single in-flight ffmpeg or model
+        invocation — those are bounded by their own timeouts — but it stops
+        the pipeline from starting the next one.
+        """
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Cancelled by user")
+
     def _notify(
         stage: str,
         progress: float = 0.0,
         message: str = "",
         clips: list[dict[str, Any]] | None = None,
     ) -> None:
+        _check_cancel()
         if progress_callback is not None:
             progress_callback(
                 PipelineProgress(stage=stage, progress=progress, message=message, clips=clips)
@@ -1216,10 +1458,87 @@ def run_pipeline(
 
     engine: WhisperEngine | None = None
     cleanup_paths: list[Path] = []
-    job_scratch_dirs: list[Path] = []
     warnings: list[str] = []
 
+    # One owner for this run's scratch and one lock over its output namespace.
+    # Runs used to share `audio_synced/`, `.master/` and `enhance_tmp/` under
+    # ffmpeg's `-y`, so a second run pointed at the same folder overwrote the
+    # audio the first run's FCPXML still referenced, and either run's cleanup
+    # deleted files the other was reading. Scratch now lives in a directory
+    # unique to this run (on the output volume — piece WAVs are the size of the
+    # final render, so /tmp is the wrong place for them), and a concurrent run
+    # on the same output is refused with an explanation instead of silently
+    # interleaving. See engine/workspace.py.
+    with output_lock(output_path.parent), RunWorkspace(output_path.parent) as workspace:
+        return _run_pipeline_locked(
+            config=config,
+            video_dir=video_dir,
+            audio_files=audio_files,
+            strategy_id=strategy_id,
+            output_path=output_path,
+            workspace=workspace,
+            warnings=warnings,
+            cleanup_paths=cleanup_paths,
+            engine=engine,
+            notify=_notify,
+            check_cancel=_check_cancel,
+            cancel_event=cancel_event,
+        )
+
+
+def _run_pipeline_locked(  # noqa: C901
+    *,
+    config: WhisperSyncConfig,
+    video_dir: Path,
+    audio_files: list[Path],
+    strategy_id: int,
+    output_path: Path,
+    workspace: RunWorkspace,
+    warnings: list[str],
+    cleanup_paths: list[Path],
+    engine: WhisperEngine | None,
+    notify: Callable[..., None],
+    check_cancel: Callable[[], None],
+    cancel_event: Any,
+) -> SyncResult:
+    """The body of ``run_pipeline``, with the run's workspace and output lock
+    already held. Split out only so the lock/scratch lifetime is expressed by a
+    ``with`` block rather than by a hand-written ``finally`` that has to
+    remember every temporary it created."""
+    _notify = notify
+    _check_cancel = check_cancel
+    job_scratch_dirs: list[Path] = []
+
     try:
+        # --- pre-flight: report unusable optional environments NOW ---
+        # Both of these features run at the very END of the pipeline, so a
+        # missing environment used to surface only after hours of
+        # transcription and rendering ("voice enhancement failed — using
+        # unenhanced audio" as the last line of a 3-hour run). The work is
+        # still worth doing without them, so this warns rather than aborts —
+        # but it warns while the user can still cancel and fix the setup.
+        _repo_root = Path(__file__).resolve().parents[2]
+        if config.voice_enhance != "off":
+            from whispersync.engine import enhance as _enhance
+
+            _reason = _enhance.unavailable_reason(config.voice_enhance, _repo_root)
+            if _reason:
+                _msg = f"{_reason} The run continues; the voice will be left unenhanced."
+                logger.warning(_msg)
+                warnings.append(_msg)
+                _notify("scanning", 0.0, _msg)
+        if config.ambience_track:
+            from whispersync.engine import separation as _separation
+
+            if not _separation.is_available(_repo_root):
+                _msg = (
+                    "Ambience track requested but the separation environment "
+                    "(.sep-venv) is missing — run setup_sep_venv.sh. The run "
+                    "continues without an ambience lane."
+                )
+                logger.warning(_msg)
+                _notify("scanning", 0.0, _msg)
+
         # --- scanning (group clips by camera) ---
         _notify("scanning", 0.0, "Scanning video directory...")
         cameras, scan_warnings = scan_cameras(video_dir, config)
@@ -1232,12 +1551,45 @@ def run_pipeline(
             for clip in cam.clips:
                 video_clips.append(clip)
                 clip_camera.append(ci)
-        cam_names = ", ".join(c.name for c in cameras)
+        camera_list = ", ".join(c.name for c in cameras)
         _notify(
             "scanning",
             1.0,
-            f"Found {len(video_clips)} clip(s) across {len(cameras)} camera(s): {cam_names}",
+            f"Found {len(video_clips)} clip(s) across {len(cameras)} camera(s): {camera_list}",
         )
+
+        # STABLE IDENTITY for every physical input, before anything is named
+        # after it. File stems are not identifiers: /A/take.wav and /B/take.wav
+        # both produced `.master/take_master.wav`, so the second extraction
+        # overwrote the first and BOTH recorders then rendered from one file;
+        # clip.mov and clip.mp4 from one camera collided the same way, as did
+        # two cameras' identically named clips in `transcripts/`. Every
+        # artifact below is named from `sid` — which is unique by construction
+        # — and display names are used only for the UI and the FCPXML.
+        # See engine/sources.py.
+        used_sids: set[str] = set()
+        cam_sources = assign_source_ids(
+            [
+                ("camera", cameras[ci].name if len(cameras) > 1 else "", clip.path)
+                for ci, clip in zip(clip_camera, video_clips, strict=True)
+            ],
+            used_sids,
+        )
+        rec_sources = assign_source_ids([("recorder", "", path) for path in audio_files], used_sids)
+
+        # A path appearing twice is a different failure from a name collision:
+        # the same file would be transcribed, rendered and exported twice under
+        # two identities, doubling the work and the timeline.
+        _seen_inputs: dict[Path, str] = {}
+        for ref in [*cam_sources, *rec_sources]:
+            resolved = ref.path.resolve()
+            previous = _seen_inputs.get(resolved)
+            if previous is not None:
+                raise ValueError(
+                    f"{ref.path} is listed twice (as {previous} and {ref.sid}). "
+                    "Each video clip and recorder file may appear only once."
+                )
+            _seen_inputs[resolved] = ref.sid
 
         # Preliminary layout from filenames so the timeline is populated while
         # transcription runs; real positions replace it after alignment.
@@ -1260,7 +1612,7 @@ def run_pipeline(
             _notify("transcribing_recorder", 0.0, message)
 
         engine = WhisperEngine(config, on_model_loading=_on_model_loading)
-        transcripts_dir = output_path.parent / "transcripts"
+        transcripts_dir = workspace.output_subdir("transcripts")
 
         def _save_tx(transcript: Transcript, stem: str, audio_path: Path) -> None:
             if not config.save_transcripts:
@@ -1277,12 +1629,24 @@ def run_pipeline(
             )
 
         rec_infos = [probe(p, timeout=config.probe_timeout_s) for p in audio_files]
+        for ref, info in zip(rec_sources, rec_infos, strict=True):
+            ref.stream_index = info.audio_stream_index
+        for ref, info in zip(cam_sources, video_infos, strict=True):
+            ref.stream_index = info.audio_stream_index
+
         rec_transcripts = []
         for ri, rp in enumerate(audio_files):
+            _check_cancel()
             _notify("transcribing_recorder", ri / len(audio_files), f"Recorder: {rp.name}")
-            rt = engine.transcribe(rp, lambda p: _notify("transcribing_recorder", p))
+            rt = engine.transcribe(
+                rp,
+                lambda p: _notify("transcribing_recorder", p),
+                stream_index=rec_sources[ri].stream_index,
+            )
             rec_transcripts.append(rt)
-            _save_tx(rt, rp.stem, rp)
+            # Named by source id, not stem: two recorders called take.wav wrote
+            # one another's transcripts under a shared `transcripts/take.json`.
+            _save_tx(rt, rec_sources[ri].sid, rp)
 
         # Inter-word silence midpoints per recorder, for seam-snap-to-silence
         # (clip_pieces nudges piece boundaries away from mid-word cuts).
@@ -1309,6 +1673,7 @@ def run_pipeline(
         clip_transcripts: list[Transcript] = []
         n = len(video_clips)
         for idx, clip in enumerate(video_clips):
+            _check_cancel()
             video_status[idx] = "working"
             # A clip with no audio track (timelapse, silent b-roll) has nothing to
             # transcribe/align — extract_audio_to_wav would raise and abort the
@@ -1338,7 +1703,7 @@ def run_pipeline(
                 f"Transcribing camera clip {idx + 1}/{n}: {clip.path.name}",
                 clips=_video_snapshot(),
             )
-            clip_audio = extract_audio_to_wav(clip.path)
+            clip_audio = extract_audio_to_wav(clip.path, stream_index=cam_sources[idx].stream_index)
             cleanup_paths.append(clip_audio)
 
             # Per-clip progress, not just a stage message: without this the
@@ -1352,11 +1717,20 @@ def run_pipeline(
             def _clip_progress(p: float, idx: int = idx) -> None:
                 _notify("transcribing_camera", (idx + p) / max(n, 1))
 
-            clip_transcript = engine.transcribe(clip_audio, _clip_progress)
+            # The cache is keyed by the ORIGINAL clip (path/size/mtime plus the
+            # chosen stream), not by the throw-away scratch WAV the decode
+            # produced: that scratch file gets a fresh random name and mtime on
+            # every run, so its key never repeated and the expensive
+            # transcription was redone in full each time — while leaving a
+            # single-use cache entry behind. See transcriber._cache_key.
+            clip_transcript = engine.transcribe(
+                clip_audio,
+                _clip_progress,
+                identity=cam_sources[idx].path,
+                stream_index=cam_sources[idx].stream_index,
+            )
             clip_transcripts.append(clip_transcript)
-            cam_name = cameras[clip_camera[idx]].name
-            clip_stem = clip.path.stem if len(cameras) == 1 else f"{cam_name}_{clip.path.stem}"
-            _save_tx(clip_transcript, clip_stem, clip.path)
+            _save_tx(clip_transcript, cam_sources[idx].sid, clip.path)
             row: list[AlignmentMap | None] = []
             for ri, rt in enumerate(rec_transcripts):
                 try:
@@ -1385,43 +1759,63 @@ def run_pipeline(
                     )
             aligns.append(row)
 
-        # --- pick the primary recorder (most total anchors) for placement ---
-        rec_anchor_total = [
-            sum(_anchor_count(aligns[ci][ri]) for ci in range(n)) for ri in range(len(audio_files))
+        # --- ACCEPTANCE GATE: decide once which maps may be used at all ---
+        #
+        # Placement and rendering used to judge maps separately: placement
+        # required `min_anchors`, while `_add_job` rendered from the raw
+        # per-recorder matrix. A map placement had just rejected as unreliable
+        # was therefore still used to cut audio — the clip was laid out by
+        # filename order while its voice came from a fit nobody trusted. And
+        # neither check looked at the clock ratio, the residual or how much of
+        # the clip the evidence covered, so a two-anchor fit with k=10 and a
+        # sub-millisecond residual passed both.
+        #
+        # One gate, applied here, produces `accepted[clip][rec]`; nothing below
+        # reads `aligns` directly.
+        accepted: list[list[AlignmentMap | None]] = []
+        for ci in range(n):
+            gated: list[AlignmentMap | None] = []
+            for ri, am in enumerate(aligns[ci]):
+                verdict = evaluate_alignment(am, video_clips[ci].duration, config)
+                if am is not None and not verdict.accepted:
+                    warnings.append(
+                        f"{video_clips[ci].path.name}: alignment to "
+                        f"{audio_files[ri].name} rejected — {verdict.reason_text}"
+                    )
+                gated.append(am if verdict.accepted else None)
+            accepted.append(gated)
+
+        # --- pick the primary recorder for placement ---
+        # Scored on ACCEPTED maps only, and on evidence rather than raw anchor
+        # count, so a recorder whose every map failed the gate can never be
+        # chosen as the reference for the whole timeline.
+        rec_scores = [
+            sum(_map_evidence(accepted[ci][ri]) for ci in range(n))
+            for ri in range(len(audio_files))
         ]
-        if max(rec_anchor_total, default=0) == 0:
-            raise RuntimeError("No camera clip could be aligned to any recorder audio.")
-        primary = max(range(len(audio_files)), key=lambda ri: rec_anchor_total[ri])
+        if max(rec_scores, default=0.0) <= 0.0:
+            raise RuntimeError(
+                "No camera clip could be aligned to any recorder audio with enough "
+                "confidence to use. Check that the recorder covers the same take as "
+                "the video, and see the warnings above for each clip's reason."
+            )
+        primary = max(range(len(audio_files)), key=lambda ri: rec_scores[ri])
         if len(audio_files) > 1:
             warnings.append(f"Timeline placement uses recorder '{audio_files[primary].name}'")
 
         # --- place clips on the master timeline from primary-recorder timecodes ---
         _notify("aligning", 1.0, "Placing clips on timeline...")
-        primary_aligns_raw = [aligns[ci][primary] for ci in range(n)]
-        # A RANSAC line fit through 2-3 anchors isn't a regression, it's a guess —
-        # placing a clip on it risks putting it at a wildly wrong timeline
-        # position with no warning beyond the later sequence-order check. Gate
-        # placement on min_anchors the same way `align()` already warns about a
-        # thin inlier count; a clip that doesn't clear the bar falls back to the
-        # existing "placed by order" path instead of trusting a weak fit. See
-        # PROJECT_ANALYSIS.md §2.10.
-        primary_aligns: list[AlignmentMap | None] = []
-        for i, am in enumerate(primary_aligns_raw):
-            if am is not None and len(am.anchors) < config.min_anchors:
-                warnings.append(
-                    f"{video_clips[i].path.name}: only {len(am.anchors)} anchor(s) "
-                    f"(minimum {config.min_anchors}) — placement is unreliable, "
-                    "falling back to filename order"
-                )
-                primary_aligns.append(None)
-            else:
-                primary_aligns.append(am)
+        primary_aligns = [accepted[ci][primary] for ci in range(n)]
         durations = [c.duration for c in video_clips]
-        offsets, unaligned = compute_master_offsets(primary_aligns, durations)
+        offsets, unaligned = compute_master_offsets(primary_aligns, durations, clip_camera)
         for clip, off in zip(video_clips, offsets, strict=True):
             clip.offset = off
         for i in unaligned:
-            warnings.append(f"{video_clips[i].path.name}: placed by order (no primary anchors)")
+            warnings.append(
+                f"{video_clips[i].path.name}: UNRESOLVED — no accepted alignment to the "
+                "primary recorder; placed after the previous clip of its own camera. "
+                "Its position on the timeline is a guess, not a measurement."
+            )
 
         aligned_primary = [primary_aligns[i] is not None for i in range(n)]
         for i in range(n):
@@ -1429,10 +1823,10 @@ def run_pipeline(
         warnings.extend(sequence_order_warnings(video_clips, clip_camera, aligned_primary))
 
         # --- choose which camera the synced audio is derived from ---
-        anchors_per_cam: dict[int, int] = {}
-        for ci, row in zip(clip_camera, aligns, strict=True):
-            best_in_row = max((_anchor_count(a) for a in row), default=0)
-            anchors_per_cam[ci] = anchors_per_cam.get(ci, 0) + best_in_row
+        anchors_per_cam: dict[int, float] = {}
+        for ci, row in zip(clip_camera, accepted, strict=True):
+            best_in_row = max((_map_evidence(a) for a in row), default=0.0)
+            anchors_per_cam[ci] = anchors_per_cam.get(ci, 0.0) + best_in_row
         if config.audio_source_camera:
             audio_ci = next(
                 (i for i, c in enumerate(cameras) if c.name == config.audio_source_camera),
@@ -1466,8 +1860,7 @@ def run_pipeline(
         # position and silence filling the gaps — so the FCPXML carries ~2 clips
         # per video instead of thousands of segment clips.
         _notify("planning", 0.0, "Planning sync strategy...")
-        audio_synced_dir = output_path.parent / "audio_synced"
-        audio_synced_dir.mkdir(parents=True, exist_ok=True)
+        audio_synced_dir = workspace.output_subdir("audio_synced")
 
         out_sr: int
         if config.timebase_source == "recorder" and rec_infos[primary].audio_sample_rate:
@@ -1484,9 +1877,13 @@ def run_pipeline(
         # and a stereo Zoom); pieces cut from recorder ``ri`` always use that
         # recorder's own format so nothing is upmixed/downmixed along the way.
         out_channels_by_rec = [max(1, info.audio_channels or 1) for info in rec_infos]
-        out_codec_by_rec = [
-            pcm_codec_for_bit_depth(info.audio_bits_per_sample) for info in rec_infos
-        ]
+        # Codec follows the source's SAMPLE FORMAT as well as its depth. A
+        # 32-bit float recorder — whose entire point is that samples above
+        # ±1.0 stay recoverable — was conformed to pcm_s32le purely because it
+        # was "32-bit", and ffmpeg hard-clips at full scale on the way in:
+        # [0, 0.5, 1, 1.5, 2, -1.5] came back as [0, 0.5, 1, 1, 1, -1]. Those
+        # peaks are gone for good; no later gain reduction brings them back.
+        out_codec_by_rec = [pcm_codec_for(info) for info in rec_infos]
 
         # Normalize each recorder to a lossless PCM master at the render's target
         # sample rate once, up front. Cutting pieces directly from a lossy source
@@ -1495,16 +1892,26 @@ def run_pipeline(
         # artifacts; cutting from an already-uncompressed, already-resampled
         # master fixes both and makes every piece/lead-silence/concat operate on
         # identical PCM (concat demuxer requires matching stream parameters).
-        master_dir = output_path.parent / "audio_synced" / ".master"
-        master_dir.mkdir(parents=True, exist_ok=True)
+        # Masters are an INTERMEDIATE, not an output: they live in this run's
+        # private scratch, named by source id. The shared `audio_synced/.master`
+        # directory with stem-derived names collided two ways at once — two
+        # recorders called take.wav produced one file (so both "recorders"
+        # rendered from whichever was extracted last), and a concurrent run
+        # rewrote the master a running render was still cutting pieces from.
+        master_dir = workspace.scratch_dir("master")
         rec_master_paths: list[Path] = []
         for ri, rp in enumerate(audio_files):
-            master_path = master_dir / f"{rp.stem}_master.wav"
+            _check_cancel()
+            master_path = master_dir / rec_sources[ri].artifact_name("master.wav")
             extract_audio_master(
-                rp, master_path, out_sr, out_channels_by_rec[ri], out_codec_by_rec[ri]
+                rp,
+                master_path,
+                out_sr,
+                out_channels_by_rec[ri],
+                out_codec_by_rec[ri],
+                stream_index=rec_sources[ri].stream_index,
             )
             rec_master_paths.append(master_path)
-            cleanup_paths.append(master_path)
 
         audio_clips: list[MediaClip] = []
         audio_speed: list[float] = []
@@ -1540,13 +1947,28 @@ def run_pipeline(
             )
             if not pieces:
                 return
+            # A dropped head is forced by the geometry, but it is not
+            # necessarily silence — Whisper misses quiet or overlapping speech,
+            # so say what was left out instead of letting the user find a
+            # missing opening phrase in the edit.
+            k_map = am.k or 1.0
+            rec_start = min(max((0.0 - am.offset) / k_map, 0.0), rec_infos[ri].duration)
+            dropped = head_trim_seconds(pieces, rec_start)
+            if dropped > HEAD_TRIM_WARN_S:
+                warnings.append(
+                    f"{vclip.path.name}: {dropped:.1f}s of recorder audio before the first "
+                    "recognised sentence could not fit and was left out. It is assumed to "
+                    "be room tone; if the take opens with quiet or overlapping speech, "
+                    "check the start of this clip."
+                )
             label = f"Audio: {audio_files[ri].stem}" if config.recorder_mode == "all" else "Audio"
-            # Friendly name tied to the camera clip (e.g. "DJI_0830_voice"); with
-            # several recorders, disambiguate by recorder stem. Role = Dialogue so
-            # FCPX colours/groups the synced voice as dialogue.
-            voice_name = f"{vclip.path.stem}_voice"
+            # Rendered-file name comes from the SOURCE IDS, which are unique by
+            # construction; two cameras' identically named clips used to render
+            # to the same "clip_voice.wav" and one overwrote the other. Role =
+            # Dialogue so FCPX colours/groups the synced voice as dialogue.
+            voice_name = f"{cam_sources[ci].sid}_voice"
             if config.recorder_mode == "all":
-                voice_name = f"{vclip.path.stem}_{audio_files[ri].stem}_voice"
+                voice_name = f"{cam_sources[ci].sid}_{rec_sources[ri].sid}_voice"
             retake_groups = _retake_groups_for_clip(
                 am, vclip.duration, rec_infos[ri].duration, rec_transcripts[ri].words, config
             )
@@ -1566,10 +1988,17 @@ def run_pipeline(
                     display_name=voice_name,
                     role="Dialogue",
                     retake_groups=retake_groups or None,
+                    # The explicit link verification needs: this voice covers
+                    # [0, duration) of THIS camera clip. No name matching.
+                    source_ref=(vclip.path, 0.0, vclip.duration),
                 )
             )
             audio_speed.append(1.0 / am.k if am.k else 1.0)
             audio_track.append(label)
+            # This clip's dialogue is now supplied by the recorder, so its own
+            # microphone must be muted in the export — otherwise the timeline
+            # plays two copies of the same voice tens of milliseconds apart.
+            vclip.source_audio_enabled = False
 
             # Camera clip audio is only needed for Boundary Flex; extract once here.
             cam_audio: Path | None = None
@@ -1611,7 +2040,7 @@ def run_pipeline(
             if clip_camera[ci] != audio_ci:
                 continue
             vclip = video_clips[ci]
-            row = aligns[ci]
+            row = accepted[ci]  # gated maps only — never the raw matrix
             if config.recorder_mode == "all":
                 for ri, am in enumerate(row):
                     if am is not None:
@@ -1619,8 +2048,14 @@ def run_pipeline(
             else:  # "best": one lane, strongest recorder per clip
                 candidates = [(ri, am) for ri, am in enumerate(row) if am is not None]
                 if candidates:
-                    best_ri, best_am = max(candidates, key=lambda t: len(t[1].anchors))
+                    best_ri, best_am = max(candidates, key=lambda t: _map_evidence(t[1]))
                     _add_job(vclip, best_am, best_ri, lane=-1, ci=ci)
+
+        # Clips with no replacement dialogue keep their own sound: muting them
+        # would hand the editor silent footage with no way back.
+        for vclip in video_clips:
+            if vclip.source_audio_enabled is None:
+                vclip.source_audio_enabled = True
 
         audio_status = ["pending"] * len(audio_clips)
 
@@ -1676,10 +2111,19 @@ def run_pipeline(
         # leftovers are force-cleaned in the outer `finally`.
         flex_frac = 0.3 if config.boundary_flex else 0.0
         prepared: list[tuple[Any, list[tuple[float, float, float]], Path]] = []
-        for j, job in enumerate(render_jobs):
-            if cancel_event is not None and cancel_event.is_set():
-                raise InterruptedError("Cancelled by user")
-            tdp = Path(tempfile.mkdtemp(prefix="whispersync_seg_", dir=audio_synced_dir))
+        # One decoded analysis array per RECORDER, reused by every job that
+        # reads it. Each job used to decode the whole recorder again — ~230 MB
+        # per hour at 16 kHz mono float32, plus the ffmpeg pass to produce it,
+        # multiplied by the number of clips. Jobs are processed in recorder
+        # order below so at most one such array is alive at a time; caching
+        # them all would trade the repeated I/O for unbounded memory.
+        rec_tracks: dict[int, Any] = {}
+        flex_order = sorted(range(len(render_jobs)), key=lambda i: render_jobs[i].recorder_idx)
+        prepared_by_index: dict[int, tuple[Any, list[tuple[float, float, float]], Path]] = {}
+        for step, j in enumerate(flex_order):
+            job = render_jobs[j]
+            _check_cancel()
+            tdp = workspace.temp_dir("seg")
             job_scratch_dirs.append(tdp)
             pieces = job.pieces
             # Boundary Flex: acoustically nudge each piece's recorder start so
@@ -1687,9 +2131,14 @@ def run_pipeline(
             if config.boundary_flex and job.cam_audio is not None:
                 _notify(
                     "processing",
-                    flex_frac * j / n_jobs,
-                    f"Boundary Flex {j + 1}/{n_jobs}",
+                    flex_frac * step / n_jobs,
+                    f"Boundary Flex {step + 1}/{n_jobs}",
                 )
+                if job.recorder_idx not in rec_tracks:
+                    rec_tracks.clear()  # only the current recorder stays resident
+                    from whispersync.engine.acoustic import load_mono16k_track
+
+                    rec_tracks[job.recorder_idx] = load_mono16k_track(job.rec_path)
                 job.lead, pieces = refine_piece_boundaries(
                     pieces,
                     job.lead,
@@ -1700,8 +2149,19 @@ def run_pipeline(
                     config,
                     tmp_dir=tdp,
                     workers=workers,
+                    rec_track=rec_tracks[job.recorder_idx],
                 )
-            prepared.append((job, pieces, tdp))
+            problems = validate_pieces(job.lead, pieces, job.duration, job.rec_duration)
+            if problems:
+                # A plan that does not tile the clip cannot land speech where it
+                # says it will, so say so rather than rendering it silently.
+                warnings.append(
+                    f"{audio_clips[job.clip_idx].display_name}: render plan problem — "
+                    f"{'; '.join(problems)}"
+                )
+            prepared_by_index[j] = (job, pieces, tdp)
+        rec_tracks.clear()
+        prepared = [prepared_by_index[j] for j in range(len(render_jobs))]
 
         # Phase 2 — render the pieces of EVERY job through ONE shared process
         # pool, then assemble jobs in order as their pieces complete (ffmpeg
@@ -1762,20 +2222,29 @@ def run_pipeline(
                 # media file matches its timeline clip; fall back to an index.
                 voice_name = audio_clips[clip_idx].display_name or f"synced_{clip_idx:03d}"
                 out = audio_synced_dir / f"{voice_name}.wav"
-                # Pause-ducking (if enabled) is folded into this same assembly pass
-                # instead of a second full decode/encode over an intermediate file.
-                assemble_continuous(
-                    seg_paths,
-                    job.lead,
-                    job.duration,
-                    out_sr,
-                    out,
-                    channels=job.channels,
-                    codec=job.codec,
-                    duck_pauses=job.pauses if config.pause_duck_enabled else None,
-                    duck_db=config.pause_duck_db,
-                    duck_fade_ms=config.pause_duck_fade_ms,
-                )
+                # Assembled to a temporary beside the destination and moved into
+                # place only once complete. Writing straight to `out` under
+                # ffmpeg's `-y` meant a failure or cancellation mid-assembly
+                # left a TRUNCATED file exactly where a previous run's good
+                # render had been — the old project's FCPXML then pointed at
+                # audio that had been silently replaced by a fragment.
+                #
+                # Pause-ducking (if enabled) is folded into this same assembly
+                # pass instead of a second full decode/encode over an
+                # intermediate file.
+                with published(out) as staged_voice:
+                    assemble_continuous(
+                        seg_paths,
+                        job.lead,
+                        job.duration,
+                        out_sr,
+                        staged_voice,
+                        channels=job.channels,
+                        codec=job.codec,
+                        duck_pauses=job.pauses if config.pause_duck_enabled else None,
+                        duck_db=config.pause_duck_db,
+                        duck_fade_ms=config.pause_duck_fade_ms,
+                    )
                 shutil.rmtree(tdp, ignore_errors=True)
                 audio_clips[clip_idx].path = out
                 audio_clips[clip_idx].in_point = 0.0
@@ -1787,10 +2256,18 @@ def run_pipeline(
                     clips=_timeline_snapshot(),
                 )
         except BaseException:
-            # Don't linger on cancellation/failure: drop queued pieces and let
-            # already-running ffmpeg workers die with the executor.
+            # Drop QUEUED pieces, then WAIT for the ones already running.
+            #
+            # `shutdown(wait=False)` returns while worker processes are still
+            # executing their current task: the `finally` below then deleted
+            # the scratch directories and recorder masters those very ffmpeg
+            # processes were reading and writing, and the run returned while
+            # its children were still alive — free to interleave with the next
+            # run. Waiting costs at most one piece's render (each ffmpeg call
+            # is bounded by its own timeout) and is what makes "cancelled"
+            # actually mean stopped.
             if pool is not None:
-                pool.shutdown(wait=False, cancel_futures=True)
+                pool.shutdown(wait=True, cancel_futures=True)
             raise
         else:
             if pool is not None:
@@ -1804,11 +2281,12 @@ def run_pipeline(
         # a backend failure is reported as a warning and the unenhanced
         # monolith is kept, never a hard failure — see engine/enhance.py. ---
         if config.voice_enhance != "off" and audio_clips:
+            _check_cancel()
             _notify("processing", 1.0, f"Enhancing voice ({config.voice_enhance})...")
             from whispersync.engine import enhance
 
             repo_root = Path(__file__).resolve().parents[2]
-            enhance_dir = output_path.parent / "enhance_tmp"
+            enhance_dir = workspace.temp_dir("enhance")
             try:
                 enhanced = enhance.run_batch(
                     config.voice_enhance,
@@ -1816,10 +2294,21 @@ def run_pipeline(
                     enhance_dir,
                     repo_root,
                 )
+                not_enhanced: list[str] = []
                 for aclip in audio_clips:
                     out_path = enhanced.get(aclip.path)
                     if out_path is not None:
                         os.replace(out_path, aclip.path)
+                    else:
+                        not_enhanced.append(aclip.path.name)
+                if not_enhanced:
+                    warnings.append(
+                        f"Voice enhancement ({config.voice_enhance}) produced no output "
+                        f"for {len(not_enhanced)} of {len(audio_clips)} clip(s) "
+                        f"({', '.join(not_enhanced[:5])}"
+                        f"{', …' if len(not_enhanced) > 5 else ''}) — those keep "
+                        "their unenhanced audio."
+                    )
             except (RuntimeError, OSError) as e:
                 warnings.append(
                     f"Voice enhancement ({config.voice_enhance}) failed ({e}) — "
@@ -1850,6 +2339,7 @@ def run_pipeline(
             check_engine = WhisperEngine(check_config)
             try:
                 for j, job in enumerate(render_jobs):
+                    _check_cancel()
                     aclip = audio_clips[job.clip_idx]
                     _notify(
                         "processing",
@@ -1858,15 +2348,22 @@ def run_pipeline(
                     )
                     cam_words = clip_transcripts[job.video_clip_idx].words
                     rendered_transcript = check_engine.transcribe(aclip.path)
-                    spans = check_rendered_clip(rendered_transcript.words, cam_words, config)
+                    outcome = check_rendered_clip(
+                        rendered_transcript.words, cam_words, config, aclip.duration
+                    )
+                    if outcome.status == "inconclusive":
+                        # "Could not be checked" is not "checked and fine".
+                        warnings.append(
+                            f"{aclip.path.name}: self-check INCONCLUSIVE — {outcome.detail}"
+                        )
+                        continue
+                    spans = outcome.spans
 
                     if spans and config.self_check_mode == "repair":
                         rec_words = rec_transcripts[job.recorder_idx].words
                         repaired_path = aclip.path
                         fixed_any = False
-                        repair_tmp = Path(
-                            tempfile.mkdtemp(prefix="whispersync_repair_", dir=audio_synced_dir)
-                        )
+                        repair_tmp = workspace.temp_dir("repair")
                         job_scratch_dirs.append(repair_tmp)
                         for span in spans:
                             candidate = _repair_span(
@@ -1886,15 +2383,15 @@ def run_pipeline(
                         if fixed_any:
                             # Replace the original monolith IN PLACE: the
                             # repaired file currently lives in repair_tmp — a
-                            # scratch dir deleted in the outer `finally` — so
-                            # leaving aclip.path pointing there would hand the
-                            # FCPXML a path that no longer exists by the time
-                            # the user opens it.
+                            # scratch dir deleted when the run's workspace is
+                            # cleaned up — so leaving aclip.path pointing there
+                            # would hand the FCPXML a path that no longer
+                            # exists by the time the user opens it.
                             os.replace(repaired_path, aclip.path)
                             rendered_transcript = check_engine.transcribe(aclip.path)
                             spans = check_rendered_clip(
-                                rendered_transcript.words, cam_words, config
-                            )
+                                rendered_transcript.words, cam_words, config, aclip.duration
+                            ).spans
 
                     for span in spans:
                         status = (
@@ -1921,6 +2418,7 @@ def run_pipeline(
             new_track: list[str] = []
             new_status: list[str] = []
             for ci_a, aclip in enumerate(audio_clips):
+                _check_cancel()
                 cuts = (
                     _quiet_cut_points(aclip.path, aclip.duration, seg_s)
                     if aclip.path.suffix.lower() == ".wav"
@@ -1936,10 +2434,12 @@ def run_pipeline(
                 base = aclip.path.with_suffix("")
                 # Same PCM codec as the rendered voice itself — a PCM->same-PCM
                 # cut is byte-identical, so the segments concatenate back into
-                # the monolith exactly.
-                voice_codec = pcm_codec_for_bit_depth(
-                    probe(aclip.path, timeout=config.probe_timeout_s).audio_bits_per_sample
-                )
+                # the monolith exactly. `pcm_codec_for` (not the bit-depth-only
+                # helper) because the SAMPLE FORMAT decides it: a float voice
+                # monolith matched on depth alone would be cut to pcm_s32le,
+                # hard-clipping every sample above full scale — the same loss
+                # the render path avoids, reintroduced at the very last step.
+                voice_codec = pcm_codec_for(probe(aclip.path, timeout=config.probe_timeout_s))
                 for si in range(len(bounds) - 1):
                     a, b = bounds[si], bounds[si + 1]
                     part = Path(f"{base}_p{si + 1:02d}.wav")
@@ -1956,6 +2456,19 @@ def run_pipeline(
                             display_name=f"{aclip.display_name or aclip.path.stem}_p{si + 1:02d}",
                             role=aclip.role,
                             retake_groups=seg_retakes or None,
+                            # Narrow the source link to THIS segment's own
+                            # stretch of the clip: a segment covering minutes
+                            # 5-10 must be verified against minutes 5-10 of the
+                            # video, not against its opening seconds.
+                            source_ref=(
+                                (
+                                    aclip.source_ref[0],
+                                    aclip.source_ref[1] + a,
+                                    b - a,
+                                )
+                                if aclip.source_ref
+                                else None
+                            ),
                         )
                     )
                     new_speed.append(audio_speed[ci_a])
@@ -1991,7 +2504,19 @@ def run_pipeline(
                 ambience_dir = output_path.parent / "ambience"
                 model_dir = repo_root / "models" / "separator"
                 ambient_lane = min((c.lane for c in audio_clips), default=-1) - 1
-                src_clips = [video_clips[ci] for ci in range(n) if clip_camera[ci] == audio_ci]
+                # Only clips that actually HAVE an audio stream. The earlier
+                # stages skip silent b-roll, but ambience re-collected every
+                # clip of the camera — so one silent timelapse in a 70-clip
+                # shoot raised out of `extract_audio_to_wav` (which sits
+                # OUTSIDE the batch try/except) and threw away the entire
+                # export after hours of rendering, for an optional lane that is
+                # on by default.
+                amb_indices = [
+                    ci
+                    for ci in range(n)
+                    if clip_camera[ci] == audio_ci and video_infos[ci].audio_codec is not None
+                ]
+                src_clips = [video_clips[ci] for ci in amb_indices]
 
                 # Extract every clip's camera audio first, then run the
                 # separator ONCE over the whole batch — audio-separator loads
@@ -1999,16 +2524,58 @@ def run_pipeline(
                 # per clip (the previous behaviour) reloaded the model from
                 # scratch for every camera clip in a multi-clip shoot. See
                 # PROJECT_ANALYSIS.md §6.3.
+                #
+                # The extracted audio is named after its CLIP, not left as an
+                # anonymous tempfile: the separator derives its output name
+                # from the input's, so "DJI_0762.wav" lands as
+                # "DJI_0762_(Instrumental)_<model>.wav". Anything left behind
+                # by an interrupted or partially failed run is then still
+                # identifiable — a field run that failed at this step left 70
+                # files called "tmp0plj448a_(Instrumental)_....wav", which no
+                # editor could match back to a clip.
+                amb_work = workspace.temp_dir("ambience_src")
+                job_scratch_dirs.append(amb_work)
                 cam_wavs: list[Path] = []
-                for k, vclip in enumerate(src_clips):
+                amb_clip_indices: list[int] = []
+                amb_names: list[str] = []
+                extract_failures: list[str] = []
+                for k, (ci_amb, vclip) in enumerate(zip(amb_indices, src_clips, strict=True)):
+                    _check_cancel()
                     _notify(
                         "processing",
                         k / max(len(src_clips), 1),
                         f"Extracting camera audio {k + 1}/{len(src_clips)}: {vclip.path.name}",
                     )
-                    cam_wav = extract_audio_to_wav(vclip.path, sample_rate=out_sr, mono=False)
-                    cleanup_paths.append(cam_wav)
+                    # Source ids are unique already — no ad-hoc de-duplication
+                    # needed, and no chance of two cameras' same-named clips
+                    # overwriting one another's ambience.
+                    name = cam_sources[ci_amb].sid
+                    try:
+                        cam_wav = extract_audio_to_wav(
+                            vclip.path,
+                            amb_work / f"{name}.wav",
+                            sample_rate=out_sr,
+                            mono=False,
+                            stream_index=cam_sources[ci_amb].stream_index,
+                        )
+                    except (RuntimeError, OSError) as e:
+                        # One clip that will not decode costs its own ambience
+                        # lane, not the finished project.
+                        logger.warning("Ambience: could not extract %s (%s)", vclip.path.name, e)
+                        extract_failures.append(vclip.path.name)
+                        continue
                     cam_wavs.append(cam_wav)
+                    amb_names.append(name)
+                    amb_clip_indices.append(ci_amb)
+                if extract_failures:
+                    warnings.append(
+                        f"Ambience: could not extract camera audio for "
+                        f"{len(extract_failures)} clip(s) "
+                        f"({', '.join(extract_failures[:5])}"
+                        f"{', …' if len(extract_failures) > 5 else ''}) — no ambience "
+                        "lane for those."
+                    )
+                src_clips = [video_clips[ci] for ci in amb_clip_indices]
 
                 _notify("processing", 0.0, f"Separating ambience for {len(cam_wavs)} clip(s)...")
                 amb_clips: list[MediaClip] = []
@@ -2024,13 +2591,19 @@ def run_pipeline(
                     warnings.append(f"Ambience batch separation failed ({e}) — skipped.")
                     amb_by_input = {}
 
-                for vclip, cam_wav in zip(src_clips, cam_wavs, strict=True):
+                skipped_clips: list[str] = []
+                for vclip, cam_wav, cam_name in zip(src_clips, cam_wavs, amb_names, strict=True):
                     amb = amb_by_input.get(cam_wav)
                     if amb is None:
+                        # One clip the separator couldn't handle no longer costs
+                        # the whole shoot its ambience — name it and move on.
+                        skipped_clips.append(vclip.path.name)
                         continue
                     # Rename the separator's "…_(Instrumental)_<model>.wav" to a clean
-                    # clip-matched name ("DJI_0832_ambience.wav").
-                    amb_final = ambience_dir / f"{vclip.path.stem}_ambience.wav"
+                    # clip-matched name ("DJI_0832_ambience.wav"). cam_name (not the
+                    # raw stem) keeps two cameras' same-named clips apart — otherwise
+                    # one would overwrite the other's ambience.
+                    amb_final = ambience_dir / f"{cam_name}_ambience.wav"
                     with contextlib.suppress(OSError):
                         amb.replace(amb_final)
                         amb = amb_final
@@ -2042,12 +2615,35 @@ def run_pipeline(
                             in_point=0.0,
                             duration=vclip.duration,
                             lane=ambient_lane,
-                            display_name=f"{vclip.path.stem}_ambience",
+                            display_name=f"{cam_name}_ambience",
                             role="Effects",
                         )
                     )
+                if skipped_clips and amb_by_input:
+                    warnings.append(
+                        f"Ambience separation produced no output for "
+                        f"{len(skipped_clips)} of {len(src_clips)} clip(s) "
+                        f"({', '.join(skipped_clips[:5])}"
+                        f"{', …' if len(skipped_clips) > 5 else ''}) — those clips have "
+                        "no ambience lane; see the log for each one's reason."
+                    )
                 plan.clips.extend(amb_clips)
                 plan.total_duration = _timeline_end(plan.clips)
+
+        # Every clip is in the plan by now (voice, segments, ambience), so this
+        # is the one place a whole-plan origin shift can be applied
+        # consistently — before EITHER serializer reads an offset. Doing it
+        # here rather than inside each of them is what makes a negative
+        # lip-sync calibration actually take effect instead of being clamped
+        # away twice, differently.
+        origin_shift = normalize_plan_origin(plan.clips)
+        if origin_shift > 0:
+            plan.total_duration = _timeline_end(plan.clips)
+            warnings.append(
+                f"Timeline shifted {origin_shift * 1000:.0f} ms later so the "
+                f"{-origin_shift * 1000:.0f} ms lip-sync calibration fits before "
+                "time zero; relative sync is unchanged."
+            )
 
         # --- optional master WAV (single file spanning the whole timeline, for
         # users without an NLE) ---
@@ -2063,41 +2659,59 @@ def run_pipeline(
                 # PCM render at out_sr, so this mix never re-touches bit depth.
                 master_channels = out_channels_by_rec[primary]
                 master_codec = out_codec_by_rec[primary]
-                mix_clips_on_timeline(
-                    [(c.path, c.offset) for c in audio_timeline_clips],
-                    plan.total_duration,
-                    out_sr,
-                    master_wav_path,
-                    channels=master_channels,
-                    codec=master_codec,
-                )
+                # Rendered to a temporary beside the destination and moved into
+                # place only once complete: a crash or a full disk mid-mix used
+                # to leave a truncated master standing where the previous run's
+                # good one had been.
+                with published(master_wav_path) as tmp_master:
+                    mix_clips_on_timeline(
+                        [(c.path, c.offset) for c in audio_timeline_clips],
+                        plan.total_duration,
+                        out_sr,
+                        tmp_master,
+                        channels=master_channels,
+                        codec=master_codec,
+                    )
             else:
                 warnings.append("render_master_wav requested but no synced audio clips to mix")
 
         # --- export ---
         _notify("exporting", 0.0, "Generating FCPXML...")
+        # The FCPXML is the run's deliverable and is published LAST, atomically,
+        # after every asset it references exists: a reader either sees the
+        # previous project or this one, never a document pointing at audio that
+        # is still being written. Validation runs on the staged file, so a
+        # broken document never replaces a working one.
+        staged_fcpxml = workspace.scratch_dir("export") / output_path.name
         generate_fcpxml(
             plan,
             video_infos,
-            output_path,
+            staged_fcpxml,
             config.fcpxml_version,
             output_path.stem,
             audio_sample_rate=out_sr,  # matches the rendered synced WAVs
         )
-        # Safety net: catch a broken export (e.g. a DTD-invalid attribute) here,
-        # with a clear warning, instead of the user only finding out when Final
-        # Cut's import dialog rejects the whole file.
-        if not validate_fcpxml(output_path):
+        export_problems = check_fcpxml(staged_fcpxml, check_media=True)
+        if export_problems:
             warnings.append(
-                "Generated FCPXML failed internal validation — Final Cut Pro may "
-                "refuse to import it. Please report this as a bug."
+                "Generated FCPXML failed validation — Final Cut Pro may refuse to "
+                f"import it: {'; '.join(export_problems[:5])}"
+                f"{f' (+{len(export_problems) - 5} more)' if len(export_problems) > 5 else ''}"
             )
+        with published(output_path) as tmp_xml:
+            shutil.copy2(staged_fcpxml, tmp_xml)
 
         # --- collect quality warnings from the best alignment overall ---
-        all_aligned = [a for row in aligns for a in row if a is not None]
-        best = max(all_aligned, key=lambda a: len(a.anchors))
-        if best.residual_ms > 40:
-            warnings.append(f"High residual alignment error: {best.residual_ms:.1f} ms")
+        # Quality warnings must describe maps that were actually USED. Reading
+        # the raw matrix reported on maps the gate had already rejected — and,
+        # worse, could pick a rejected map as "best" and report its residual as
+        # the run's headline number.
+        all_used = [a for row in accepted for a in row if a is not None]
+        best = max(all_used, key=_map_evidence)
+        for am in all_used:
+            if am.provenance == "text" and am.residual_ms > 40:
+                warnings.append(f"High residual alignment error: {am.residual_ms:.1f} ms")
+                break
 
         # Auto-strategy advice: tell the user if the drift characteristics
         # suggest a different strategy than the one actually used, so they
@@ -2111,7 +2725,7 @@ def run_pipeline(
             )
 
         # count the best recorder per clip for a representative anchor total
-        anchors_used = sum(max((_anchor_count(a) for a in row), default=0) for row in aligns)
+        anchors_used = sum(max((_anchor_count(a) for a in row), default=0) for row in accepted)
 
         _notify("done", 1.0, "Pipeline complete")
         return SyncResult(
@@ -2132,8 +2746,11 @@ def run_pipeline(
     finally:
         if engine is not None:
             engine.unload()
-        for p in cleanup_paths:
+        # Only files THIS run created, and only after the render pool has been
+        # fully shut down above. The run's own scratch tree is removed by the
+        # workspace context manager in run_pipeline.
+        for tmp in cleanup_paths:
             with contextlib.suppress(OSError):
-                os.unlink(p)
+                os.unlink(tmp)
         for d in job_scratch_dirs:
             shutil.rmtree(d, ignore_errors=True)

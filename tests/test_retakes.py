@@ -116,3 +116,51 @@ def test_real_recorder_transcript_finds_known_retakes() -> None:
     # first group's repeated material starts at "кто", not the "а ты" preamble
     assert groups[0].takes[0].text.startswith("кто")
     assert "предмета" in groups[1].keeper.text
+
+
+def test_three_identical_takes_form_one_group_of_three() -> None:
+    """All attempts belong to the group, and the LAST one is kept.
+
+    With the same phrase at 0 s, 3 s and 6 s, extending the 3->6 match
+    backwards found that the tokens before 3 s matched too — they are the same
+    phrase, at 0 s — and walked the span into the first attempt. The two
+    occurrences then overlapped, their gap came out negative, the third attempt
+    was rejected as implausible, and the group stopped at two with the MIDDLE
+    take kept as the keeper.
+    """
+    phrase = ["кто", "ещё", "учится", "в", "школе"]
+    words: list[Word] = []
+    for attempt_start in (0.0, 3.0, 6.0):
+        for i, text in enumerate(phrase):
+            t = attempt_start + i * 0.2
+            words.append(Word(text=text, start=t, end=t + 0.15, probability=0.9))
+
+    cfg = WhisperSyncConfig(detect_retakes=True, retake_min_words=4, retake_max_gap_s=6.0)
+    groups = detect_retakes(words, cfg)
+
+    assert len(groups) == 1
+    group = groups[0]
+    assert len(group.takes) == 3, [t.text for t in group.takes]
+    # The keeper is the final attempt — the version the speaker completed.
+    assert group.keeper is group.takes[-1]
+    assert group.keeper.start >= 6.0 - 1e-6
+
+
+def test_retake_takes_never_overlap() -> None:
+    """Overlapping takes are one span counted twice, not two attempts."""
+    phrase = ["раз", "два", "три", "четыре"]
+    words: list[Word] = []
+    for attempt_start in (0.0, 2.5, 5.0, 7.5):
+        for i, text in enumerate(phrase):
+            t = attempt_start + i * 0.2
+            words.append(Word(text=text, start=t, end=t + 0.15, probability=0.9))
+
+    cfg = WhisperSyncConfig(detect_retakes=True, retake_min_words=4, retake_max_gap_s=6.0)
+    groups = detect_retakes(words, cfg)
+    assert groups
+    for group in groups:
+        for earlier, later in zip(group.takes, group.takes[1:], strict=False):
+            assert (
+                earlier.end <= later.start + 1e-9
+            ), f"takes overlap: {earlier.start}-{earlier.end} then {later.start}-{later.end}"
+            assert earlier.end > earlier.start

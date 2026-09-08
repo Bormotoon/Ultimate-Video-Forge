@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from whispersync import __version__
-from whispersync.config import WhisperSyncConfig, load_config
+from whispersync.config import ConfigError, WhisperSyncConfig, load_config
 from whispersync.engine import enhance
 from whispersync.engine.pipeline import PipelineProgress, run_pipeline
 from whispersync.logging_setup import setup_logging
@@ -302,41 +302,54 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _run_verify(result: Any, json_output: bool) -> list[dict[str, Any]]:
-    """Measure realized lag for every (video, synced voice) pair in the sync
-    result, using the same GCC-PHAT harness as tools/verify_sync.py. Video
-    audio is decoded fresh (via ffmpeg) rather than reusing any transcription
-    scratch file, since those are cleaned up by the time rendering finishes.
-    """
-    from tools.verify_sync import measure
+    """Measure realized lag for every rendered voice clip in the sync result.
 
-    video_clips = {c.path.stem: c.path for c in result.plan.clips if c.kind == "video"}
+    Each clip is verified against the SOURCE AND RANGE it was actually made
+    from, taken from ``MediaClip.source_ref``. The previous version matched a
+    voice back to its video with ``display_name.startswith(video_stem)`` over a
+    ``{stem: path}`` dictionary, which went wrong three ways at once: "A1"
+    prefix-matched "A10"; two cameras' identically named clips overwrote each
+    other in the dictionary; and a voice SEGMENT covering minutes 5-10 was
+    compared against the opening seconds of the video, so a five-minute content
+    difference was measured and reported as lip-sync lag.
+    """
+    from whispersync.engine.verify import measure
+
     reports: list[dict[str, Any]] = []
     for clip in result.plan.clips:
         if clip.kind != "audio" or clip.role != "Dialogue":
             continue
-        # "<video_stem>_voice[_<recorder>]" -> match back to its video clip.
-        video_path = next(
-            (p for stem, p in video_clips.items() if (clip.display_name or "").startswith(stem)),
-            None,
-        )
-        if video_path is None:
+        if clip.source_ref is None:
+            _print(
+                f"  verify: {clip.display_name or clip.path.stem}: skipped "
+                "(no recorded source link)",
+                to_stderr=json_output,
+            )
             continue
+        source_path, source_start, source_duration = clip.source_ref
         try:
-            report = measure(video_path, clip.path)
-        except (RuntimeError, ValueError) as e:
+            report = measure(
+                source_path,
+                clip.path,
+                source_start_s=source_start,
+                source_duration_s=source_duration,
+            )
+        except (RuntimeError, ValueError, OSError) as e:
             _print(f"  verify: {clip.path.name}: measurement failed ({e})", to_stderr=json_output)
             continue
         summary = report.summary()
-        reports.append({"clip": clip.display_name or clip.path.stem, **summary})
+        status, reason = report.verdict(median_threshold_ms=20.0)
+        name = clip.display_name or clip.path.stem
+        reports.append({"clip": name, "status": status, "reason": reason, **summary})
         if not json_output:
             median = summary.get("median_abs_lag_ms")
             p90 = summary.get("p90_abs_lag_ms")
-            median_str = f"{median:.1f}" if median is not None else "n/a"
-            p90_str = f"{p90:.1f}" if p90 is not None else "n/a"
+            median_str = f"{float(median):.1f}" if median is not None else "n/a"
+            p90_str = f"{float(p90):.1f}" if p90 is not None else "n/a"
             _print(
-                f"  verify: {clip.display_name or clip.path.stem}: "
-                f"median {median_str} ms, p90 {p90_str} ms "
-                f"({summary['n_confident']}/{summary['n_total']} confident points)"
+                f"  verify: {name}: {status} — median {median_str} ms, p90 {p90_str} ms "
+                f"({summary['n_confident']}/{summary['n_attempted']} usable windows, "
+                f"covering {float(summary['coverage_ratio']):.0%} of the clip)"
             )
     return reports
 
@@ -523,8 +536,13 @@ def main() -> None:
         overrides["use_cache"] = False
 
     try:
-        config = load_config(args.config, **overrides)
-    except FileNotFoundError as exc:
+        config = load_config(args.config, True, **overrides)
+    except (FileNotFoundError, ConfigError) as exc:
+        # A configuration problem is a USAGE error (exit 2), reported as a
+        # short message. It used to reach the user as a traceback from
+        # wherever the bad value first mattered — often after transcription —
+        # or not at all, when a value like `seed_bin_width=0` merely selected a
+        # different, silently wrong code path.
         _print(f"Error: {exc}", to_stderr=args.json_output)
         sys.exit(EXIT_USAGE_ERROR)
 
@@ -545,7 +563,18 @@ def main() -> None:
     # Default the output next to the sources (the video folder), which usually
     # lives on a volume with room — unlike the repo's working directory.
     output_path = args.output or (args.video_dir / "sync_output.fcpxml")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # Creating the output directory sat outside the main try/except, so a
+        # read-only or non-existent destination produced a raw traceback
+        # instead of the same one-line usage error every other bad argument
+        # gets.
+        _print(
+            f"Error: cannot use output folder {output_path.parent}: {exc}",
+            to_stderr=args.json_output,
+        )
+        sys.exit(EXIT_USAGE_ERROR)
 
     _print("WhisperSync — Starting synchronization", to_stderr=args.json_output)
     _print(f"  Video dir:   {args.video_dir}", to_stderr=args.json_output)
