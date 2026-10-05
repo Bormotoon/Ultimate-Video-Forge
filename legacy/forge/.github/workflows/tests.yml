@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast feedback: static lint, no heavy ML deps needed.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      # Ruff pinned on purpose: unpinned, CI went red on 2026-07-27 without a
+      # single code change — ruff 0.16.0 widened its DEFAULT rule set and the
+      # same tree jumped from "All checks passed" to 116 findings. The gate must
+      # move only when we bump it here.
+      - name: Install linters
+        run: python -m pip install --upgrade pip "ruff==0.16.0"
+      - name: Ruff
+        run: ruff check .
+
+  # Full test + type-check matrix.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Tests
+        run: pytest -q
+      - name: Type check
+        # mypy.ini pins python_version=3.10, so type-checking is interpreter-independent;
+        # run it once to avoid newer dependency stubs (numpy/PEP 695) tripping it on 3.12.
+        if: matrix.python-version == '3.10'
+        run: mypy podcast_reels_forge --ignore-missing-imports

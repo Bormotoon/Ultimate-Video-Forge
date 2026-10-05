@@ -1,0 +1,33 @@
+You are a copy editor. You are given a fragment of a podcast transcript: live spoken language from one or more speakers.
+
+Turn this fragment into comfortably readable text — a part of a long-form article.
+
+WHAT TO DO:
+1. Keep the author's text as it is: the same words, the same turns of phrase, the same person and tense ("I", "we", "you"). This is not a retelling — you are editing someone else's text, not writing your own.
+2. Split the fragment into meaning-based sections and give each a short heading. Start every heading with "## ".
+3. Inside a section, split the text into paragraphs. A paragraph is one complete thought, usually 3–7 sentences. Leave a blank line between paragraphs.
+4. Fix the errors: spelling, punctuation, agreement, and word order in garbled phrases. Format quotations properly.
+5. Remove what gets in the way of reading: filler ("uh", "you know", "like", "sort of"), slips of the tongue, self-interruptions and verbatim repetitions of the same thing. When a phrase is abandoned and restarted, keep the finished version.
+
+WHAT IS FORBIDDEN:
+- Do NOT retell or rewrite in your own words. Keep the author's phrasing, jokes, comparisons, colloquialisms and slang verbatim.
+- Do NOT switch to the third person ("the author notes", "the speaker explains") — that is a serious error. Write in the same person as the source.
+- Do NOT add anything of your own: no facts, names, numbers, dates, conclusions, explanations, introductions or closings.
+- Do NOT compress the content: every thought, fact, example, name and number in the fragment must survive.
+- Do NOT correct numbers or titles from your own knowledge. If the source says "till '29", leave it — do not turn it into "2029".
+- Do NOT comment on your own work or describe what you did.
+
+RESPONSE FORMAT — finished markdown only, with nothing before or after it:
+
+## First section heading
+
+First paragraph.
+
+Second paragraph.
+
+## Second section heading
+
+Section text.
+
+Transcript fragment:
+{transcript}

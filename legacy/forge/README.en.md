@@ -1,0 +1,572 @@
+# 🎙️ Podcast Reels Forge
+
+## Automatically create Reels/Shorts from podcasts (local-first)
+
+[![CI](https://github.com/Bormotoon/Podcast-Reels-Forge/actions/workflows/tests.yml/badge.svg)](https://github.com/Bormotoon/Podcast-Reels-Forge/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/github/v/release/Bormotoon/Podcast-Reels-Forge)](https://github.com/Bormotoon/Podcast-Reels-Forge/releases/latest)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![педобраз.рф](https://img.shields.io/badge/%D0%BF%D0%B5%D0%B4%D0%BE%D0%B1%D1%80%D0%B0%D0%B7.%D1%80%D1%84-project_page-D64500)](https://xn--80abidn3bem.xn--p1ai/projects/podcast-reels-forge/)
+[![Donate](https://img.shields.io/badge/%E2%9D%A4-Support%20the%20project-E53935)](https://dalink.to/bormotoon)
+
+**English** | [Русский](README.md)
+
+🌐 **Project page:** [педобраз.рф/projects/podcast-reels-forge](https://xn--80abidn3bem.xn--p1ai/projects/podcast-reels-forge/)
+
+---
+
+## 📌 Table of Contents
+
+- [What it does](#what-it-does)
+- [Key Features](#key-features)
+- [Quick Start](#quick-start)
+- [Working with YouTube](#working-with-youtube)
+- [Run Modes by Task](#run-modes-by-task)
+- [Pipeline Overview](#pipeline-overview)
+- [Output Layout](#output-layout)
+- [Command Line Arguments](#command-line-arguments)
+- [Configuration (config.yaml)](#configuration-configyaml)
+- [Graphical Interface (GUI)](#graphical-interface-gui)
+- [The Frame Follows the Speaker](#the-frame-follows-the-speaker)
+- [Rerendering Videos](#re-render-video-from-existing-momentsjson)
+- [Performance and Stability](#performance-and-stability)
+- [Documentation](#documentation)
+- [Support the Project](#support-the-project)
+- [License](#license)
+
+---
+
+## What it does
+
+**Podcast Reels Forge** is a powerful CLI tool designed to automatically extract viral short-form content (Reels, Shorts, TikTok) from long-form podcasts or interviews. It handles everything from speech recognition to final video editing.
+
+Main workflow steps:
+
+1. **Speech Recognition (faster-whisper)**: Converts audio/video into text with per-word timestamps. Model `large-v3`, with two modes — fast batched and accurate context-aware (see [Run Modes by Task](#run-modes-by-task)). A sentence-split `.srt` is written alongside it — one short cue per screen instead of a three-or-four-sentence wall of text.
+2. **Diarization (Optional)**: Identifies different speakers throughout the audio.
+3. **Transcript Proofreading (LLM)**: gemma4 fixes spelling and punctuation; a guardrail rejects any correction that adds, drops or paraphrases text.
+4. **Episode long-read (LLM)**: gemma4 edits the proofread transcript into a readable article — meaning-based sections with headings and paragraphs. It is not a retelling: the author's words, phrasing and grammatical person are kept, and only filler, slips and repetitions go. Three guardrails catch rewriting, padding and abridging alike. With diarization enabled the text is also split by speaker, with names taken from the conversation itself.
+5. **AI Analysis (LLM)**: A staged `scout → cleanup → judge` flow on a local Gemma, with candidates verified against the transcript: quote matching, phrase-aligned boundaries, audio signals (loudness/pauses/speech rate) and whole-episode context. The clip count scales with runtime (`clips_per_hour`).
+6. **Video Editing (FFmpeg + NVENC)**: Cuts clips at pauses in the speech, frames them 9:16 with a window that follows whoever is talking for the whole clip, and burns in subtitles — 16 ready-made looks, line breaks measured with the real font, timings re-checked by Whisper on every clip. Decoding, face analysis and encoding run on the GPU (NVDEC + torch CUDA + NVENC).
+
+Detailed user guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
+Unattended scheduled runs (nightly channel runs, reports, notifications): [docs/AUTONOMOUS.md](docs/AUTONOMOUS.md)
+
+---
+
+## Key features
+
+- **Batch Processing**: Drop multiple videos into `input/`, and the forge will process them all sequentially.
+- **Two transcription modes**: `fast` (batched, ~5 min per hour of audio) and `quality` (sequential with context, more accurate on quiet/noisy recordings).
+- **Hallucination guard**: Suppresses Whisper repetition loops (endless "Thank you." on silence/music) via a temperature ladder, repetition penalty, and `condition_on_previous_text`.
+- **Role-based llama.cpp pipeline**: Local staged flow through **llama.cpp** with a Gemma 4 lineup: `gemma4`. Model replies are constrained by a JSON grammar, unparseable JSON is re-asked, and one failed chunk doesn't abort the analysis.
+- **Transcript proofreading**: An LLM fixes spelling and punctuation before analysis; a letter-content check guarantees the model added and paraphrased nothing.
+- **Episode article**: A detailed, sectioned retelling (`<stem>.article.md`) that reads far better than a transcript. Passages that fail the faithfulness checks are flagged rather than passed off as verified.
+- **Clips grounded in reality**: Every candidate's quote is checked against what was actually said; clip bounds snap to the start of a phrase and the end of a thought; hallucinated timecodes are dropped.
+- **Audio signals**: Loudness, pause density and speech rate on each candidate's span are measured with ffmpeg and feed the ranking — text heuristics can't hear the episode, these can.
+- **Runtime-scaled clip counts**: `clips_per_hour: 10` — a 1.5-hour episode yields ~15 clips; the per-type counters only set the mix.
+- **The frame follows the speaker**: YuNet finds faces on the GPU, Light-ASD tells who is talking from lips and sound, and Viterbi smoothing keeps a short "uh-huh" from jerking the frame. Two people sitting far apart can be stacked (`two_speaker_layout: split`). See [The Frame Follows the Speaker](#the-frame-follows-the-speaker).
+- **Viral-style subtitles**: 16 ready-made looks (`hormozi`, `mrbeast`, `tiktok`, `karaoke`, `neon`…), word highlight modes, pyramid line breaks that never end on a preposition, censoring, speaker colours. Every clip is recognized again and the subtitles snap to the actual speech.
+- **Clip edges placed by the speech**: starts and ends land on pauses between phrases, not "±5 seconds", and padding never spills into the neighbouring clip.
+- **Hardware Acceleration**: **CUDA** (ctranslate2) for Whisper, torch CUDA for face analysis, **NVDEC/NVENC** for video. The NVENC-capable ffmpeg is auto-detected.
+- **Unattended runs**: a nightly timer, a report on every stage of every episode, exit codes a scheduler can act on, notifications, a single-run lock. One broken episode never stops the queue. See [docs/AUTONOMOUS.md](docs/AUTONOMOUS.md).
+- **Nothing is redone for nothing**: per-stage input fingerprints, an LLM answer cache, and a stage-by-stage queue (Whisper and llama-server load once for the whole queue).
+- **Host settings kept apart**: a gitignored `config.local.yaml` is merged over `config.yaml`, so machine paths and ports never sit as uncommitted edits.
+- **Stall-proof llama.cpp calls**: A total request timeout plus automatic retries; the pipeline rides out even a ten-minute server stall on its own.
+- **Flexible Clip Types**: Configure durations and mix for Stories, Reels, Long Reels, and Highlights separately.
+- **Honest quality measurement**: `evaluate_prompts` computes recall/precision against a hand-labelled golden set (`golden/<episode>.json`).
+- **Browser GUI**: Build `config.yaml` and edit ASS subtitles visually with a bilingual (RU/EN) interface, no server needed — see [Graphical Interface (GUI)](#graphical-interface-gui).
+
+---
+
+## Quick start
+
+### Requirements
+
+- **Python 3.10+**
+- **FFmpeg** (must be in PATH)
+- **llama.cpp (`llama-server`)** (for local LLM support)
+- **NVIDIA GPU with CUDA** — effectively required: Whisper, speaker tracking and encoding all run on it. Without CUDA clips get a centre crop and transcription is very slow. The reference card is a 16 GB RTX 5060 Ti.
+- **yt-dlp** — optional, only to pull material off YouTube: `pip install -U yt-dlp`
+- **pyannote.audio** — optional, for speaker separation (diarization)
+
+### Installation
+
+```bash
+git clone https://github.com/Bormotoon/Podcast-Reels-Forge.git
+cd Podcast-Reels-Forge
+
+python3 -m venv whisper-env
+source whisper-env/bin/activate
+pip install -r requirements.txt
+
+# Optional: YouTube and diarization
+pip install -e ".[youtube,diarization]"
+
+# Keys and tokens (all optional) go in .env
+cp .env.example .env
+```
+
+`start_forge.py` re-executes itself inside `whisper-env` when the environment is not active. Models (Whisper, YuNet, Light-ASD) download on first use.
+
+### Prepare Input
+
+Place your video files (mp4, mkv, mov) in the `input/` directory — or place nothing and point Forge at a YouTube link instead (see [Working with YouTube](#working-with-youtube)). The folder is scanned together with its sub-folders.
+*Tip: If a same-name `mp3` already exists, Forge will use it. Otherwise it automatically extracts audio from the video into `video.mp3` at 320 kbps and continues the pipeline as usual.*
+
+### Run
+
+```bash
+python3 start_forge.py
+```
+
+---
+
+## Working with YouTube
+
+Instead of copying material in by hand, Forge can pull it straight off YouTube: one video by link, a whole playlist, or an entire channel. This is the pipeline's first stage, `fetch`. It drops the file into `input/youtube/`, and from there it is indistinguishable from one you copied in yourself.
+
+### What you need
+
+```bash
+./whisper-env/bin/pip install -U yt-dlp
+```
+
+`YOUTUBE_API_KEY` is optional. Without it, yt-dlp does the playlist and channel listing itself — slower, and publish dates are unknown until a video is downloaded. With a key it is a single fast request: listing a whole channel costs ~41 units of the free 10,000/day quota. The key is read from the project-root `.env` or from the environment; create one in Google Cloud Console by enabling "YouTube Data API v3", then Credentials → Create credentials → API key. Read-only public data, no OAuth.
+
+### Examples
+
+```bash
+# One video, through the whole pipeline
+python3 start_forge.py --youtube "https://youtu.be/D6WjXRJt1DA"
+
+# A whole channel, everything but video cutting
+python3 start_forge.py --youtube "@pedobraz" --skip cut
+
+# A playlist: download and transcribe only
+python3 start_forge.py --youtube "https://www.youtube.com/playlist?list=PL..." --only fetch,transcribe
+
+# See what would be taken, downloading nothing
+python3 start_forge.py --youtube "@pedobraz" --yt-limit 5 --yt-list
+
+# Only this year, no Shorts (60 seconds is the default floor)
+python3 start_forge.py --youtube "@pedobraz" --yt-since 2026-01-01
+
+# Work over what is already downloaded, fetching nothing
+python3 start_forge.py --skip fetch
+```
+
+Every link shape is understood: `watch?v=`, `youtu.be/`, `shorts/`, `live/`, `playlist?list=`, `/@handle`, `/channel/UC…`, the legacy `/c/` and `/user/` paths, plus a bare `@handle` or video id. When a value starts with a dash (`-3LisPanK24` is a real id), attach it with `=`: `--youtube=-3LisPanK24`, or argparse will read it as a flag.
+
+### What never to take
+
+Part of a channel may be handled differently — a podcast cut from local masters rather than from YouTube audio, say. Those videos go in `youtube.exclude`:
+
+```yaml
+youtube:
+  exclude:
+    - "PLoXa43IuWqDcGdAQbPvtJy0TzS8cWeIC6"   # ПедОбраз Show
+```
+
+A playlist beats a list of ids here: the rule "everything on the channel except this show" stays correct on its own as episodes are added to the show. The same source shapes as `sources` are accepted — a playlist, a channel, a single video.
+
+An exclusion outranks a direct link: a video on the list is not taken even when named in `--youtube`. Filtering happens before the cap, so `--yt-limit 5` yields five usable videos rather than "the newest five, some of which then dropped out".
+
+One-off exclusions use the repeatable `--yt-exclude` flag. It **adds** to the config list rather than replacing it: a standing rule must not be lifted silently by a single command.
+
+### What gets downloaded
+
+By default (`youtube.download: audio`) **only the audio track** is taken: an hour of podcast is ~64 MB instead of ~1 GB, which is what makes a whole-channel run affordable in bandwidth and disk. There is then nothing to cut — the `cut` stage says the video is missing and moves on, while the transcript, long-read and `moments.json` are produced as usual.
+
+When you do want the video:
+
+```bash
+# One run: fetch with video and cut it
+python3 start_forge.py --youtube "https://youtu.be/D6WjXRJt1DA" --yt-video
+```
+
+Or change `youtube.download` in the config: `video` always fetches it, `auto` fetches it only when `cut` is among the selected stages.
+
+Video is capped at 1080p: the output is a 1080-wide vertical clip either way, so a 4K source is only occupied disk. Change it via `youtube.max_height`.
+
+Transcription is always our own: YouTube's captions are never used, even when present. The rest of the pipeline — proofreading, the long-read, quote verification, burn-in — is built on Whisper's output, and auto-captions with their missing punctuation would drag all of it down at once.
+
+### Names and repeat runs
+
+Files are named `YYYY-MM-DD - Title [id]`, for example:
+
+```
+input/youtube/2026-07-06 - Что я понял на выпускном… [B8G2ANNBIrU].mp4
+output/2026-07-06 - Что я понял на выпускном… [B8G2ANNBIrU]/
+```
+
+The date sorts episode folders chronologically; the id keeps names unique and lets Forge recognise an already-downloaded video even after it was retitled on YouTube. yt-dlp's `.info.json` — title, description, chapters — stays alongside.
+
+A repeat run downloads nothing twice: the file on disk is checked first, then the `input/youtube/.archive.txt` archive. Thanks to the archive, a nightly channel run takes only new episodes. `--no-skip-existing` bypasses both checks.
+
+### When a download fails
+
+One failure earns a second attempt through another set of YouTube clients. This fixes a real case: for some older videos the default clients see no formats at all, and the video reads as "This video is not available" though the API reports it public and unrestricted.
+
+What the retry cannot fix is a rights-holder block or a region lock — such a video is out of reach for every client. The pipeline says so and moves on; one blocked episode does not bring down a whole-channel run.
+
+If YouTube changed something else, it can be fixed from config rather than in code — `youtube.ydl_options` passes any yt-dlp option straight through:
+
+```yaml
+youtube:
+  ydl_options:
+    extractor_args:
+      youtube:
+        player_client: ["web_safari", "tv", "android"]
+```
+
+### Run scope
+
+Once YouTube sources are given — via `--youtube` or the `youtube.sources` list in the config — **only** the named videos are processed. Otherwise a single run with a YouTube link would drag along every local episode in `input/`, transcoding audio for each. Lift it with `--yt-all-inputs`. A run with no sources at all behaves as before: it takes everything it finds in the input folder, sub-folders included.
+
+---
+
+## Run modes by task
+
+Forge can run end-to-end (full pipeline) or transcription-only. Transcription has two modes — `fast` (default) and `quality`.
+
+| Mode | When to use | Speed\* |
+|---|---|---|
+| `fast` (batched) | Clean recording, need a quick draft | ~5 min per hour of audio |
+| `quality` (sequential, context-aware) | Quiet/far-field/noisy recording (dictaphone, phone, hall): fixes garbled words | ~1 h per hour of audio |
+
+\* Reference for an RTX 5060 Ti 16GB with `large-v3`. Quality mode is slower because it processes segments sequentially with language context instead of independent batches.
+
+### Full pipeline (transcribe → analyze → cut with NVENC)
+
+```bash
+python3 start_forge.py                     # transcription mode comes from config.yaml
+python3 start_forge.py --verbose           # verbose logs
+python3 start_forge.py --no-skip-existing  # rerun all stages, ignore cache
+```
+
+For the full pipeline, set the transcription mode in `config.yaml` → `transcription.mode` (`fast`/`quality`).
+
+### Transcription-only for audio in `input/`
+
+```bash
+# Fast mode (default)
+python3 transcribe_input_audio.py --verbose
+
+# Quality mode + topic hint — greatly improves quiet/noisy recordings
+python3 transcribe_input_audio.py --verbose --mode quality \
+  --initial-prompt "School parent meeting. Curriculum, classes, teachers."
+
+# Re-transcribe from scratch, ignoring cache
+python3 transcribe_input_audio.py --verbose --no-skip-existing
+```
+
+> 💡 **Topic hint** (`--initial-prompt`) biases the model's vocabulary and helps in both modes. Provide context specific to the recording.
+
+> 💡 **Audio denoising** in practice **hurts** recognition — Whisper is trained on "dirty" audio. Get gains from quality mode and the topic hint, not from preprocessing.
+
+### Re-render videos without AI analysis
+
+```bash
+python3 rerender_videos.py --smart-crop-face --replace
+```
+
+### Inspect the result
+
+```bash
+python3 - <<'PY'
+import json; d=json.load(open('output/<stem>/<stem>.json'))
+s=d['segments']
+print('mode:', d.get('mode'), '| segments:', len(s))
+PY
+```
+
+---
+
+## Pipeline overview
+
+The orchestrator [start_forge.py](start_forge.py) runs [podcast_reels_forge/pipeline.py](podcast_reels_forge/pipeline.py), which executes the following stages for each file:
+
+0. **Fetch**: (When YouTube sources are given) A video, playlist or channel is downloaded into `input/youtube/` as `YYYY-MM-DD - Title [id]`. It runs before the queue is built, so the run can narrow itself to the episodes that were asked for.
+1. **Transcription**: Uses `faster-whisper` with per-word timestamps. Output: `output/<file_stem>/<file_stem>.json` + `.srt`.
+2. **Diarization**: (If enabled) Creates `diarization.json` with speaker turns.
+3. **Proofread**: gemma4 proofreads the transcript (spelling/punctuation) with a guardrail check on every correction. Output: `<file_stem>.proofread.json` + `.srt`; the raw transcript is untouched.
+4. **Article**: gemma4 rebuilds the proofread transcript into an article: meaning-based sections, headings, paragraphs. Length and vocabulary checks catch padding; fragments that fail are flagged in `.article.json`. Output: `<file_stem>.article.md` + `.json`.
+5. **Analyze (Staged)**: *LLM discovers → Python proves → a deterministic selector chooses → LLM writes metadata.* Episode overview → scout over overlapping chunks (interval + verbatim quote only) → the quote is looked up in the transcript and unproven candidates are rejected → cleanup and judge answer with keep/drop/merge decisions by `candidate_id`, so they cannot move a clip or rewrite its quote; the judge sees each clip's real opening and closing seconds. Then boundary snapping that keeps the quote inside the clip, audio probing, and MMR selection under type quotas, an overlap policy and topic diversity. Artifacts go to `output/<file_stem>/<model>/` (e.g. `gemma4_26b/`).
+6. **Video Processing**: Cuts clips from the final `moments.json`. Edges land on pauses in the speech; the 9:16 frame follows the speaker; each clip is recognized again by Whisper and the subtitles take the refined timings; subtitles are burned in a single encode. The finished clip is checked with ffprobe (streams, duration) — a broken one goes to `reels/rejected/`. Forge adds a ready-to-post `reel_XX.md`, keeps a local `reel_XX.srt`, and builds `reels_preview.mp4`.
+
+By default the queue runs **stage by stage** (`autonomy.scheduling: stage`): every transcription with one Whisper load, then every LLM stage in one llama-server session, then all the cutting. `scheduling: episode` restores the old one-episode-at-a-time order.
+
+
+---
+
+## Output layout
+
+Inside the `output/` directory:
+
+```text
+output/
+  my_podcast/
+    my_podcast.json            # Transcript (segments + per-word timestamps)
+    my_podcast.srt
+    my_podcast.proofread.json  # Proofread transcript (used by analysis and subtitles)
+    my_podcast.proofread.srt
+    my_podcast.article.md        # Episode retelling, ready to read
+    my_podcast.article.json      # Sections, timings and guardrail metadata
+    diarization.json           # (Optional) Speaker info
+    .forge_state.json          # Stage input fingerprints: what to redo on change
+    gemma4_26b/                # Analysis model folder
+      analysis_manifest.json   # Run parameters: quotas, chunks, language
+      episode_context.json     # Episode overview (cached)
+      scout_candidates.json    # Everything the scout found
+      cleaned_candidates.json  # After quote checks, dedupe, cleanup and audio probing
+      rejected_candidates.json # Everything a gate threw out, with the reason
+      analysis_metrics.json    # Run metrics: survival, quotes, duplicates, stage timings
+      analysis_complete.json   # The analysis ran to the end (an empty result is a result)
+      llm_cache/               # Cached LLM answers for resuming after a crash
+      moments.json             # Final list: score (1-10), priority, quote_match_ratio…
+      reels.md                 # Clip summary
+      reels/                   # Cut video clips .mp4
+        reel_01.srt            # Local subtitle timeline (reference)
+        reel_01.md             # Description + 5 hashtags for reel_01.mp4
+        framing/reel_01.json   # Who the frame showed and when: face tracks, shot cuts, camera path
+        subtitle_sync.json     # How far the timings moved after the Whisper re-check
+        rejected.json          # Rejected moments with reasons
+        rejected/              # Clips that failed filters or QA (when encoded)
+      reels_preview.mp4        # Concatenated preview of all clips
+  _runs/
+    latest.json                # Report of the latest run (see docs/AUTONOMOUS.md)
+```
+
+---
+
+## Command line arguments
+
+Main flags for `start_forge.py`:
+
+- `--config <path>`: Path to config (default: `config.yaml`).
+- `--verbose`: Verbose output for all commands and logs.
+- `--quiet`: Errors-only mode.
+- `--no-skip-existing`: Rerun all stages even if files already exist (ignore cache).
+- `--autotune`: Automatically tune parameters for current hardware (smaller chunks, longer timeouts).
+- `--no-progress`: Disable progress bar (useful for CI/logging).
+- `--only <stages>`: Run only these stages, comma-separated. Example: `--only proofread,article`.
+- `--skip <stages>`: Run everything except these stages. Example: `--skip cut`.
+- `--list-stages`: Print the stages in order and exit.
+- `--skip-preflight`: Skip the environment check before the start (ffmpeg, llama-server and its model, tokens, free disk).
+- `--free-ram` / `--no-free-ram`: Take unused memory from virtual machines for the duration of the run and give it back at the end — or leave it alone even when `host_memory.enabled: true` (see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#host-memory--освобождение-памяти-хоста)).
+
+Exit codes: `0` everything passed, `3` some episodes failed, `1` fatal error, `75` another run is active. The report is `output/_runs/latest.json`.
+
+Stages: `fetch`, `transcribe`, `diarize`, `proofread`, `article`, `analyze`, `cut`. A typo is an error, not a silent skip of half the pipeline. Skipping a stage does not strand the others: when a proofread transcript already exists from an earlier run, `--only article` picks it up.
+
+```bash
+# Build long-reads from existing transcripts without re-cutting anything
+python3 start_forge.py --only article
+
+# Everything except video cutting
+python3 start_forge.py --skip cut
+```
+
+YouTube flags (see [Working with YouTube](#working-with-youtube) for the detail):
+
+- `--youtube <URL>`: A video, playlist or channel link, or an `@handle`. Repeatable. Attach a value starting with a dash using `=`: `--youtube=-3LisPanK24`.
+- `--yt-exclude <URL>`: Never take these videos (usually a playlist). Repeatable; adds to `youtube.exclude` from the config.
+- `--yt-list`: Print the selected videos and exit, downloading nothing.
+- `--yt-limit <N>`: Take only the newest N.
+- `--yt-since <date>` / `--yt-until <date>`: Publish-date bounds, `YYYY-MM-DD`.
+- `--yt-min-duration <s>` / `--yt-max-duration <s>`: Length bounds. The default floor of 60 seconds drops Shorts.
+- `--yt-audio-only` / `--yt-video`: Override the automatic track choice.
+- `--yt-max-height <px>`: Video height ceiling (default 1080).
+- `--yt-cookies <file>`: Netscape cookie jar — for age-gated or members-only material.
+- `--yt-all-inputs`: Do not narrow the run to what was fetched; process the whole input folder.
+
+Downloading can also run on its own, without the rest of the pipeline:
+
+```bash
+python3 -m podcast_reels_forge.scripts.fetch_youtube --list "@pedobraz"
+python3 -m podcast_reels_forge.scripts.fetch_youtube "@pedobraz" --limit 5 --audio-only
+```
+
+Flags for the standalone transcriber `transcribe_input_audio.py`:
+
+- `--mode <fast|quality>`: Override `transcription.mode` from config.
+- `--initial-prompt "<text>"`: Topic hint to bias the model's vocabulary.
+- `--verbose` / `--quiet`: Log level.
+- `--no-skip-existing`: Re-transcribe even if a JSON already exists.
+
+---
+
+## Configuration (config.yaml)
+
+The full reference of every key is [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+### Host settings: config.local.yaml
+
+`config.yaml` is tracked in git and holds the project defaults. Anything specific to one machine — model paths, the llama-server port, VRAM — goes into `config.local.yaml` next to it. The file is gitignored, merged over `config.yaml` at every start, and survives a config export from the GUI:
+
+```yaml
+# config.local.yaml — only the differences
+llama_cpp:
+  service:
+    model_path: "/models/gemma-4-26b-q4.gguf"
+transcription:
+  device: cuda
+```
+
+A config can extend another and hold only its differences: `extends: config.yaml` (e.g. `python3 start_forge.py --config config.show.yaml` for a separate show). Order: the `extends` base → the file itself → `config.local.yaml`.
+
+### Key Sections
+
+- **`transcription`**: Whisper model (`large-v3`), device (`auto`/`cuda`/`cpu`), language.
+  - `mode`: `fast` (batched) or `quality` (sequential, more accurate).
+  - `batch_size`: batch size in fast mode (default 16; on OOM it auto-halves down to CPU).
+  - `quality_beam_size`: beam width in quality mode (default 10).
+  - `initial_prompt`: default topic hint (overridable with `--initial-prompt`).
+- **`llama_cpp`**:
+  - `roles`: Role mapping for `scout / cleanup_refine / judge_metadata / proofread`.
+  - `role_overrides`: Per-role timeout, temperature and chunk-size tweaks.
+  - `n_predict`: Token budget for a model reply (default 4096).
+  - `model_overrides`: Legacy compatibility only, not the primary path.
+- **`proofread`**: Transcript proofreading (on/off, batch size, guardrail similarity threshold).
+- **`processing`**:
+  - `clips_per_hour`: Clips per hour of total runtime (default 10; `0` = fixed counts from `clips`). The `clips` counters then act as the type mix.
+  - `clips`: Durations and mix for the clip types (`stories`, `reels`, `long_reels`, `highlights`).
+  - `analysis`: Selection fine-tuning — quote verification, boundary snapping, audio signals, episode/judge context, scoring weights, topic diversity. The whole block is optional; details in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+  - `quality_filters.min_score`: Threshold on the model's rating (1-10 scale; the ranking value lives in a separate `priority` field).
+- **`video`**:
+  - `vertical_crop`: Enable/disable 9:16 aspect ratio.
+  - `smart_crop_face`: Frame on faces. `active_speaker` — pick whoever is talking (Light-ASD); `face_follow` — glide after the person; `speaker_switch`: `cut` | `pan`; `two_speaker_layout`: `speaker` | `split`; `face_device: cuda`; `gpu_decode` — NVDEC + `scale_cuda` + NVENC. See [The Frame Follows the Speaker](#the-frame-follows-the-speaker).
+  - `qa` / `qa_blackdetect`: Check the finished clip with ffprobe (and, optionally, for black frames).
+  - `use_nvenc`: Prefer NVIDIA hardware encoding (NVENC). Falls back to libx264 automatically if no NVENC ffmpeg build is found.
+  - `nvenc_cq`: NVENC VBR quality target (lower = better; default 21).
+  - `nvenc_preset`: NVENC preset `p1`(faster)…`p7`(higher quality), default `p5`.
+  - `video_bitrate`: Bitrate ceiling (for NVENC, caps the VBR peak).
+- **`subtitles`**:
+  - `enabled`: Toggle burned-in **ASS** subtitle rendering (via ffmpeg's `ass` filter).
+  - `font`: Path to the subtitle font file. Default: `assets/fonts/bignoodletoooblique.ttf`.
+  - `ass_style`: Path to the `.ass` style file. Default: `assets/subtitles/forge_subtitles.ass`. If the file is missing, a built-in fallback style is used.
+  - `wrap_words`: Toggle word wrapping for captions. When disabled, the caption stays on one line.
+  - `max_width_ratio`: Share of the frame the text may span. Defaults to `0.74` (the frame minus the 140px insets that clear the right-hand action rail). Forge breaks lines itself: text is measured with the real font in frame pixels, lines are balanced and never end on a preposition (`line_balance`: even, pyramid, greedy).
+  - `preset`: A complete ready-made look — `forge`, `hormozi`, `mrbeast`, `karaoke`, `tiktok`, `box`, `sticker`, `word_box`, `neon`, `vibrant`, `minimal`, `classic`, `one_word`, `retro`, `bold_pop`, `headline` (Cyrillic fonts ship in `assets/fonts`). Empty — the editor's style file.
+  - `highlight`: Word highlight — `none`, `karaoke`, `word` (active word), `fill` (spoken words), `reveal` (typewriter), `pop`.
+  - `text_case`, `strip_punctuation`, `censor_words`, `max_words_per_cue`, `speaker_colors` and cue timing — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md#subtitles--субтитры).
+  - `vertical_align`: `style` (the style's row), `top`, `center`, `bottom`. `vertical_offset`: shift by a share of the frame height away from the anchored edge.
+  - `fade_in_duration` / `fade_out_duration`: Fade a cue in and out (the ASS `\fad` tag). `0` disables it. If the two together outlast the cue, both are scaled down proportionally.
+  - `font_size_px`: Base size for the built-in looks (tuned at 96, they scale with it); with an editor file the size comes from the file.
+  - The default style is the viral caption look: a heavy condensed face and a thick black outline instead of a drop shadow, anchored bottom-centre above the platform chrome. Each cue appears whole (`karaoke: false`); word-by-word highlighting comes with a preset or `highlight`.
+  - `whisper_sync`: before burning, every clip is recognized again, its words are matched to the transcript, and drifted subtitles take the new timings (report in `reels/subtitle_sync.json`).
+  - `fade_min_gap_s`: fade only cues next to a pause — 93% of podcast cues run back to back, and fading each one made the text blink.
+  - The easiest way to tune the style is the visual [GUI](#graphical-interface-gui) (Subtitles tab). The "Save ASS File" button writes the style straight into `assets/subtitles/forge_subtitles.ass`, which the pipeline reads.
+  - `word_x_space` / `word_y_space` are legacy no-ops: spacing comes from the `.ass` style (`Spacing` in the editor).
+- **`article`**: The episode retelling. `enabled` turns the stage on; `max_length_ratio` and `max_novel_word_ratio` set the faithfulness thresholds (details in [docs/CONFIGURATION.md](docs/CONFIGURATION.md)).
+- **`diarization`**: Enable and configure speaker detection (needs a Hugging Face token in `PYANNOTE_TOKEN`, `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` or `HUGGING_FACE_ACCESS_TOKEN`, see [`.env.example`](.env.example)). `num_speakers` pins the speaker count when it is known — less over-clustering on noisy recordings.
+
+---
+
+## Graphical Interface (GUI)
+
+Besides the CLI, the project ships a full **browser GUI** for building `config.yaml`
+and tuning subtitles visually — no server required, just static pages. A dark
+token-based "forge" theme: an ember brand accent, a colour per pipeline stage,
+Cyrillic-native typography (Golos Text + JetBrains Mono), full keyboard
+navigation and an **RU/EN** toggle.
+
+![Dashboard](docs/images/gui-dashboard.png)
+
+Open [`gui/index.html`](gui/index.html) in your browser (double-click or via a file
+server). The interface is split into separate pages per pipeline stage, each with
+its own accent colour:
+
+| Page | Purpose |
+|---|---|
+| **Dashboard** | File queue, pipeline run (demo), stage status |
+| **Transcribe** | Whisper model, `fast`/`quality` mode, beam/batch, anti-hallucination |
+| **Analyze** | llama.cpp service & VRAM tuning, model roles, watchdog, per-role overrides |
+| **Cut** | NVENC/encoding, quality filters, smart crop, clip types & counts |
+| **Subtitles** | Render parameters + an embedded **visual ASS style editor** with a phone preview |
+| **Settings** | Paths, cache, diarization, CLI flags, and a **live `config.yaml` preview** |
+| **Logs** | Console output from the stages |
+
+| [![Analyze](docs/images/gui-analyze.png)](docs/images/gui-analyze.png) | [![Cut](docs/images/gui-cut.png)](docs/images/gui-cut.png) |
+|---|---|
+| Analyze: LLM service, model roles, inference | Cut: encoding, quality filters, clips |
+
+![Subtitle editor](docs/images/gui-subtitles.png)
+
+The settings cover the pipeline config **1:1**: on the Settings page click "Export
+config.yaml" and drop the file into the project root. The embedded subtitle editor
+(Subtitles tab) saves the style to `assets/subtitles/forge_subtitles.ass` — exactly
+what the render stage reads. Form state is kept in the browser's `localStorage`.
+
+> The Subtitles tab has 16 one-click ready-made styles, a separate active-word style and a
+> preview that splits cues and breaks lines with the same algorithm as the burn. The old
+> `assets/subtitles/style-editor.html` address redirects here.
+
+---
+
+## The frame follows the speaker
+
+With `video.smart_crop_face: true` the 9:16 window shows whoever is talking for the whole clip ([utils/face_track.py](podcast_reels_forge/utils/face_track.py)):
+
+1. **One pass on the GPU.** ffmpeg decodes the clip on NVDEC and everything after that runs in torch on the card. **YuNet** looks for faces 5 times a second and finds even 60–90 px faces in wide shots. Shot cuts are detected on the same decode.
+2. **Tracks, not frames.** Faces are linked into tracks within a shot; faces that never move (a photo on a slide, a portrait on the wall) and passers-by are dropped.
+3. **Who is talking.** With two or more people in a shot, **Light-ASD** (CVPR 2023) decides from lips and sound. Viterbi with a switch penalty turns that into turns, so a short "uh-huh" does not jerk the frame.
+4. **A camera on a tripod.** Within a turn the window holds while the face stays in a dead zone and eases to where the person settles. A change of speaker is a cut (`speaker_switch: cut`) or a pan (`pan`).
+5. **Two people apart** — with `two_speaker_layout: split`, two people sitting far apart are stacked one above the other (the default `speaker` shows whoever talks).
+
+The per-clip report is `reels/framing/reel_XX.json`. Without CUDA a clip gets a centre crop (the preflight warns about it up front). On POS footage, analysing a 48-second clip went from ~93 s on the CPU to ~7 s on the GPU.
+
+---
+
+## Re-render video from existing moments.json
+
+If you want to change video parameters (bitrate, crop, padding) without re-running the long AI analysis, use [rerender_videos.py](rerender_videos.py):
+
+```bash
+# Re-render everything with smart crop enabled
+python3 rerender_videos.py --smart-crop-face --replace
+```
+
+---
+
+## Performance and stability
+
+- **Whisper (memory)**: On OOM, `batch_size` auto-halves (16 → 8 → … → CPU), so it won't crash — just slower. To speed up, free VRAM or lower `batch_size`.
+- **Whisper (quality)**: Garbled words on quiet/far-field recordings are fixed by `quality` mode + `--initial-prompt`, **not** by audio cleanup (denoising hurts recognition).
+- **Blackwell GPU (RTX 50xx)**: Requires `torch>=2.7` built for CUDA 12.x. The PyTorch `sm_120` warning is harmless — Whisper inference runs via ctranslate2, not PyTorch kernels.
+- **ffmpeg / NVENC**: Forge auto-detects an NVENC-capable ffmpeg (`/usr/local/bin`, `/usr/bin`); you can force a path via the `FORGE_FFMPEG` env var. If NVENC is unavailable, encoding falls back to CPU (libx264).
+- **llama.cpp**: Stalled requests are cut off by the total timeout (`llama_cpp.timeout`, per-role via `role_overrides`) and retried automatically; one failed chunk doesn't abort the episode. Unparseable JSON is re-asked (`processing.analysis.json_retry`).
+- **Timing reference** (RTX 5060 Ti 16GB, ~2-hour episode): transcription + proofreading ~28 min, analysis ~9 min, cutting ~18 min. Raising `clips_per_hour` lengthens analysis and cutting proportionally.
+- **Host memory**: llama-server's prompt cache is sized from free RAM by default (`cache_ram_mb: auto`), and the server's output goes to `llama-server.log`. On a machine that also runs VMs, `host_memory` (or `--free-ram`) takes their unused memory for the run and is guaranteed to give it back.
+
+---
+
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | User guide: install, first run, common problems |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Reference for every `config.yaml` key |
+| [docs/AUTONOMOUS.md](docs/AUTONOMOUS.md) | Scheduled runs: systemd/cron, reports, notifications |
+| [docs/PROMPTS.md](docs/PROMPTS.md) | How the scout/cleanup/judge prompts work and how to write your own |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | For developers: code layout, tests, releases |
+| [docs/ANALYSIS_REPORT.md](docs/ANALYSIS_REPORT.md) | Audit of moment selection and cutting (RU) |
+| [docs/AUTONOMY_REVIEW.md](docs/AUTONOMY_REVIEW.md) | Review of unattended-run robustness (RU) |
+| [docs/COMPETITOR_REVIEW.md](docs/COMPETITOR_REVIEW.md) | Review of 11 open-source alternatives (RU) |
+| [CHANGELOG.md](CHANGELOG.md) | Release history |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
+
+---
+
+## Support the Project
+
+Forge is free and runs fully local. If it saves you hours of editing — support development:
+
+[![Support Podcast Reels Forge](docs/images/donate_banner.png)](https://dalink.to/bormotoon)
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE).
