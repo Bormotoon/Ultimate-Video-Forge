@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Environments and local configuration
+.venv/
+venv/
+*.local.yaml
+.env
+
+# Generated media and application state
+fixtures/generated/
+*.log
+*.lock
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
