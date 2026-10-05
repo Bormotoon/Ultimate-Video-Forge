@@ -1,0 +1,164 @@
+"""Media discovery, classification, stable IDs, grouping, and chapters."""
+
+from __future__ import annotations
+
+import re
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from studio.core.media import MediaInfo, probe
+from studio.core.project import Asset, AssetKind, AssetRole, Project, stable_fingerprint
+from studio.stages.base import Decision, GpuUse, Requirement, StageContext, StageOutput
+
+MEDIA_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".wav", ".flac", ".mp3", ".m4a"}
+IGNORED_SUFFIXES = {".lrf", ".lrv", ".thm"}
+GOPRO_CHAPTER = re.compile(r"^G[HX](\d{2})(\d{4})$", re.IGNORECASE)
+
+
+class ScanStage:
+    id = "scan"
+    title = "Material scan"
+    after: tuple[str, ...] = ()
+    gpu = GpuUse.NONE
+
+    def requirements(self, settings: dict[str, object]) -> list[Requirement]:
+        return [Requirement("binary", "ffprobe", "read media metadata")]
+
+    def decide(self, project: Project, settings: dict[str, object]) -> Decision:
+        return Decision.run() if project.source_dir.is_dir() else Decision.blocked(
+            "source directory does not exist", "choose an existing directory"
+        )
+
+    def fingerprint(self, project: Project, settings: dict[str, object]) -> str:
+        files = _media_paths(project.source_dir)
+        identities = [
+            (
+                str(path.relative_to(project.source_dir)),
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+            )
+            for path in files
+        ]
+        return stable_fingerprint("scan-v1", identities, settings.get("scan", {}))
+
+    def run(self, context: StageContext) -> StageOutput:
+        assets, warnings = scan(context.project.source_dir)
+        report = context.work_dir / "stages" / "scan" / "report.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        import json
+
+        data = {"assets": [_asset_json(asset) for asset in assets], "warnings": warnings}
+        report.write_text(
+            json.dumps(data, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return StageOutput((report,), {"assets": assets})
+
+
+def scan(source_dir: Path) -> tuple[list[Asset], list[str]]:
+    paths = _media_paths(source_dir)
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(paths)))) as pool:
+        infos = list(pool.map(probe, paths))
+    records = list(zip(paths, infos, strict=True))
+    ids = _stable_ids([path for path, _ in records], source_dir)
+    assets: list[Asset] = []
+    warnings: list[str] = []
+    chapter_roots: dict[str, str] = {}
+    for path, info in records:
+        relative = path.relative_to(source_dir)
+        kind = (
+            AssetKind.VIDEO
+            if info.video_codec
+            else AssetKind.AUDIO
+            if info.audio_codec
+            else AssetKind.OTHER
+        )
+        role = (
+            AssetRole.CAMERA
+            if kind is AssetKind.VIDEO
+            else AssetRole.RECORDER
+            if kind is AssetKind.AUDIO
+            else AssetRole.IGNORE
+        )
+        group = relative.parent.name if relative.parent != Path(".") else _device_group(path, info)
+        chapter_key = _gopro_key(path)
+        chapter_of = chapter_roots.setdefault(chapter_key, ids[path]) if chapter_key else None
+        if chapter_of == ids[path]:
+            chapter_of = None
+        asset = Asset(
+            ids[path],
+            relative,
+            kind,
+            role,
+            _device_name(info),
+            group,
+            chapter_of,
+            {"media_info": info.to_dict()},
+        )
+        assets.append(asset)
+        if kind is AssetKind.VIDEO and not info.audio_codec:
+            warnings.append(f"{relative}: video has no audio; acoustic sync is unavailable")
+    return assets, warnings
+
+
+def _media_paths(source_dir: Path) -> list[Path]:
+    return sorted(
+        (
+            path for path in source_dir.rglob("*")
+            if path.is_file()
+            and not any(
+                part.startswith(".") or part == "_studio"
+                for part in path.relative_to(source_dir).parts
+            )
+            and path.suffix.lower() in MEDIA_SUFFIXES
+            and path.suffix.lower() not in IGNORED_SUFFIXES
+        ),
+        key=lambda path: _natural_key(str(path.relative_to(source_dir))),
+    )
+
+
+def _stable_ids(paths: list[Path], source_dir: Path) -> dict[Path, str]:
+    used: set[str] = set()
+    result: dict[Path, str] = {}
+    for path in paths:
+        relative_stem = str(path.relative_to(source_dir).with_suffix("")).lower()
+        base = re.sub(r"[^a-z0-9]+", "-", relative_stem).strip("-") or "source"
+        candidate = base
+        number = 2
+        while candidate in used:
+            candidate = f"{base}-{number}"
+            number += 1
+        used.add(candidate)
+        result[path] = candidate
+    return result
+
+
+def _device_group(path: Path, info: MediaInfo) -> str:
+    return _device_name(info) or path.stem.split("_")[0].lower()
+
+
+def _device_name(info: MediaInfo) -> str | None:
+    make = info.tags.get("com.apple.quicktime.make") or info.tags.get("make")
+    model = info.tags.get("com.apple.quicktime.model") or info.tags.get("model")
+    return " ".join(part for part in (make, model) if part) or None
+
+
+def _gopro_key(path: Path) -> str | None:
+    match = GOPRO_CHAPTER.match(path.stem)
+    return f"gopro-{match.group(2)}" if match else None
+
+
+def _natural_key(value: str) -> list[tuple[int, int, str]]:
+    return [
+        (0, int(part), "") if part.isdigit() else (1, 0, part.lower())
+        for part in re.split(r"(\d+)", value)
+        if part
+    ]
+
+
+def _asset_json(asset: Asset) -> dict[str, object]:
+    return {
+        "id": asset.id, "path": str(asset.path), "kind": asset.kind.value,
+        "role": asset.role.value, "device": asset.device, "group_id": asset.group_id,
+        "chapter_of": asset.chapter_of, "manual": asset.manual,
+    }
