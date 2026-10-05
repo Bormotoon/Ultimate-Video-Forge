@@ -24,3 +24,11 @@ Build the Studio package with:
 ```bash
 python3.12 -m build
 ```
+
+Generate the deterministic two-camera synchronization fixture with:
+
+```bash
+python3.12 tools/make_fixtures.py --force
+```
+
+The generator requires `ffmpeg`, `ffprobe`, and either `espeak-ng` or `espeak`.
