@@ -70,7 +70,19 @@ def generate_fcpxml(
     fcpxml_version: str = "1.9",
     project_name: str = "WhisperSync",
     audio_sample_rate: int | None = None,
+    media_base_dir: Path | None = None,
 ) -> Path:
+    """Write the FCPXML for ``plan`` to ``output_path``.
+
+    ``media_base_dir`` is the directory the document's relative media paths are
+    resolved against — i.e. where the file will FINALLY live. It defaults to
+    ``output_path.parent``, which is right only when the document is written
+    where it is published. The pipeline stages the XML in a scratch directory
+    and moves it into place afterwards, so without this parameter every media
+    path fell into the absolute-URL branch of ``_media_src`` and the rendered
+    audio sitting next to the finished document was still referenced by an
+    absolute path — portable-project support that silently never applied.
+    """
     ref_video = video_infos[0] if video_infos else None
     # Sequence (timeline) rate — every spine position is snapped to this grid.
     seq_fps: Fraction = (ref_video.fps or Fraction(25, 1)) if ref_video else Fraction(25, 1)
@@ -119,7 +131,9 @@ def generate_fcpxml(
     seq_fmt = _format_for(seq_fps, seq_w, seq_h)  # r1
 
     asset_map: dict[str, str] = {}
-    base_dir = output_path.parent.resolve()
+    # Declared length of each asset's file, so no clip can claim media past it.
+    asset_seconds: dict[str, float] = {}
+    base_dir = (media_base_dir or output_path.parent).resolve()
 
     seen_paths: set[str] = set()
     for clip in plan.clips:
@@ -147,11 +161,28 @@ def generate_fcpxml(
             # not this flag, and not the role — that decides whether the
             # camera's own microphone is heard (see _spine_clip).
             has_audio = "1" if (info is None or info.audio_codec is not None) else "0"
+            # An asset describes the FILE, so its duration is the container's,
+            # not the picture's: a MOV whose audio runs past the last video
+            # frame is (commonly) 0.1-0.2 s longer than its 195 frames of
+            # video, and declaring the shorter figure makes Final Cut compare
+            # the declared media against the real file, disagree, and refuse to
+            # relink it. The TIMELINE still uses the frame-accurate picture
+            # length — that is `clip.duration`, applied on the asset-clip
+            # below, so the project never places more frames than exist.
+            file_seconds = (info.container_duration if info else None) or (
+                clip.duration + clip.in_point
+            )
+            file_seconds = max(file_seconds, clip.duration + clip.in_point)
+            asset_seconds[path_str] = file_seconds
             asset_attrs = {
                 "id": asset_id,
                 "name": asset_name,
                 "start": "0s",
-                "duration": _frame_rational(clip.duration + clip.in_point, cfps, "round"),
+                # Floored, not rounded: an asset duration has to sit on the
+                # frame grid, and rounding up puts the declared length past the
+                # end of the file — the same disagreement, half a frame's
+                # worth, that this is meant to remove.
+                "duration": _frame_rational(file_seconds, cfps, "floor"),
                 "hasVideo": "1",
                 "hasAudio": has_audio,
                 "format": _format_for(cfps, cw, ch),
@@ -163,17 +194,25 @@ def generate_fcpxml(
             # if the file can't be probed (e.g. in unit tests with fake paths).
             audio_channels = 1
             audio_rate = sample_rate
+            # As for video: declare the file's OWN length. The planned
+            # duration here is the SOURCE VIDEO's, copied onto the rendered
+            # clip when the job was built, and a rendered WAV lands a few
+            # milliseconds either side of it — enough for Final Cut to call the
+            # media a mismatch on every single ambience track.
+            file_seconds = clip.duration + clip.in_point
             try:
                 audio_info = probe(clip.path)
                 audio_channels = audio_info.audio_channels or 1
                 audio_rate = audio_info.audio_sample_rate or sample_rate
+                file_seconds = audio_info.container_duration or audio_info.duration
             except (RuntimeError, OSError):
                 pass
+            asset_seconds[path_str] = file_seconds
             asset_attrs = {
                 "id": asset_id,
                 "name": asset_name,
                 "start": "0s",
-                "duration": to_rational(clip.duration + clip.in_point, audio_rate),
+                "duration": to_rational(file_seconds, audio_rate),
                 "hasVideo": "0",
                 "hasAudio": "1",
                 "audioSources": "1",
@@ -217,15 +256,77 @@ def generate_fcpxml(
     video_clips = sorted((c for c in plan.clips if c.kind == "video"), key=lambda c: c.offset)
     audio_clips = sorted((c for c in plan.clips if c.kind != "video"), key=lambda c: c.offset)
 
-    primary_lane = min((c.lane for c in video_clips), default=1)
-    spine_videos = [c for c in video_clips if c.lane == primary_lane]
-    connected_videos = [c for c in video_clips if c.lane != primary_lane]
-
     # Frame duration (seconds) of the sequence grid, used to align spine offsets.
     frame_s = float(seq_fps.denominator) / float(seq_fps.numerator)
 
+    primary_lane = min((c.lane for c in video_clips), default=1)
+    max_lane = max((c.lane for c in video_clips), default=1)
+
+    # Clips of the primary camera that OVERLAP EACH OTHER cannot all live in
+    # the spine either: the spine is sequential, so the loop below could only
+    # push the later one along by its predecessor's running time. That silent
+    # push is not a cosmetic slip — it discards a measured position and moves
+    # every clip after it, which is how a timeline ends up as one unbroken
+    # ribbon in an order nobody chose. So only a non-overlapping chain stays in
+    # the spine (earliest start wins, since the greedy pass walks in offset
+    # order); an overlapping clip is promoted to a connected clip on a lane
+    # above every camera's, where it keeps its real position. One camera should
+    # never produce overlaps at all — when it does, the clips' positions
+    # disagree with each other and the promotion makes that visible instead of
+    # hiding it inside a reshuffle.
+    spine_videos: list[MediaClip] = []
+    promoted: list[MediaClip] = []
+    spine_reach = float("-inf")
+    for clip in video_clips:
+        if clip.lane != primary_lane:
+            continue
+        if clip.offset < spine_reach - frame_s / 2:
+            promoted.append(clip)
+        else:
+            spine_videos.append(clip)
+            spine_reach = clip.offset + clip.duration
+
+    # Lane assignment for connected video: other cameras keep their own lane,
+    # promoted clips are packed onto the lowest free lane above all of them so
+    # two promoted clips only share a lane when they do not overlap in time.
+    lane_of: dict[int, int] = {}  # id(clip) -> lane
+    lane_reach: dict[int, float] = {}
+    for clip in promoted:
+        lane = max_lane + 1
+        while lane_reach.get(lane, float("-inf")) > clip.offset + frame_s / 2:
+            lane += 1
+        lane_of[id(clip)] = lane
+        lane_reach[lane] = clip.offset + clip.duration
+
+    connected_videos = sorted(
+        [c for c in video_clips if c.lane != primary_lane] + promoted,
+        key=lambda c: c.offset,
+    )
+    if promoted:
+        logger.warning(
+            "%d camera clip(s) overlap others from the same camera and were exported as "
+            "connected clips above the storyline instead of being pushed along it: %s",
+            len(promoted),
+            ", ".join(c.display_name or c.path.stem for c in promoted),
+        )
+
     def _clip_name(clip: MediaClip) -> str:
         return clip.display_name or clip.path.stem
+
+    def _clip_seconds(clip: MediaClip) -> float:
+        """How much of ``clip`` may be placed, given what its file holds.
+
+        The asset now declares the file's real length, so a clip whose planned
+        duration was copied from another file (the rendered audio's, which
+        comes from the source VIDEO's duration) could ask for a few
+        milliseconds that do not exist. Final Cut reads that as a clip running
+        past the end of its media. Trimming here is the honest resolution: the
+        missing tail was never recorded.
+        """
+        available = asset_seconds.get(str(clip.path.resolve()))
+        if available is None:
+            return clip.duration
+        return max(0.0, min(clip.duration, available - clip.in_point))
 
     def _set_role(el: ET.Element, clip: MediaClip) -> None:
         # FCPX colours/groups clips by role: videoRole on video, audioRole on audio.
@@ -290,7 +391,7 @@ def generate_fcpxml(
             name=_clip_name(clip),
             offset=_frame_rational(base_offset, seq_fps, "round"),
             start=_frame_rational(clip.in_point, seq_fps, "round"),
-            duration=_frame_rational(clip.duration, seq_fps, "floor"),
+            duration=_frame_rational(_clip_seconds(clip), seq_fps, "floor"),
         )
         _set_role(el, clip)
         _emit_retake_markers(el, clip)
@@ -303,7 +404,7 @@ def generate_fcpxml(
             name=_clip_name(clip),
             offset=offset_str,
             start=_frame_rational(clip.in_point, seq_fps, "round"),
-            duration=_frame_rational(clip.duration, seq_fps, "floor"),
+            duration=_frame_rational(_clip_seconds(clip), seq_fps, "floor"),
         )
         _set_role(el, clip)
         _set_source_enable(el, clip)
@@ -314,20 +415,24 @@ def generate_fcpxml(
             parent_el,
             "asset-clip",
             ref=asset_map.get(str(clip.path.resolve()), "r2"),
-            lane=str(clip.lane),
+            # A clip promoted out of the spine (see LAYOUT) carries the lane it
+            # was packed onto, not its camera's lane, which the spine owns.
+            lane=str(lane_of.get(id(clip), clip.lane)),
             name=_clip_name(clip),
             offset=_frame_rational(base_offset, seq_fps, "round"),
             start=_frame_rational(clip.in_point, seq_fps, "round"),
-            duration=_frame_rational(clip.duration, seq_fps, "floor"),
+            duration=_frame_rational(_clip_seconds(clip), seq_fps, "floor"),
         )
         _set_role(el, clip)
         _set_source_enable(el, clip)
 
-    # Lay the primary camera's clips end-to-end with gaps for the holes. The
-    # spine's own clock ("offset") is contiguous; each element's offset is where
-    # it begins on it. Track (timeline_start, timeline_end, parent_in_point,
-    # element) so connected clips can be positioned on the PARENT's local clock
-    # (which starts at its in_point).
+    # Lay the primary camera's clips at their MEASURED positions, with a gap
+    # covering each hole. The spine's own clock ("offset") is contiguous, so
+    # every hole must be filled by an element for the next clip to land where
+    # it belongs; `spine_videos` is overlap-free by construction, so a clip
+    # never has to be pushed past its own offset. Track (timeline_start,
+    # timeline_end, parent_in_point, element) so connected clips can be
+    # positioned on the PARENT's local clock (which starts at its in_point).
     spine_elems: list[tuple[float, float, float, ET.Element]] = []
     cursor = 0.0
     for clip in spine_videos:
@@ -343,7 +448,7 @@ def generate_fcpxml(
             )
             cursor = clip.offset
         el = _spine_clip(clip, _frame_rational(cursor, seq_fps, "round"))
-        end = cursor + clip.duration
+        end = cursor + _clip_seconds(clip)
         spine_elems.append((cursor, end, clip.in_point, el))
         cursor = end
 
@@ -363,7 +468,19 @@ def generate_fcpxml(
             for start_s, end_s, in_pt, el in spine_elems:
                 if start_s - frame_s <= offset < end_s:
                     return start_s, in_pt, el
-            # Before the first / after the last spine clip — clamp to the nearest.
+            # Now that the spine keeps real positions, it also has real holes,
+            # and a clip can start inside one (or after the last clip). Attach
+            # it to the nearest PRECEDING spine clip: a connected clip may
+            # extend past its parent, so the position stays exact, whereas
+            # falling back to the FIRST clip (the old rule) turned every such
+            # clip into one that starts before its parent and gets clamped to
+            # the head of the timeline.
+            best: tuple[float, float, ET.Element] | None = None
+            for start_s, _end_s, in_pt, el in spine_elems:
+                if start_s - frame_s <= offset:
+                    best = (start_s, in_pt, el)
+            if best is not None:
+                return best
             s0, _e0, ip0, el0 = spine_elems[0]
             return s0, ip0, el0
 
@@ -376,8 +493,7 @@ def generate_fcpxml(
                 # silent absorption is how a negative calibration was reported
                 # as applied while having no effect.
                 logger.warning(
-                    "Clip %s starts %.3fs before its parent clip; clamping to the "
-                    "parent's start.",
+                    "Clip %s starts %.3fs before its parent clip; clamping to the parent's start.",
                     _clip_name(clip),
                     parent_tl_start - clip.offset,
                 )
@@ -438,7 +554,9 @@ def _element_time_problems(el: ET.Element, where: str) -> list[str]:
     return problems
 
 
-def check_fcpxml(path: Path, *, check_media: bool = True) -> list[str]:
+def check_fcpxml(
+    path: Path, *, check_media: bool = True, media_base_dir: Path | None = None
+) -> list[str]:
     """Everything structurally wrong with an FCPXML document, as messages.
 
     The previous check accepted ``<fcpxml><spine><asset-clip ref="missing"
@@ -452,7 +570,10 @@ def check_fcpxml(path: Path, *, check_media: bool = True) -> list[str]:
     * every time attribute parses as a rational and every duration is positive;
     * the sequence is long enough to contain every element placed in the spine;
     * referenced media exists on disk (``check_media``; relative ``src`` values
-      are resolved against the document, as Final Cut does).
+      are resolved against ``media_base_dir``, defaulting to the document's own
+      directory, as Final Cut does — a document validated while staged
+      elsewhere must be told where it will finally live, or its relative paths
+      resolve against the staging directory and every one looks missing).
 
     This is a strict structural + reference check, not DTD validation: the DTD
     is version-specific and not redistributable with this project, and fetching
@@ -489,10 +610,11 @@ def check_fcpxml(path: Path, *, check_media: bool = True) -> list[str]:
                 if not src:
                     problems.append(f"asset {rid!r} has no <media-rep src=...>")
                 elif check_media:
+                    rel_base = media_base_dir or path.parent
                     resolved = (
                         Path(unquote(src[len("file://") :]))
                         if src.startswith("file://")
-                        else path.parent / unquote(src)
+                        else rel_base / unquote(src)
                     )
                     if not resolved.exists():
                         problems.append(f"asset {rid!r} references missing media {src!r}")

@@ -40,6 +40,15 @@ class MediaInfo:
     # True only when the container reports a fixed frame rate we can trust for
     # a frame-count duration; VFR material must use timestamps instead.
     is_cfr: bool = True
+    # Length of the CONTAINER, as ffprobe reports it for the file as a whole.
+    # ``duration`` above is the PICTURE length (frame-accurate), which is what
+    # planning and timeline placement must use — but it is commonly a few
+    # frames shorter than the file, because the audio track runs past the last
+    # video frame. An NLE describes an asset by the file, so the FCPXML must
+    # declare this value: declaring the picture length instead makes the
+    # declared and the actual media disagree, and Final Cut then refuses to
+    # relink the file ("the media differs from the original").
+    container_duration: float | None = None
 
 
 # Muxer options for every WAV this project writes, placed immediately before
@@ -140,6 +149,7 @@ def probe(path: Path, timeout: float = 30.0) -> MediaInfo:
     if duration_str is None:
         raise RuntimeError(f"Could not determine duration for {path}")
     duration = float(duration_str)
+    container_duration = duration
 
     fps: Fraction | None = None
     width: int | None = None
@@ -220,6 +230,7 @@ def probe(path: Path, timeout: float = 30.0) -> MediaInfo:
         audio_bits_per_sample=audio_bits_per_sample,
         audio_stream_index=audio_index,
         is_cfr=is_cfr,
+        container_duration=container_duration,
     )
 
 

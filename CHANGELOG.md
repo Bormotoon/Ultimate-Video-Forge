@@ -4,6 +4,46 @@ All notable changes to WhisperSync will be documented in this file.
 
 ## [Unreleased]
 
+### The exported timeline could be scrambled, and the media unrelinkable
+
+Four defects found while diagnosing a real 16-clip shoot whose FCPXML imported
+as one unbroken ribbon of footage in an order nobody chose, and whose every MOV
+Final Cut then refused to relink. Each one alone corrupts an export; together
+they left no clip of that project at its measured position.
+
+- **A clip that could not be located no longer displaces one that could**
+  (`engine/pipeline.py`). Clips with no accepted alignment were chained from
+  the head of their own camera's timeline. On a shoot opening with silent
+  B-roll — eleven clips whose only transcript was "Hmm" — that laid the
+  unplaceable material straight over the located material, and every guessed
+  position was drawn exactly like a measured one. Unresolved clips are now
+  parked end-to-end AFTER all measured footage, where they stay reachable and
+  can displace nothing, and the warning says so.
+- **Overlapping clips are stacked, not queued** (`engine/export.py`). The spine
+  is sequential, so a clip laid there while another is still playing could only
+  be pushed past its own measured offset — taking everything behind it along.
+  One overlap therefore destroyed the whole timeline's positions. Only a
+  non-overlapping chain now stays in the spine; an overlapping clip is promoted
+  to a connected clip on a lane above every camera's, keeping its real position
+  and making the disagreement visible instead of hiding it in a reshuffle.
+- **An asset declares the length of its FILE, not of its picture**
+  (`engine/media.py`, `engine/export.py`). A MOV whose audio runs past the last
+  video frame is longer than its picture; the export declared the picture
+  length, Final Cut compared the declaration against the real file and refused
+  to relink it ("the media differs from the original") — on 10 of 16 clips, by
+  up to 6 frames. The rendered ambience was worse: it inherited the SOURCE
+  VIDEO's duration, which no rendered WAV matches exactly. Both now come from
+  the file itself, floored to the frame grid so the declared length can never
+  run past the end of the media, while the TIMELINE keeps using the
+  frame-accurate picture length. A clip is trimmed if its plan asks for more
+  than its file holds.
+- **Relative media paths finally apply** (`engine/export.py`,
+  `engine/pipeline.py`). The document is staged in a scratch directory and
+  moved into place, so paths were resolved against the staging directory:
+  nothing was ever relative, and the rendered audio sitting beside the finished
+  project was referenced by an absolute path. `generate_fcpxml` and
+  `check_fcpxml` now take the directory the document will finally live in.
+
 ### Audit remediation (PROJECT_AUDIT_2026-09-08)
 
 A project-wide audit found that the main risk was not style but **silently

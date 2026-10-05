@@ -668,3 +668,149 @@ def test_parse_rational_handles_ntsc_and_rejects_nonsense() -> None:
     assert parse_rational("nonsense") is None
     assert parse_rational("1/0s") is None
     assert parse_rational("") is None
+
+
+# --- overlapping primary-camera clips, asset durations, staged documents -----
+
+
+def _write_wav(path: Path, seconds: float, rate: int = 48000, channels: int = 2) -> None:
+    """A real, probeable WAV — these tests turn on what ffprobe reports."""
+    import struct
+    import wave
+
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(struct.pack("<h", 0) * channels * int(round(seconds * rate)))
+
+
+def _mov(path: str, offset: float, dur: float, lane: int = 1) -> MediaClip:
+    return MediaClip(
+        path=Path(path), kind="video", offset=offset, in_point=0.0, duration=dur, lane=lane
+    )
+
+
+def _spine_positions(root: ET.Element) -> dict[str, float]:
+    """Timeline start of every spine element, by name (spine clocks are contiguous)."""
+    spine = root.find(".//spine")
+    out: dict[str, float] = {}
+    for el in spine:
+        off = parse_rational(el.get("offset", "0s")) or 0.0
+        if el.tag == "asset-clip":
+            out[el.get("name")] = off
+        for child in el.findall("asset-clip"):
+            out[child.get("name")] = off + (parse_rational(child.get("offset", "0s")) or 0.0)
+    return out
+
+
+def test_overlapping_clips_keep_their_positions_instead_of_being_queued(
+    tmp_path: Path,
+) -> None:
+    """An overlap must never push a measured clip along the spine.
+
+    The spine is sequential, so a clip laid there after one that is still
+    playing can only start later than it was measured to — and everything
+    behind it moves too. One such overlap turned a whole timeline into a single
+    unbroken ribbon in an order nobody chose. The later clip belongs on a lane
+    above instead, at the position it was actually measured at.
+    """
+    clips = [
+        _mov("/v/a.mov", offset=0.0, dur=100.0),
+        _mov("/v/b.mov", offset=50.0, dur=10.0),  # overlaps a
+        _mov("/v/c.mov", offset=120.0, dur=10.0),  # clear of both
+    ]
+    plan = SyncPlan(strategy_id=1, clips=clips, total_duration=130.0)
+    out = tmp_path / "overlap.fcpxml"
+    generate_fcpxml(
+        plan, [_vinfo("/v/a.mov", 100.0), _vinfo("/v/b.mov", 10.0), _vinfo("/v/c.mov", 10.0)], out
+    )
+    root = ET.parse(out).getroot()
+
+    pos = _spine_positions(root)
+    assert abs(pos["a"] - 0.0) < 0.05
+    assert abs(pos["b"] - 50.0) < 0.05  # NOT pushed to 100
+    assert abs(pos["c"] - 120.0) < 0.05  # NOT pushed to 110
+
+    # b left the storyline for a lane above every camera's.
+    spine_names = [el.get("name") for el in root.find(".//spine") if el.tag == "asset-clip"]
+    assert spine_names == ["a", "c"]
+    b_el = root.find(".//asset-clip[@name='b']")
+    assert int(b_el.get("lane")) > 1
+
+
+def test_asset_duration_describes_the_file_not_the_picture(tmp_path: Path) -> None:
+    """Final Cut compares the declared media against the file when relinking.
+
+    A MOV whose audio runs past the last video frame is longer than its
+    picture. Declaring the picture length made the two disagree and Final Cut
+    refused to relink the file, while the TIMELINE must still use the
+    frame-accurate picture length so it never places frames that do not exist.
+    """
+    info = _vinfo("/v/a.mov", 6.5065)  # 195 frames of picture
+    info.container_duration = 6.6133  # ...in a file 0.1 s longer
+    plan = SyncPlan(strategy_id=1, clips=[_mov("/v/a.mov", 0.0, 6.5065)], total_duration=6.5065)
+    out = tmp_path / "asset_dur.fcpxml"
+    generate_fcpxml(plan, [info], out)
+    root = ET.parse(out).getroot()
+
+    asset_dur = parse_rational(root.find(".//asset").get("duration"))
+    clip_dur = parse_rational(root.find(".//spine/asset-clip").get("duration"))
+    assert abs(asset_dur - 6.6133) < 0.04  # the file, snapped to a frame
+    assert abs(clip_dur - 6.5065) < 0.001  # the picture
+    assert clip_dur <= asset_dur
+
+
+def test_clip_cannot_claim_media_past_the_end_of_its_asset(tmp_path: Path) -> None:
+    """A rendered WAV carries the SOURCE VIDEO's planned duration, and lands a
+    few milliseconds either side of it. When it lands short, the clip must be
+    trimmed to what exists rather than running past the end of its media."""
+    wav = tmp_path / "amb.wav"
+    _write_wav(wav, seconds=9.9, rate=48000)
+    clips = [
+        _mov("/v/a.mov", 0.0, 10.0),
+        MediaClip(path=wav, kind="audio", offset=0.0, in_point=0.0, duration=10.0, lane=-2),
+    ]
+    plan = SyncPlan(strategy_id=1, clips=clips, total_duration=10.0)
+    out = tmp_path / "short.fcpxml"
+    generate_fcpxml(plan, [_vinfo("/v/a.mov", 10.0)], out)
+    root = ET.parse(out).getroot()
+
+    asset = root.find(f".//asset[@name='{wav.stem}']")
+    asset_dur = parse_rational(asset.get("duration"))
+    clip_dur = parse_rational(root.find(f".//asset-clip[@name='{wav.stem}']").get("duration"))
+    assert abs(asset_dur - 9.9) < 0.01  # the rendered file's own length
+    assert clip_dur <= asset_dur + 1e-9
+
+
+def test_staged_document_still_writes_paths_relative_to_where_it_lands(
+    tmp_path: Path,
+) -> None:
+    """The pipeline writes the XML to a scratch dir and moves it into place.
+
+    Resolving relative media against the scratch dir means nothing is ever
+    relative, so the co-located rendered audio gets an absolute path and the
+    project stops being portable — the portability support silently never
+    applying to a single real run.
+    """
+    final_dir = tmp_path / "project"
+    (final_dir / "audio_synced").mkdir(parents=True)
+    wav = final_dir / "audio_synced" / "voice.wav"
+    _write_wav(wav, seconds=10.0, rate=48000)
+    staged = tmp_path / "scratch" / "out.fcpxml"
+    staged.parent.mkdir()
+
+    clips = [
+        _mov("/v/a.mov", 0.0, 10.0),
+        MediaClip(path=wav, kind="audio", offset=0.0, in_point=0.0, duration=10.0, lane=-1),
+    ]
+    plan = SyncPlan(strategy_id=1, clips=clips, total_duration=10.0)
+    generate_fcpxml(plan, [_vinfo("/v/a.mov", 10.0)], staged, media_base_dir=final_dir)
+    root = ET.parse(staged).getroot()
+
+    srcs = {a.get("name"): a.find("media-rep").get("src") for a in root.findall(".//asset")}
+    assert srcs["voice"] == "audio_synced/voice.wav"
+    # ...and validation of the staged file must resolve them the same way.
+    assert check_fcpxml(staged, check_media=True, media_base_dir=final_dir) == [
+        "asset 'r2' references missing media 'file:///v/a.mov'"
+    ]

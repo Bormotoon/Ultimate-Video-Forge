@@ -135,6 +135,35 @@ def test_unaligned_clip_falls_back_to_previous_end() -> None:
     assert unaligned == [1]
 
 
+def test_unaligned_clips_are_parked_after_all_measured_footage() -> None:
+    """A guessed position must never overlap a measured one.
+
+    A shoot that opens with silent B-roll produces exactly this: the silent
+    clips align to nothing, and chaining them from the head of their camera's
+    timeline lays them straight over the located material. The overlap then
+    reaches the exporter, whose spine is sequential, and the real footage gets
+    shoved along by clips that were never placed at all.
+    """
+    # clips 0 and 1 are silent (no alignment); clips 2 and 3 are measured.
+    offsets, unaligned = compute_master_offsets(
+        [None, None, _align(0.0), _align(100.0)],
+        durations=[6.0, 320.0, 50.0, 25.0],
+        clip_camera=[0, 0, 0, 0],
+    )
+    assert unaligned == [0, 1]
+    assert offsets[2] == 0.0
+    assert abs(offsets[3] - 100.0) < 1e-9
+    measured_end = 125.0  # clip 3 ends here
+    assert offsets[0] >= measured_end
+    assert offsets[1] >= offsets[0] + 6.0  # parked clips stay in order, end to end
+
+
+def test_all_unaligned_still_lays_everything_out_from_zero() -> None:
+    offsets, unaligned = compute_master_offsets([None, None], durations=[10.0, 5.0])
+    assert offsets == [0.0, 10.0]
+    assert unaligned == [0, 1]
+
+
 def _fake_probe(path: Path, timeout: float = 30.0):  # noqa: ANN202
     from fractions import Fraction
 
@@ -166,9 +195,7 @@ def test_scan_cameras_flat_dir_is_single_camera(tmp_path, monkeypatch) -> None: 
     assert warns == []
 
 
-def test_scan_cameras_subfolders_become_separate_lanes(
-    tmp_path, monkeypatch
-) -> None:  # noqa: ANN001
+def test_scan_cameras_subfolders_become_separate_lanes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.setattr("whispersync.engine.pipeline.probe", _fake_probe)
     (tmp_path / "camA").mkdir()
     (tmp_path / "camB").mkdir()

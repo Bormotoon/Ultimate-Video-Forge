@@ -233,14 +233,21 @@ def compute_master_offsets(
     matched recorder start time ``-offset/k``, anchored so the earliest clip
     sits at 0.
 
-    A clip with no accepted alignment has NO measured position. It is placed
-    after the previous clip OF ITS OWN CAMERA and reported, so the caller can
-    mark it unresolved. A single shared cursor (the previous behaviour) put
-    camera B's first unplaceable clip after camera A's last clip — a position
-    invented out of an unrelated camera's running time, presented on the
-    timeline exactly like a measured one. ``clip_camera`` (camera index per
-    clip) is optional only so existing callers/tests keep working; without it
-    every clip is treated as one camera.
+    A clip with no accepted alignment has NO measured position, so it is parked
+    END-TO-END AFTER EVERY MEASURED CLIP and reported, letting the caller mark
+    it unresolved. Two earlier rules both failed the same way: a single shared
+    cursor put camera B's first unplaceable clip after camera A's last clip,
+    and per-camera chaining (which replaced it) put an unplaceable clip after
+    the previous clip of its own camera — which, for a shoot whose opening
+    clips are silent B-roll, means the head of the timeline. Those invented
+    positions then OVERLAP the measured ones and are drawn exactly like them,
+    so the real footage gets pushed aside by material that was never located.
+    Parking them past the end keeps unresolved footage in the project and
+    reachable, while guaranteeing it can never displace a measurement.
+
+    ``clip_camera`` is accepted for call compatibility; placement no longer
+    depends on it, since a guessed position is not more credible for coming
+    from the same camera.
 
     Returns (offsets, unaligned_indices).
     """
@@ -253,19 +260,23 @@ def compute_master_offsets(
 
     aligned = [r for r in rec_starts if r is not None]
     ref = min(aligned) if aligned else 0.0
-    cams = clip_camera if clip_camera is not None else [0] * len(durations)
+
+    # Where the measured material ends — the start of the parking area.
+    measured_end = 0.0
+    for rs, dur in zip(rec_starts, durations, strict=True):
+        if rs is not None:
+            measured_end = max(measured_end, rs - ref + dur)
 
     offsets: list[float] = []
     unaligned: list[int] = []
-    prev_end: dict[int, float] = {}
-    for i, (rs, dur, cam) in enumerate(zip(rec_starts, durations, cams, strict=True)):
+    cursor = measured_end
+    for i, (rs, dur) in enumerate(zip(rec_starts, durations, strict=True)):
         if rs is not None:
-            off = rs - ref
+            offsets.append(rs - ref)
         else:
-            off = prev_end.get(cam, 0.0)
+            offsets.append(cursor)
+            cursor += dur
             unaligned.append(i)
-        offsets.append(off)
-        prev_end[cam] = off + dur
     return offsets, unaligned
 
 
@@ -1813,8 +1824,9 @@ def _run_pipeline_locked(  # noqa: C901
         for i in unaligned:
             warnings.append(
                 f"{video_clips[i].path.name}: UNRESOLVED — no accepted alignment to the "
-                "primary recorder; placed after the previous clip of its own camera. "
-                "Its position on the timeline is a guess, not a measurement."
+                "primary recorder; parked at the END of the timeline, after all located "
+                "footage, so it cannot displace it. It has no measured position: place "
+                "it by hand, or check why it did not align (silent clip? wrong recorder?)."
             )
 
         aligned_primary = [primary_aligns[i] is not None for i in range(n)]
@@ -2690,8 +2702,13 @@ def _run_pipeline_locked(  # noqa: C901
             config.fcpxml_version,
             output_path.stem,
             audio_sample_rate=out_sr,  # matches the rendered synced WAVs
+            # Relative media paths must resolve from where the document ENDS UP,
+            # not from the scratch directory it is staged in.
+            media_base_dir=output_path.parent,
         )
-        export_problems = check_fcpxml(staged_fcpxml, check_media=True)
+        export_problems = check_fcpxml(
+            staged_fcpxml, check_media=True, media_base_dir=output_path.parent
+        )
         if export_problems:
             warnings.append(
                 "Generated FCPXML failed validation — Final Cut Pro may refuse to "
