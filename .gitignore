@@ -18,6 +18,8 @@ venv/
 fixtures/generated/
 *.log
 *.lock
+!legacy/forge/requirements.lock
+!legacy/forge/requirements-dev.lock
 
 # Editors and operating systems
 .idea/
