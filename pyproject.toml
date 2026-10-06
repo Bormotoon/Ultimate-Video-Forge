@@ -14,6 +14,7 @@ authors = [{ name = "Bormotoon" }]
 dependencies = [
     "numpy>=1.26.0,<3",
     "platformdirs>=4.0.0,<5",
+    "PyQt6>=6.7.0,<7",
     "PyYAML>=6.0.1,<7",
 ]
 
