@@ -57,9 +57,25 @@ class SyncStage:
         recorders = [asset for asset in context.project.assets if asset.role is AssetRole.RECORDER]
         placements: list[SourcePlacement] = []
         warps: list[AudioWarpMap] = []
-        for camera in cameras:
+        for index, camera in enumerate(cameras):
             duration = _duration(camera)
-            placements.append(SourcePlacement(camera.id, 0.0, 0.0, duration, provenance="metadata"))
+            camera_offset = 0.0
+            provenance = "metadata"
+            if index and not recorders:
+                primary = Transcript.load(context.project.transcripts[cameras[0].id])
+                candidate = Transcript.load(context.project.transcripts[camera.id])
+                anchors = text_anchors(primary, candidate)
+                camera_offset, _camera_k, _residual = fit_alignment(anchors)
+                provenance = "text"
+            placements.append(
+                SourcePlacement(
+                    camera.id,
+                    camera_offset,
+                    0.0,
+                    duration,
+                    provenance=provenance,
+                )
+            )
         if recorders:
             reference = recorders[0]
             recorder_transcript = Transcript.load(context.project.transcripts[reference.id])
@@ -79,7 +95,8 @@ class SyncStage:
                         {"inliers": float(len(anchors)), "residual_ms": residual * 1000},
                     )
                 )
-                strategy = 3 if mode == "complex" else 1
+                selected_mode = choose_sync_mode(mode, duration, k, residual)
+                strategy = 3 if selected_mode == "complex" else 1
                 warps.append(
                     AudioWarpMap(
                         f"warp-{reference.id}-{camera.id}",
@@ -146,6 +163,22 @@ def fit_alignment(anchors: list[TextAnchor]) -> tuple[float, float, float]:
         sum((y - (offset + k * x)) ** 2 for x, y in zip(xs, ys, strict=True)) / len(xs)
     ) ** 0.5
     return offset, k, residual
+
+
+def choose_sync_mode(
+    requested: str,
+    duration_s: float,
+    k: float,
+    residual_s: float,
+    *,
+    max_drift_ms: float = 20.0,
+) -> str:
+    if requested != "auto":
+        return requested
+    accumulated_drift_ms = abs(k - 1.0) * duration_s * 1000
+    if accumulated_drift_ms < max_drift_ms and residual_s < 0.02:
+        return "simple"
+    return "complex"
 
 
 def _required_transcripts(project: Project) -> list[str]:

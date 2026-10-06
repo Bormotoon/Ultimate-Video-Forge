@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from studio.core.transcript import Segment, Transcript, Word
-from studio.stages.sync import fit_alignment, text_anchors
+from studio.stages.sync import choose_sync_mode, fit_alignment, text_anchors
 
 
 def _transcript(times: list[float], words: list[str]) -> Transcript:
@@ -31,3 +31,9 @@ def test_repeated_words_are_not_used_as_ambiguous_anchors() -> None:
     recorder = _transcript([0, 1, 2], ["same", "same", "unique"])
     camera = _transcript([3, 4, 5], ["same", "same", "unique"])
     assert [anchor.token for anchor in text_anchors(camera, recorder)] == ["unique"]
+
+
+def test_auto_mode_uses_accumulated_drift_threshold() -> None:
+    assert choose_sync_mode("auto", 10, 1.0005, 0.005) == "simple"
+    assert choose_sync_mode("auto", 600, 1.0005, 0.005) == "complex"
+    assert choose_sync_mode("camera", 600, 1.2, 1.0) == "camera"
