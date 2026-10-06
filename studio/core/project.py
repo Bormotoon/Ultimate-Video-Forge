@@ -52,6 +52,7 @@ class Project:
     source_dir: Path
     work_dir: Path
     assets: list[Asset] = field(default_factory=list)
+    transcripts: dict[str, Path] = field(default_factory=dict)
     outputs: dict[str, list[Path]] = field(default_factory=dict)
     plan_revision: int = 1
     version: int = 1
@@ -78,6 +79,7 @@ class Project:
                 }
                 for asset in self.assets
             ],
+            "transcripts": {key: str(value) for key, value in self.transcripts.items()},
             "outputs": {key: [str(path) for path in paths] for key, paths in self.outputs.items()},
         }
 
@@ -102,6 +104,9 @@ class Project:
                 )
                 for item in data.get("assets", [])
             ],
+            transcripts={
+                key: Path(value) for key, value in data.get("transcripts", {}).items()
+            },
             outputs={
                 key: [Path(value) for value in values]
                 for key, values in data.get("outputs", {}).items()
