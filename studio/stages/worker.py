@@ -15,6 +15,7 @@ from studio.stages.base import Stage, StageContext
 from studio.stages.events import EventType, StageEvent
 from studio.stages.export import ExportStage
 from studio.stages.prepare import PrepareStage
+from studio.stages.program import ProgramStage
 from studio.stages.roughcut import RoughcutStage
 from studio.stages.scan import ScanStage
 from studio.stages.sync import SyncStage
@@ -31,6 +32,7 @@ def stage_registry() -> dict[str, Stage]:
         TimelineStage(),
         RoughcutStage(),
         ExportStage(),
+        ProgramStage(),
     ]
     return {stage.id: stage for stage in stages}
 
