@@ -99,7 +99,8 @@ jobs:
       - name: Build and smoke-test the frozen executable
         run: |
           pyinstaller --noconfirm --clean packaging/pyinstaller/studio.spec
-          dist/studio --check-resources
+          dist/studio --version
+          dist/studio doctor
 
   cross-platform:
     name: Installed artifact smoke (${{ matrix.os }})

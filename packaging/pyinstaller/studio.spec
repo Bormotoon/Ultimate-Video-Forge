@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller smoke specification for Studio."""
+"""PyInstaller specification for the Studio CLI."""
 
 from pathlib import Path
 
@@ -7,7 +7,7 @@ root = Path(SPEC).resolve().parents[2]
 resource_root = root / "studio" / "resources"
 
 a = Analysis(
-    [str(root / "studio" / "app.py")],
+    [str(root / "studio" / "cli" / "main.py")],
     pathex=[str(root)],
     binaries=[],
     datas=[
@@ -16,7 +16,15 @@ a = Analysis(
         (str(resource_root / "fonts"), "studio/resources/fonts"),
         (str(resource_root / "subtitle_editor"), "studio/resources/subtitle_editor"),
     ],
-    hiddenimports=["studio.resources", "yaml", "platformdirs"],
+    hiddenimports=[
+        "studio.resources",
+        "studio.stages.worker",
+        "yaml",
+        "platformdirs",
+        "PyQt6.QtCore",
+        "PyQt6.QtGui",
+        "PyQt6.QtWidgets",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
