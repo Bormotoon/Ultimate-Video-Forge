@@ -35,7 +35,7 @@ class Sequence:
 class ExportStage:
     id = "export"
     title = "NLE export"
-    after: tuple[str, ...] = ("timeline",)
+    after: tuple[str, ...] = ("timeline", "roughcut")
     gpu = GpuUse.NONE
 
     def requirements(self, settings: dict[str, object]) -> list[Requirement]:
