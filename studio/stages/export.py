@@ -53,10 +53,12 @@ class ExportStage:
 
     def run(self, context: StageContext) -> StageOutput:
         sequence = build_sequence(context.project)
-        output = context.work_dir / "export" / f"{sequence.name}.fcpxml"
-        write_fcpxml(sequence, output, media_base=context.project.source_dir)
-        outputs = {**context.project.outputs, "export": [output]}
-        return StageOutput((output,), {"outputs": outputs})
+        fcpxml = context.work_dir / "export" / f"{sequence.name}.fcpxml"
+        xmeml = context.work_dir / "export" / f"{sequence.name}.xml"
+        write_fcpxml(sequence, fcpxml, media_base=context.project.source_dir)
+        write_xmeml(sequence, xmeml)
+        outputs = {**context.project.outputs, "export": [fcpxml, xmeml]}
+        return StageOutput((fcpxml, xmeml), {"outputs": outputs})
 
 
 def build_sequence(project: Project, name: str = "Studio") -> Sequence:
@@ -170,6 +172,65 @@ def fcpxml_intervals(path: Path) -> list[tuple[str, float, float]]:
     ]
 
 
+def write_xmeml(sequence: Sequence, output: Path) -> Path:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    root = ET.Element("xmeml", version="4")
+    sequence_el = ET.SubElement(root, "sequence", id="sequence-1")
+    ET.SubElement(sequence_el, "name").text = sequence.name
+    _xmeml_rate(sequence_el, sequence.fps)
+    duration = max(
+        _frames(clip.timeline_start_s + clip.duration_s, sequence.fps)
+        for clip in sequence.clips
+    )
+    ET.SubElement(sequence_el, "duration").text = str(duration)
+    media = ET.SubElement(sequence_el, "media")
+    video = ET.SubElement(media, "video")
+    for lane in sorted({clip.lane for clip in sequence.clips}):
+        track = ET.SubElement(video, "track")
+        for index, clip in enumerate(
+            (item for item in sequence.clips if item.lane == lane), 1
+        ):
+            item = ET.SubElement(track, "clipitem", id=f"v-{lane}-{index}")
+            ET.SubElement(item, "name").text = clip.path.stem
+            ET.SubElement(item, "enabled").text = "TRUE"
+            ET.SubElement(item, "start").text = str(
+                _frames(clip.timeline_start_s, sequence.fps)
+            )
+            ET.SubElement(item, "end").text = str(
+                _frames(clip.timeline_start_s + clip.duration_s, sequence.fps)
+            )
+            ET.SubElement(item, "in").text = str(
+                _frames(clip.source_in_s, sequence.fps)
+            )
+            ET.SubElement(item, "out").text = str(
+                _frames(clip.source_in_s + clip.duration_s, sequence.fps)
+            )
+            file_el = ET.SubElement(item, "file", id=f"file-{clip.asset_id}")
+            ET.SubElement(file_el, "name").text = clip.path.name
+            ET.SubElement(file_el, "pathurl").text = _xmeml_url(clip.path)
+            _xmeml_rate(file_el, sequence.fps)
+    ET.indent(root)
+    tree = ET.ElementTree(root)
+    with output.open("wb") as handle:
+        handle.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n')
+        tree.write(handle, encoding="utf-8", xml_declaration=False)
+    return output
+
+
+def xmeml_intervals(path: Path) -> list[tuple[str, float, float]]:
+    root = ET.parse(path).getroot()
+    sequence = root.find("sequence")
+    if sequence is None:
+        raise ValueError("xmeml has no sequence")
+    fps = _xmeml_fps(sequence)
+    intervals: list[tuple[str, float, float]] = []
+    for item in root.findall(".//video/track/clipitem"):
+        start = int(item.findtext("start", "0")) / float(fps)
+        end = int(item.findtext("end", "0")) / float(fps)
+        intervals.append((item.findtext("name", ""), start, end - start))
+    return intervals
+
+
 def _media_src(path: Path, base: Path) -> str:
     resolved = path.resolve()
     try:
@@ -179,7 +240,7 @@ def _media_src(path: Path, base: Path) -> str:
 
 
 def _frame_time(seconds: float, fps: Fraction) -> str:
-    frames = round(seconds * float(fps))
+    frames = _frames(seconds, fps)
     return f"{frames * fps.denominator}/{fps.numerator}s"
 
 
@@ -191,3 +252,27 @@ def _rational(seconds: float, denominator: int) -> str:
 def _parse_time(value: str) -> float:
     raw = value.removesuffix("s")
     return float(Fraction(raw))
+
+
+def _frames(seconds: float, fps: Fraction) -> int:
+    return round(seconds * float(fps))
+
+
+def _xmeml_rate(parent: ET.Element, fps: Fraction) -> None:
+    rate = ET.SubElement(parent, "rate")
+    ntsc = fps.denominator != 1
+    timebase = round(float(fps)) if ntsc else fps.numerator
+    ET.SubElement(rate, "timebase").text = str(timebase)
+    ET.SubElement(rate, "ntsc").text = "TRUE" if ntsc else "FALSE"
+
+
+def _xmeml_fps(sequence: ET.Element) -> Fraction:
+    timebase = int(sequence.findtext("rate/timebase", "25"))
+    if sequence.findtext("rate/ntsc") == "TRUE":
+        return Fraction(timebase * 1000, 1001)
+    return Fraction(timebase, 1)
+
+
+def _xmeml_url(path: Path) -> str:
+    uri = path.resolve().as_uri()
+    return "file://localhost/" + uri.removeprefix("file:///")
