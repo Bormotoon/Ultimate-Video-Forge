@@ -10,10 +10,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from studio import __version__
 from studio.core.project import Project
+from studio.core.settings import SettingsError, load_settings
 from studio.core.workspace import project_lock
 from studio.stages.planner import build_plan
 from studio.stages.runner import run_stage_process
@@ -35,16 +34,15 @@ def _project(source: Path) -> tuple[Project, Path, Path]:
     return project, project_path, settings_path
 
 
-def _settings(path: Path) -> dict[str, Any]:
-    value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(value, dict):
-        raise ValueError("settings root must be a mapping")
-    return value
+def _settings(path: Path, overrides: list[str] | None = None) -> dict[str, Any]:
+    return load_settings([path], overrides).to_dict()
 
 
-def _run_discovery(source: Path, *, include_prepare: bool) -> Project:
+def _run_discovery(
+    source: Path, *, include_prepare: bool, overrides: list[str] | None = None
+) -> Project:
     project, project_path, settings_path = _project(source)
-    settings = _settings(settings_path)
+    settings = _settings(settings_path, overrides)
     selected = [stage_registry()["scan"]]
     if include_prepare:
         selected.append(stage_registry()["prepare"])
@@ -58,9 +56,9 @@ def _run_discovery(source: Path, *, include_prepare: bool) -> Project:
     return Project.load(project_path)
 
 
-def _run_pipeline(source: Path) -> Project:
+def _run_pipeline(source: Path, overrides: list[str] | None = None) -> Project:
     project, project_path, settings_path = _project(source)
-    settings = _settings(settings_path)
+    settings = _settings(settings_path, overrides)
     registry = stage_registry()
     with project_lock(project.work_dir):
         while True:
@@ -111,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("source", type=Path)
         command.add_argument("--json", action="store_true")
+        command.add_argument("--set", action="append", default=[])
     commands.add_parser("doctor")
     return parser
 
@@ -120,14 +119,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "doctor":
         return _doctor()
     project = (
-        _run_pipeline(args.source)
+        _run_pipeline(args.source, args.set)
         if args.command == "run"
-        else _run_discovery(args.source, include_prepare=args.command == "plan")
+        else _run_discovery(
+            args.source, include_prepare=args.command == "plan", overrides=args.set
+        )
     )
     if args.command == "scan":
         data = project.to_dict()
     else:
-        settings = _settings(project.work_dir / "settings.yaml")
+        settings = _settings(project.work_dir / "settings.yaml", args.set)
         plan = build_plan(stage_registry().values(), project, settings)
         data = {
             "revision": plan.revision,
@@ -146,4 +147,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except SettingsError as exc:
+        print(f"settings error: {exc}")
+        raise SystemExit(2) from exc
