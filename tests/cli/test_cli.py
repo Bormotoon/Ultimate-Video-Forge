@@ -12,6 +12,13 @@ def test_scan_and_plan_fixture_through_workers(tmp_path: Path, capsys) -> None: 
     assert len(scan["assets"]) == 4
     assert main(["plan", str(source), "--json"]) == 0
     plan = json.loads(capsys.readouterr().out)
-    assert [stage["id"] for stage in plan["stages"]] == ["scan", "prepare", "transcribe"]
+    assert [stage["id"] for stage in plan["stages"]] == [
+        "scan",
+        "prepare",
+        "transcribe",
+        "sync",
+        "timeline",
+        "export",
+    ]
     assert all(stage["reuse"] for stage in plan["stages"][:2])
     assert plan["stages"][2]["decision"] == "run"

@@ -58,6 +58,33 @@ def _run_discovery(source: Path, *, include_prepare: bool) -> Project:
     return Project.load(project_path)
 
 
+def _run_pipeline(source: Path) -> Project:
+    project, project_path, settings_path = _project(source)
+    settings = _settings(settings_path)
+    registry = stage_registry()
+    with project_lock(project.work_dir):
+        while True:
+            project = Project.load(project_path)
+            plan = build_plan(registry.values(), project, settings)
+            candidate = next(
+                (
+                    item
+                    for item in plan.stages
+                    if item.decision.kind.value == "run" and not item.will_reuse
+                ),
+                None,
+            )
+            if candidate is None:
+                break
+            run_stage_process(
+                candidate.stage_id,
+                project_path,
+                settings_path,
+                candidate.fingerprint,
+            )
+    return Project.load(project_path)
+
+
 def _doctor() -> int:
     checks = {
         "ffmpeg": shutil.which("ffmpeg"),
@@ -92,7 +119,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "doctor":
         return _doctor()
-    project = _run_discovery(args.source, include_prepare=args.command in {"plan", "run"})
+    project = (
+        _run_pipeline(args.source)
+        if args.command == "run"
+        else _run_discovery(args.source, include_prepare=args.command == "plan")
+    )
     if args.command == "scan":
         data = project.to_dict()
     else:
