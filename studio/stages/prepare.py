@@ -38,7 +38,7 @@ class PrepareStage:
         reasons: dict[str, str] = {
             asset_id: "primary recorder transcript" for asset_id in recorders
         }
-        if not recorders or mode == "complex":
+        if not recorders or mode in {"auto", "complex"}:
             transcripts.extend(cameras)
             reasons.update(
                 {asset_id: "camera transcript required for placement" for asset_id in cameras}
