@@ -20,6 +20,7 @@ def test_scan_and_plan_fixture_through_workers(tmp_path: Path, capsys) -> None: 
         "timeline",
         "roughcut",
         "export",
+        "program",
     ]
     assert all(stage["reuse"] for stage in plan["stages"][:2])
     assert plan["stages"][2]["decision"] == "run"
