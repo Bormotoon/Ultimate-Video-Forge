@@ -43,5 +43,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
+def gui_main() -> int:
+    from studio.gui.main_window import main as launch_gui
+
+    return launch_gui()
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

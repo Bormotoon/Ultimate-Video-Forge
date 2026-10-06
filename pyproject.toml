@@ -33,6 +33,7 @@ dev = [
 
 [project.scripts]
 studio = "studio.cli.main:main"
+studio-gui = "studio.app:gui_main"
 
 [tool.setuptools.packages.find]
 include = ["studio*"]
