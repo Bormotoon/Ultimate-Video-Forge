@@ -12,6 +12,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from studio.core.timeline import AudioWarpMap, AudioWarpPiece, SourcePlacement, TimeDomain
+
 PROJECT_SCHEMA_VERSION = 1
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -52,6 +54,8 @@ class Project:
     source_dir: Path
     work_dir: Path
     assets: list[Asset] = field(default_factory=list)
+    placements: list[SourcePlacement] = field(default_factory=list)
+    audio_warp_maps: list[AudioWarpMap] = field(default_factory=list)
     transcripts: dict[str, Path] = field(default_factory=dict)
     outputs: dict[str, list[Path]] = field(default_factory=dict)
     plan_revision: int = 1
@@ -79,6 +83,19 @@ class Project:
                 }
                 for asset in self.assets
             ],
+            "placements": [asdict(placement) for placement in self.placements],
+            "audio_warp_maps": [
+                {
+                    "id": warp.id,
+                    "source_asset_id": warp.source_asset_id,
+                    "target_asset_id": warp.target_asset_id,
+                    "pieces": [asdict(piece) for piece in warp.pieces],
+                    "source_domain": warp.source_domain.value,
+                    "strategy": warp.strategy,
+                    "evidence": warp.evidence,
+                }
+                for warp in self.audio_warp_maps
+            ],
             "transcripts": {key: str(value) for key, value in self.transcripts.items()},
             "outputs": {key: [str(path) for path in paths] for key, paths in self.outputs.items()},
         }
@@ -103,6 +120,19 @@ class Project:
                     manual=item.get("manual", {}),
                 )
                 for item in data.get("assets", [])
+            ],
+            placements=[SourcePlacement(**item) for item in data.get("placements", [])],
+            audio_warp_maps=[
+                AudioWarpMap(
+                    id=item["id"],
+                    source_asset_id=item["source_asset_id"],
+                    target_asset_id=item.get("target_asset_id"),
+                    pieces=tuple(AudioWarpPiece(**piece) for piece in item["pieces"]),
+                    source_domain=TimeDomain(item["source_domain"]),
+                    strategy=int(item["strategy"]),
+                    evidence=item.get("evidence"),
+                )
+                for item in data.get("audio_warp_maps", [])
             ],
             transcripts={
                 key: Path(value) for key, value in data.get("transcripts", {}).items()

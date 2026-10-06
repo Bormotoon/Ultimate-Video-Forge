@@ -15,11 +15,12 @@ from studio.stages.base import Stage, StageContext
 from studio.stages.events import EventType, StageEvent
 from studio.stages.prepare import PrepareStage
 from studio.stages.scan import ScanStage
+from studio.stages.sync import SyncStage
 from studio.stages.transcribe import TranscribeStage
 
 
 def stage_registry() -> dict[str, Stage]:
-    stages: list[Stage] = [ScanStage(), PrepareStage(), TranscribeStage()]
+    stages: list[Stage] = [ScanStage(), PrepareStage(), TranscribeStage(), SyncStage()]
     return {stage.id: stage for stage in stages}
 
 

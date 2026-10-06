@@ -10,12 +10,20 @@ from studio.core.project import (
     describe_artifact,
     stable_fingerprint,
 )
+from studio.core.timeline import AudioWarpMap, AudioWarpPiece, SourcePlacement, TimeDomain
 
 
 def test_project_json_round_trip(tmp_path: Path) -> None:
     project = Project(
         source_dir=Path("."), work_dir=Path("_studio"),
         assets=[Asset("cam-a", Path("camera/a.mov"), AssetKind.VIDEO, AssetRole.CAMERA)],
+        placements=[SourcePlacement("cam-a", 0, 0, 10)],
+        audio_warp_maps=[
+            AudioWarpMap(
+                "warp", "rec", "cam-a", (AudioWarpPiece(0, 10, 0, 10, "copy"),),
+                TimeDomain.FILE, 1,
+            )
+        ],
     )
     path = tmp_path / "project.json"
     project.save(path)
