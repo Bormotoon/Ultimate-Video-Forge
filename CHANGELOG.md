@@ -4,6 +4,13 @@ All notable changes to Studio will be documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Workers receive a private snapshot of effective settings, including CLI overrides;
+  manifests record the settings actually used, without modifying project YAML.
+- Invalid CLI settings return exit code 2 through the installed console entry
+  point and write diagnostics to stderr, keeping JSON stdout clean.
+
 ### Added
 
 - Frozen source snapshots for WhisperSync and Podcast Reels Forge.

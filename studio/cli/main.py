@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -50,7 +51,10 @@ def _run_discovery(
         for stage in selected:
             project = Project.load(project_path)
             fingerprint = stage.fingerprint(project, settings)
-            result = run_stage_process(stage.id, project_path, settings_path, fingerprint)
+            result = run_stage_process(
+                stage.id, project_path, settings_path, fingerprint,
+                effective_settings=settings,
+            )
             if not result.manifest.reusable(project.work_dir, fingerprint):
                 raise RuntimeError(f"stage {stage.id} did not publish a reusable result")
     return Project.load(project_path)
@@ -79,6 +83,7 @@ def _run_pipeline(source: Path, overrides: list[str] | None = None) -> Project:
                 project_path,
                 settings_path,
                 candidate.fingerprint,
+                effective_settings=settings,
             )
     return Project.load(project_path)
 
@@ -115,6 +120,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        return _main(argv)
+    except SettingsError as exc:
+        print(f"settings error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "doctor":
         return _doctor()
@@ -147,8 +160,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except SettingsError as exc:
-        print(f"settings error: {exc}")
-        raise SystemExit(2) from exc
+    raise SystemExit(main())
