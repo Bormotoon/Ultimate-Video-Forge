@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Sequence
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +56,8 @@ def execute(stage_id: str, project_path: Path, settings_path: Path) -> int:
                 raise ValueError("settings root must be a mapping")
             settings = loaded
     _emit(StageEvent(EventType.START, stage_id))
-    output = stage.run(StageContext(project, settings, project.work_dir))
+    with redirect_stdout(sys.stderr):
+        output = stage.run(StageContext(project, settings, project.work_dir))
     for key, value in output.project_changes.items():
         if not hasattr(project, key):
             raise ValueError(f"stage returned unknown project field: {key}")
@@ -79,7 +82,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return execute(args.stage_id, args.project, args.settings)
     except Exception as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False), flush=True)
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr, flush=True)
+        _emit(StageEvent(EventType.DONE, args.stage_id, {"status": "failed"}))
         return 1
 
 

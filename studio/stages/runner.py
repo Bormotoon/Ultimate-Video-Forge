@@ -7,7 +7,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,34 +76,36 @@ def _run_stage_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         start_new_session=os.name != "nt",
     )
-    events: list[StageEvent] = []
-    assert process.stdout is not None
-    while process.poll() is None:
-        if cancelled():
+    try:
+        while True:
+            if cancelled():
+                raise StageProcessError(f"stage {stage_id} was cancelled")
+            try:
+                # communicate drains BOTH pipes while the deadline keeps
+                # cancellation responsive even when stdout stays silent.
+                stdout, stderr = process.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if process.returncode != 0:
+            raise StageProcessError(
+                f"stage {stage_id} exited {process.returncode}: {stderr.strip()}"
+            )
+        events = _parse_events(stdout, stage_id)
+    except BaseException:
+        _stop_process_tree(process, terminate_after_s)
+        raise
+    finally:
+        if process.poll() is None:
             _stop_process_tree(process, terminate_after_s)
-            raise StageProcessError(f"stage {stage_id} was cancelled")
-        line = process.stdout.readline()
-        if line:
-            event = StageEvent.from_json(line)
-            if event.stage != stage_id:
-                _stop_process_tree(process, terminate_after_s)
-                raise StageProcessError(f"worker emitted event for unexpected stage {event.stage}")
-            events.append(event)
-        else:
-            time.sleep(0.02)
-    remainder = process.stdout.read()
-    for line in remainder.splitlines():
-        if line:
-            events.append(StageEvent.from_json(line))
-    assert process.stderr is not None
-    stderr = process.stderr.read().strip()
-    if process.returncode != 0:
-        raise StageProcessError(f"stage {stage_id} exited {process.returncode}: {stderr}")
-    done = next((event for event in reversed(events) if event.type is EventType.DONE), None)
-    if done is None or done.payload.get("status") != "ok":
-        raise StageProcessError(f"stage {stage_id} exited without a successful done event")
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
     artifact_paths = [
         Path(event.payload["path"])
         for event in events
@@ -127,18 +128,46 @@ def _run_stage_process(
     return RunResult(tuple(events), manifest)
 
 
+def _parse_events(stdout: str, stage_id: str) -> list[StageEvent]:
+    events: list[StageEvent] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = StageEvent.from_json(line)
+        except (ValueError, TypeError) as exc:
+            raise StageProcessError(f"stage {stage_id}: {exc}") from exc
+        if event.stage != stage_id:
+            raise StageProcessError(f"worker emitted event for unexpected stage {event.stage}")
+        if events and events[-1].type is EventType.DONE:
+            raise StageProcessError(f"stage {stage_id} emitted an event after done")
+        events.append(event)
+    if not events or events[0].type is not EventType.START:
+        raise StageProcessError(f"stage {stage_id} exited without a start event")
+    if events[-1].type is not EventType.DONE or events[-1].payload.get("status") != "ok":
+        raise StageProcessError(f"stage {stage_id} exited without a successful done event")
+    return events
+
+
 def _stop_process_tree(process: subprocess.Popen[str], grace_s: float) -> None:
     if process.poll() is not None:
         return
-    if os.name == "nt":
-        process.terminate()
-    else:
-        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        process.wait()
+        return
     try:
         process.wait(timeout=grace_s)
     except subprocess.TimeoutExpired:
-        if os.name == "nt":
-            process.kill()
-        else:
-            os.killpg(process.pid, signal.SIGKILL)
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         process.wait()

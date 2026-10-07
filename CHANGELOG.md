@@ -6,6 +6,9 @@ All notable changes to Studio will be documented in this file.
 
 ### Fixed
 
+- Worker cancellation remains responsive without stdout output, both pipes are
+  drained concurrently, and buffered events receive the same protocol checks.
+- Worker diagnostics use stderr; failures emit a protocol-valid failed event.
 - Workers receive a private snapshot of effective settings, including CLI overrides;
   manifests record the settings actually used, without modifying project YAML.
 - Invalid CLI settings return exit code 2 through the installed console entry
