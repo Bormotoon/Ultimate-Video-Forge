@@ -83,6 +83,8 @@ class ProgramSettings:
     enabled: bool = False
     encoder: str = "auto"
     fps: str = "auto"
+    speaker_cameras: dict[str, str] = field(default_factory=dict)
+    min_shot_s: float = 1.0
 
 
 @dataclass(slots=True)
@@ -182,6 +184,10 @@ def validate_settings(settings: Settings) -> None:
     ):
         raise SettingsError("speakers.silence_floor_db must be between -100 and 0")
     _one_of("program.encoder", settings.program.encoder, {"auto", "nvenc", "libx264", "cpu"})
+    _non_negative("program.min_shot_s", settings.program.min_shot_s)
+    if any(not key.strip() or not value.strip()
+           for key, value in settings.program.speaker_cameras.items()):
+        raise SettingsError("program.speaker_cameras requires nonempty speaker and camera names")
     if settings.program.fps != "auto":
         from fractions import Fraction
 

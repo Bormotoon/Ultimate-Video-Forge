@@ -26,8 +26,8 @@ from studio.stages.program_encoder import select_encoder
 class ProgramStage:
     id = "program"
     title = "Review master"
-    after: tuple[str, ...] = ("timeline", "roughcut")
-    optional_after = ("roughcut",)
+    after: tuple[str, ...] = ("timeline", "roughcut", "speakers")
+    optional_after = ("roughcut", "speakers")
     gpu = GpuUse.NVENC
 
     def requirements(self, settings: dict[str, object]) -> list[Requirement]:
@@ -42,7 +42,10 @@ class ProgramStage:
         edit_path = _edit_path(project)
         edit = edit_path.read_text(encoding="utf-8") if edit_path.is_file() else ""
         return stable_fingerprint(
-            "program-v5", edit, project.placements, project.outputs.get("sync"),
+            "program-v6", edit, project.placements, project.outputs.get("sync"),
+            [path.read_text(encoding="utf-8") for path in project.outputs.get("speakers", [])
+             if path.is_file()],
+            [(asset.id, asset.group_id) for asset in project.assets],
             [describe_artifact(project.work_dir, path)
              for key, paths in project.outputs.items() if key.startswith("sync:")
              for path in paths if path.is_file()],
@@ -62,12 +65,33 @@ class ProgramStage:
         output.parent.mkdir(parents=True, exist_ok=True)
         conf = context.settings.get("program", {})
         conf = conf if isinstance(conf, dict) else {}
+        mapping = conf.get("speaker_cameras", {})
+        if mapping:
+            from studio.stages.camera_selection import speaker_camera_edit
+
+            paths = context.project.outputs.get("speakers", [])
+            if not paths or not paths[0].is_file():
+                raise ValueError("speaker camera selection requires speakers output; run speakers")
+            edit = speaker_camera_edit(
+                context.project, edit, json.loads(paths[0].read_text(encoding="utf-8")),
+                mapping, min_shot_s=float(conf.get("min_shot_s", 1.0)),
+            )
         render_report = render_project_program(
             context.project, edit, output, encoder=str(conf.get("encoder", "auto")),
             fps=str(conf.get("fps", "auto")),
         )
-        edited = map_transcript_to_edited(timeline, edit)
+        transcript_ranges = []
+        for item in edit.keep:
+            if transcript_ranges and abs(transcript_ranges[-1].end_s - item.start_s) < 1e-9:
+                transcript_ranges[-1] = KeepRange(transcript_ranges[-1].start_s, item.end_s)
+            else:
+                transcript_ranges.append(KeepRange(item.start_s, item.end_s))
+        edited = map_transcript_to_edited(timeline, EditMap(edit.id, tuple(transcript_ranges)))
         edited = align_transcript_to_frames(edited, render_report)
+        render_report["camera_plan"] = [
+            {"start_s": item.start_s, "end_s": item.end_s, "camera_id": item.camera_id}
+            for item in edit.keep
+        ]
         edited_path = context.work_dir / "program" / "program.transcript.json"
         edited.save(edited_path)
         report_path = output.with_name("render.json")

@@ -278,3 +278,15 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   Full suite: 225 passed; changed-file Ruff and diff checks pass.
 - Pyannote integration, speaker-driven camera switching and true NLE multicam
   export remain open; smoothing does not establish real-world speaker accuracy.
+
+### Speaker-driven review camera selection
+
+- Added `program.speaker_cameras` and `program.min_shot_s` for optional camera
+  switching from existing timeline speaker turns. Camera/group mappings are
+  coverage-aware; explicit edit choices win, uncertain speech holds the current
+  angle and missing preferred coverage falls back. Retained ranges remain intact.
+- Program depends optionally on speakers, fingerprints speaker reports/group IDs
+  and records its camera plan in render.json. Five regressions cover switching,
+  holds, coverage fallback/manual precedence, removed ranges and invalid mappings.
+- Full suite: 230 passed; changed-file Ruff and diff checks pass. Pyannote,
+  NLE multicam export and real-world speaker/camera acceptance remain open.

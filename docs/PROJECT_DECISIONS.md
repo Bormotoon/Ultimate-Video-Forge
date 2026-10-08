@@ -228,3 +228,12 @@ entry points and recorded project paths in the same change.
   are retained. Decisions use original neighbors in one pass to avoid cascades.
   Zero min_turn_s disables smoothing. Raw attribution is retained separately in
   diarization.raw.json / speakers_raw; reports record the policy and thresholds.
+
+- Review program supports explicit `program.speaker_cameras` mappings from speaker
+  names to camera asset/group IDs. Coverage boundaries and speaker turns split
+  retained ranges; unavailable preferred cameras fall back to a covered camera.
+  Unknown/overlap/unmapped speech holds the current covered camera. Explicit
+  edit camera choices take priority; minimum shot length defaults to one second.
+  Camera decisions are recorded in render.json; they do not modify roughcut input
+  or NLE exports. Adjacent camera cuts are merged for transcript retention so
+  words crossing a camera switch are not removed.
