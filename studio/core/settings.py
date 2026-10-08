@@ -33,6 +33,8 @@ class SyncSettings:
     recorder_mode: str = "best"
     boundary_flex: bool = False
     verify: bool = False
+    voice_segment_minutes: float = 0.0
+    master_wav: bool = False
 
 
 @dataclass(slots=True)
@@ -137,6 +139,7 @@ def validate_settings(settings: Settings) -> None:
     if settings.sync.strategy not in {1, 2, 3}:
         raise SettingsError("sync.strategy must be 1, 2, or 3")
     _non_negative("sync.max_drift_ms", settings.sync.max_drift_ms)
+    _non_negative("sync.voice_segment_minutes", settings.sync.voice_segment_minutes)
     _one_of("sync.recorder_mode", settings.sync.recorder_mode, {"best", "all"})
     for name in ("acoustic_grid_s", "acoustic_window_s", "acoustic_min_sharpness"):
         _positive(f"sync.{name}", getattr(settings.sync, name))

@@ -276,6 +276,23 @@ def _run_complex(context: StageContext) -> StageOutput:
         "padding": "silence is outside invertible source maps",
     }, indent=2) + "\n", encoding="utf-8")
     artifacts.append(report)
+    from studio.stages.sync_outputs import render_voice_master, segment_voice
+
+    if float(sync.get("voice_segment_minutes", 0)) > 0:
+        for camera in cameras:
+            segments = segment_voice(
+                outputs[f"sync:{camera.id}"][0], report.parent / "segments" / camera.id,
+                float(sync["voice_segment_minutes"]),
+            )
+            artifacts.extend(segments)
+            outputs[f"voice-segments:{camera.id}"] = list(segments)
+    if sync.get("master_wav"):
+        master = render_voice_master(
+            placements, {camera.id: outputs[f"sync:{camera.id}"][0] for camera in cameras},
+            context.work_dir / "export" / "voice-master.wav",
+        )
+        artifacts.append(master)
+        outputs["master_wav"] = [master]
     if sync.get("verify"):
         from studio.stages.sync_verify import measure
 

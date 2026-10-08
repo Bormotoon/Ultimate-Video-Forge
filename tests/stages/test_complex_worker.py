@@ -32,7 +32,8 @@ def test_complex_worker_publishes_real_voice_and_warp(tmp_path: Path, recorder_c
         transcripts["rec2"] = transcripts["rec"]
     Project(tmp_path, work, assets=assets, transcripts=transcripts).save(project_path)
     settings = work / "settings.yaml"
-    settings.write_text("sync:\n  mode: complex\n  recorder_mode: all\n")
+    settings.write_text("sync:\n  mode: complex\n  recorder_mode: all\n"
+                        "  master_wav: true\n  voice_segment_minutes: 0.02\n")
     result = run_stage_process("sync", project_path, settings, "complex-fp")
     project = Project.load(project_path)
     voice = project.outputs["sync:cam"][0]
@@ -44,5 +45,7 @@ def test_complex_worker_publishes_real_voice_and_warp(tmp_path: Path, recorder_c
     )
     assert len(project.outputs["sync-tracks:cam"]) == recorder_count
     assert len(project.audio_warp_maps) == recorder_count
+    assert project.outputs["master_wav"][0].is_file()
+    assert len(project.outputs["voice-segments:cam"]) == 4
     assert result.manifest.reusable(work, "complex-fp")
     assert not list(work.glob(".settings-*"))

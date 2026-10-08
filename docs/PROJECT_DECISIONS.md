@@ -149,3 +149,13 @@ entry points and recorded project paths in the same change.
   realized lag/coverage verdicts; `uvf verify CAMERA VOICE` returns nonzero for
   failed or inconclusive measurements. Convert numpy scalars to JSON numbers at
   the report boundary. No unmeasured window is counted as successful sync.
+
+- Voice segments use integer sample boundaries and preserve the original PCM
+  codec. Publish a rendered-audio segment index with frame offsets and durations;
+  retain the full voice WAV for existing export/program consumers. Use ffprobe
+  rather than Python wave for metadata because Python 3.10 cannot read extensible
+  24-bit WAV emitted by the renderer. Quiet-seam selection is still outstanding.
+- Optional voice-master WAV selects one replacement per timeline interval rather
+  than summing duplicated dialogue from overlapping cameras. Retime nonunity
+  camera clocks before mixing; preserve gaps with silence and use the existing
+  limiter-enabled timeline mixer. This is an unedited voice master.

@@ -177,3 +177,13 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   Realized waveform verification is migrated and exposed through `sync.verify`
   and CLI `verify`; identical generated audio passes the real measurement/CLI test.
   Enhancement, ambience, self-check/repair and master/segment outputs remain open.
+
+### Voice output continuation
+
+- `sync.voice_segment_minutes` now publishes sample-accurate PCM segments plus
+  a rendered-audio index. Full voice outputs remain available. Real PCM tests
+  reassemble segments byte-for-byte; worker tests include extensible 24-bit WAV.
+- `sync.master_wav` publishes an unedited stereo timeline voice master, chooses
+  one replacement on overlapping cameras, retimes camera clock ratios and uses
+  silence in uncovered ranges. Audio tests check duration and duplicate-level
+  prevention. Quiet seam selection and segment-based NLE links remain open.
