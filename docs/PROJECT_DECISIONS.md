@@ -159,3 +159,10 @@ entry points and recorded project paths in the same change.
   than summing duplicated dialogue from overlapping cameras. Retime nonunity
   camera clocks before mixing; preserve gaps with silence and use the existing
   limiter-enabled timeline mixer. This is an unedited voice master.
+
+- Migrate frozen content diagnosis and local re-alignment without algorithm changes.
+  `sync.self_check=warn` re-recognizes selected rendered voice and compares it with
+  the camera reference, publishes passed/failed/inconclusive outcomes and flagged
+  spans, then unloads the shared check model. Keep automatic repair unavailable
+  until replacement rendering, warp-map updates and post-repair verification are
+  integrated together; local re-alignment alone is not a completed repair feature.

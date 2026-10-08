@@ -35,6 +35,7 @@ class SyncSettings:
     verify: bool = False
     voice_segment_minutes: float = 0.0
     master_wav: bool = False
+    self_check: str = "off"
 
 
 @dataclass(slots=True)
@@ -141,6 +142,7 @@ def validate_settings(settings: Settings) -> None:
     _non_negative("sync.max_drift_ms", settings.sync.max_drift_ms)
     _non_negative("sync.voice_segment_minutes", settings.sync.voice_segment_minutes)
     _one_of("sync.recorder_mode", settings.sync.recorder_mode, {"best", "all"})
+    _one_of("sync.self_check", settings.sync.self_check, {"off", "warn"})
     for name in ("acoustic_grid_s", "acoustic_window_s", "acoustic_min_sharpness"):
         _positive(f"sync.{name}", getattr(settings.sync, name))
     _one_of("transcribe.device", settings.transcribe.device, {"auto", "cuda", "cpu"})

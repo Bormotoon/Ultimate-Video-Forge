@@ -276,6 +276,16 @@ def _run_complex(context: StageContext) -> StageOutput:
         "padding": "silence is outside invertible source maps",
     }, indent=2) + "\n", encoding="utf-8")
     artifacts.append(report)
+    if sync.get("self_check", "off") != "off":
+        from studio.stages.sync_check_step import check_voices
+
+        checks = check_voices(
+            dict(zip([camera.id for camera in cameras], camera_transcripts, strict=True)),
+            {camera.id: outputs[f"sync:{camera.id}"][0] for camera in cameras},
+            report.parent / "self-check", context.settings.get("transcribe", {}),
+        )
+        artifacts.extend(checks)
+        outputs["self_check"] = list(checks)
     from studio.stages.sync_outputs import render_voice_master, segment_voice
 
     if float(sync.get("voice_segment_minutes", 0)) > 0:

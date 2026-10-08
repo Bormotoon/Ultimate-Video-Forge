@@ -187,3 +187,16 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   one replacement on overlapping cameras, retimes camera clock ratios and uses
   silence in uncovered ranges. Audio tests check duration and duplicate-level
   prevention. Quiet seam selection and segment-based NLE links remain open.
+
+### Content self-check continuation
+
+- Preserved content diagnostics and local text/acoustic re-alignment are migrated.
+  Nineteen original regression cases pass, including empty-render content loss,
+  ASR jitter, repeated occurrences and local repair-alignment rejection.
+- `sync.self_check=warn` runs a shared Whisper engine on rendered voices, publishes
+  rendered transcripts and content reports, and unloads the model before leaving
+  the worker. Three frozen/migrated outcome parity cases and stage tests cover
+  report serialization and failed content outcomes. Actual model acceptance is open.
+- Automatic repair rendering and atomic warp-map replacement are not implemented;
+  repair mode is deliberately not accepted by settings yet. Ambience/enhancement
+  integration, master crossfades and remaining multicam tasks are still pending.
