@@ -381,3 +381,14 @@ an actual Whisper/model/NLE end-to-end acceptance run.
 - Regression covers three cuts, three camera channels, replacement voice and
   resolution of every link. Full suite: 243 passed; changed-file Ruff and diff
   checks pass. Premiere link/import and playback acceptance remain open.
+
+### Audio metadata and roles
+
+- Export probes rendered voice/ambience PCM metadata, including extensible WAV,
+  and emits actual channels/sample rates/bit depth. FCPXML labels voice as dialogue
+  and ambience as effects. Camera audio uses available scan metadata.
+- Real mono 24-bit 44.1 kHz voice and stereo 16-bit 48 kHz ambience regression
+  passes, along with FCPXML 1.9 DTD validation. Invalid placeholder fixtures were
+  replaced with actual WAV headers; invalid media does not silently pass probing.
+- Full suite: 244 passed; changed-file Ruff and diff checks pass. Camera bit-depth
+  discovery and actual NLE role/audio-layout interpretation remain open.

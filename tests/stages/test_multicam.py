@@ -104,8 +104,12 @@ def test_affine_multicam_trims_in_source_clock_and_retimes_audio(tmp_path: Path)
     project.assets = [Asset("a", Path("a.mov"), "video", AssetRole.CAMERA)]
     project.placements = [SourcePlacement("a", 2, 1, 4, 1.25)]
     voice, room = tmp_path / "voice.wav", tmp_path / "room.wav"
-    voice.touch()
-    room.touch()
+    import wave
+
+    for path in (voice, room):
+        with wave.open(str(path), "wb") as audio:
+            audio.setparams((1, 2, 48000, 0, "NONE", "PCM"))
+            audio.writeframes(b"\x00\x00" * 48000)
     edit = tmp_path / "edit.json"
     edit.write_text(json.dumps({"mode": "cut", "keep": [{"start": 3.25, "end": 5.75}]}))
     project.outputs = {"sync:a": [voice], "ambience:a": [room], "roughcut": [edit]}

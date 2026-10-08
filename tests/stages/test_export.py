@@ -53,7 +53,11 @@ def test_xmeml_round_trip_preserves_sequence_intervals(tmp_path: Path) -> None:
 
 def test_synced_voice_is_connected_and_original_audio_is_muted(tmp_path: Path) -> None:
     voice = tmp_path / "voice.wav"
-    voice.write_bytes(b"wave")
+    import wave
+
+    with wave.open(str(voice), "wb") as audio:
+        audio.setparams((1, 2, 48000, 0, "NONE", "PCM"))
+        audio.writeframes(b"\x00\x00" * 48000 * 5)
     project = Project(tmp_path, tmp_path / "_studio")
     project.assets = [Asset("cam", Path("camera.mov"), "video", AssetRole.CAMERA)]
     project.placements = [SourcePlacement("cam", 1.0, 0.0, 5.0)]
@@ -79,7 +83,11 @@ def test_synced_voice_is_connected_and_original_audio_is_muted(tmp_path: Path) -
 
 def test_edit_is_applied_identically_to_video_and_synced_voice(tmp_path: Path) -> None:
     voice = tmp_path / "voice.wav"
-    voice.write_bytes(b"wave")
+    import wave
+
+    with wave.open(str(voice), "wb") as audio:
+        audio.setparams((1, 2, 48000, 0, "NONE", "PCM"))
+        audio.writeframes(b"\x00\x00" * 48000 * 5)
     edit = tmp_path / "edit.json"
     edit.write_text(
         '{"mode":"cut","keep":[{"start":1,"end":3},{"start":5,"end":6}]}'

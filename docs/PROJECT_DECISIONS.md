@@ -296,3 +296,9 @@ entry points and recorded project paths in the same change.
   media type, track index, clip index and group index resolved after tracks exist.
   This avoids per-cut audio-track proliferation and partial stereo/multichannel
   links. External voice tracks remain separate from the original camera group.
+
+- Rendered voice/ambience export metadata is read from WAV headers, with ffprobe
+  fallback for extensible/RF64 PCM. Channels, rate and depth describe the actual
+  audio file rather than camera defaults. Invalid audio fails instead of claiming
+  a successful export. FCPXML assets expose channels/rate and dialogue/effects
+  roles; XMEML emits actual sample rate and depth. Camera metadata comes from scan.

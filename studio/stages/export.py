@@ -30,6 +30,9 @@ class SequenceClip:
     source_fps: Fraction | None = None
     source_width: int | None = None
     source_height: int | None = None
+    audio_sample_rate: int = 48000
+    audio_depth: int = 16
+    audio_role: str = "dialogue"
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +75,7 @@ class ExportStage:
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
-            "export-v10", project.assets, project.placements, project.audio_warp_maps,
+            "export-v11", project.assets, project.placements, project.audio_warp_maps,
             inputs, settings.get("export", {}), settings.get("roughcut", {}),
             settings.get("program", {}),
         )
@@ -174,6 +177,8 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
                 source_fps=Fraction(str(media.get("fps") or "25")),
                 source_width=int(media.get("width") or 1920),
                 source_height=int(media.get("height") or 1080),
+                audio_sample_rate=int(media.get("audio_sample_rate") or 48000),
+                audio_depth=int(media.get("audio_bits_per_sample") or 16),
             )
         )
         if voice is not None:
@@ -182,6 +187,7 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
                 placement.offset_s, -camera_index - 1, True, has_video=False,
                 rate=rate,
             ))
+            clips[-1] = audio_metadata(clips[-1])
         room = project.outputs.get(f"ambience:{asset.id}", [])
         if room and room[0].is_file():
             clips.append(SequenceClip(
@@ -189,7 +195,9 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
                 placement.offset_s, -1000 - camera_index, True, has_video=False,
                 audio_channels=int(media.get("audio_channels") or 2),
                 rate=rate,
+                audio_role="effects",
             ))
+            clips[-1] = audio_metadata(clips[-1])
         camera_index += 1
     if not clips:
         raise ValueError("cannot build a sequence without placed camera clips")
@@ -249,6 +257,25 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
     )
 
 
+def audio_metadata(clip: SequenceClip) -> SequenceClip:
+    """Read rendered PCM metadata instead of inheriting camera channel counts."""
+    import wave
+
+    try:
+        with wave.open(str(clip.path), "rb") as audio:
+            return replace(clip, audio_channels=audio.getnchannels(),
+                           audio_sample_rate=audio.getframerate(),
+                           audio_depth=audio.getsampwidth() * 8)
+    except (wave.Error, EOFError):
+        # Python 3.10 cannot read WAVE_FORMAT_EXTENSIBLE / RF64 headers.
+        from studio.stages.sync_media import probe
+
+        info = probe(clip.path)
+        return replace(clip, audio_channels=info.audio_channels or clip.audio_channels,
+                       audio_sample_rate=info.audio_sample_rate or clip.audio_sample_rate,
+                       audio_depth=info.audio_bits_per_sample or clip.audio_depth)
+
+
 def write_fcpxml(
     sequence: Sequence, output: Path, *, media_base: Path, version: str = "1.9",
 ) -> Path:
@@ -301,6 +328,10 @@ def write_fcpxml(
                               frameDuration=f"{source_fps.denominator}/{source_fps.numerator}s",
                               width=str(key[1]), height=str(key[2]))
             asset_element.set("format", formats[key])
+        if clip.has_audio:
+            asset_element.set("audioSources", "1")
+            asset_element.set("audioChannels", str(clip.audio_channels))
+            asset_element.set("audioRate", str(clip.audio_sample_rate))
     library = ET.SubElement(root, "library")
     event = ET.SubElement(library, "event", name="Studio")
     project = ET.SubElement(event, "project", name=sequence.name)
@@ -331,6 +362,8 @@ def write_fcpxml(
         )
         if clip.has_audio and not clip.audio_enabled:
             ET.SubElement(element, "adjust-volume", amount="-96dB")
+        if clip.has_audio:
+            element.set("audioRole", clip.audio_role)
         if abs(clip.rate - 1) > 1e-9:
             # FCPXML start is in the adjusted clip clock; timeMap values
             # remain in the original media clock, including nonzero in-points.
@@ -443,8 +476,8 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
                 file_audio = ET.SubElement(file_media, "audio")
                 ET.SubElement(file_audio, "channelcount").text = str(clip.audio_channels)
                 sample = ET.SubElement(file_audio, "samplecharacteristics")
-                ET.SubElement(sample, "depth").text = "16"
-                ET.SubElement(sample, "samplerate").text = "48000"
+                ET.SubElement(sample, "depth").text = str(clip.audio_depth)
+                ET.SubElement(sample, "samplerate").text = str(clip.audio_sample_rate)
             if not clip.has_video:
                 source_track = ET.SubElement(item, "sourcetrack")
                 ET.SubElement(source_track, "mediatype").text = "audio"
