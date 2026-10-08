@@ -178,3 +178,17 @@ entry points and recorded project paths in the same change.
   conformed to original duration/rate/channels/bit-depth before publication. Export
   attaches ambience as independent audio lanes. Model installation and actual GPU
   listening/quality acceptance are still outstanding.
+
+- `sync.self_check=repair` now offers a conservative whole-clip acoustic-first
+  linear rerender for clips whose original content check failed. Passed and
+  inconclusive clips are not repaired. Acceptance requires both a passed new
+  content check and passed 20 ms acoustic verification; failed or inconclusive
+  verification retains the original voice/map. Candidate/backend failures are
+  reported, and rejected candidate audio is removed.
+- Accepted repair replaces the selected voice, its matching recorder/camera warp
+  map and the selected all-recorder lane before segments/master/verification.
+  Original assets and initial diagnostic reports remain available. Published
+  output.json reflects final selected paths and strategies keyed by warp ID.
+- Repair currently requires voice_enhance=off so an accepted rerender cannot
+  silently bypass requested enhancement. Local span repair and a real-model
+  end-to-end acceptance gate remain open; this is not full legacy repair parity.

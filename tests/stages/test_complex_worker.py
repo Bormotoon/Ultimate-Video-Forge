@@ -1,11 +1,16 @@
+import json
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from studio.core.project import Asset, AssetKind, AssetRole, Project
+from studio.core.timeline import AudioWarpMap, AudioWarpPiece, TimeDomain
 from studio.core.transcript import Segment, Transcript, Word
+from studio.stages.base import StageContext
 from studio.stages.runner import run_stage_process
+from studio.stages.sync import _run_complex
 
 
 @pytest.mark.parametrize("recorder_count", [1, 2])
@@ -49,3 +54,51 @@ def test_complex_worker_publishes_real_voice_and_warp(tmp_path: Path, recorder_c
     assert len(project.outputs["voice-segments:cam"]) == 4
     assert result.manifest.reusable(work, "complex-fp")
     assert not list(work.glob(".settings-*"))
+
+
+def test_repair_updates_selected_lane_map_report_and_segment_input(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    source = tmp_path / "recorder.wav"
+    with wave.open(str(source), "wb") as audio:
+        audio.setparams((1, 2, 48000, 0, "NONE", "not compressed"))
+        audio.writeframes(b"\x10\x00" * 48000 * 4)
+    words = tuple(Word(f"token{i}", 0.2 + i * 0.1, 0.25 + i * 0.1) for i in range(25))
+    transcripts = {}
+    for name, duration in [("rec", 4.0), ("cam", 3.0)]:
+        path = work / f"{name}.json"
+        Transcript(source, "en", duration, [Segment(0, 3, words)]).save(path)
+        transcripts[name] = path
+    project = Project(tmp_path, work, assets=[
+        Asset("rec", Path("recorder.wav"), AssetKind.AUDIO, AssetRole.RECORDER),
+        Asset("cam", Path("camera.mov"), AssetKind.VIDEO, AssetRole.CAMERA),
+    ], transcripts=transcripts)
+    repair_path = work / "stages" / "sync" / "repair" / "cam-repaired.wav"
+    repair_path.parent.mkdir(parents=True)
+    repair_path.write_bytes(source.read_bytes())
+    repair_report = repair_path.with_name("report.json")
+    repair_report.write_text("{}")
+    check_report = work / "check.json"
+    check_report.write_text("{}")
+    repaired_map = AudioWarpMap("warp-rec-cam", "rec", "cam", (
+        AudioWarpPiece(0.1, 3, 0, 3, "copy"),
+    ), TimeDomain.FILE, 1, {"repair_verified": 1.0})
+    with patch("studio.stages.sync_check_step.check_voices", return_value=(check_report,)), patch(
+        "studio.stages.sync_repair.repair_voices",
+        return_value=({"cam": repair_path}, {"cam": repaired_map},
+                      (repair_path, repair_report)),
+    ) as repair, patch("studio.stages.sync_outputs.segment_voice", return_value=()) as segment:
+        result = _run_complex(StageContext(project, {"sync": {
+            "mode": "complex", "recorder_mode": "all", "self_check": "repair",
+            "voice_segment_minutes": 1,
+        }}, work))
+    assert repair.call_args.args[1]["cam"] == tmp_path / "camera.mov"
+    assert repair.call_args.args[2]["cam"][0] == "rec"
+    segment.assert_called_once()
+    assert segment.call_args.args[0] == repair_path
+    changes = result.project_changes
+    assert changes["outputs"]["sync:cam"] == [repair_path]
+    assert changes["outputs"]["sync-tracks:cam"] == [repair_path]
+    assert changes["audio_warp_maps"] == [repaired_map]
+    published = json.loads((work / "stages" / "sync" / "output.json").read_text())
+    assert published["voices"]["cam"] == "repair/cam-repaired.wav"

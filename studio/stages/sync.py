@@ -200,7 +200,10 @@ def _run_complex(context: StageContext) -> StageOutput:
     source = project.source_dir / recorder.path
     sync = context.settings.get("sync", {})
     sync = sync if isinstance(sync, dict) else {}
+    if sync.get("self_check") == "repair" and sync.get("voice_enhance", "off") != "off":
+        raise ValueError("sync.self_check=repair currently requires voice_enhance=off")
     mode = _sync_mode(context.settings)
+    repair_sources = {}
     for extra in recorders[1:]:
         extra_transcript = Transcript.load(project.transcripts[extra.id])
         fitted = align_sources(
@@ -264,6 +267,13 @@ def _run_complex(context: StageContext) -> StageOutput:
             choices.append((extra.id, extra_voice, fitted.residual_ms, fitted.inliers))
         choices.sort(key=lambda item: (item[2], -item[3]))
         outputs[f"sync:{camera.id}"] = [choices[0][1]]
+        if sync.get("self_check") == "repair":
+            selected_asset = next(asset for asset in recorders if asset.id == choices[0][0])
+            repair_sources[camera.id] = (
+                selected_asset.id, project.source_dir / selected_asset.path,
+                Transcript.load(project.transcripts[selected_asset.id]),
+                int(selected_asset.manual.get("media_info", {}).get("audio_channels") or 1),
+            )
         if sync.get("recorder_mode") == "all":
             outputs[f"sync-tracks:{camera.id}"] = [item[1] for item in choices]
     report = context.work_dir / "stages" / "sync" / "output.json"
@@ -300,6 +310,26 @@ def _run_complex(context: StageContext) -> StageOutput:
         )
         artifacts.extend(checks)
         outputs["self_check"] = list(checks)
+        if sync.get("self_check") == "repair":
+            from studio.stages.sync_repair import repair_voices
+
+            repaired, repaired_maps, repair_artifacts = repair_voices(
+                dict(zip([camera.id for camera in cameras], camera_transcripts, strict=True)),
+                {camera.id: project.source_dir / camera.path for camera in cameras},
+                repair_sources, report.parent / "repair", checks[-1],
+                context.settings.get("transcribe", {}),
+            )
+            artifacts.extend(repair_artifacts)
+            outputs["repair"] = list(repair_artifacts)
+            for asset_id, path in repaired.items():
+                old_path = outputs[f"sync:{asset_id}"][0]
+                outputs[f"sync:{asset_id}"] = [path]
+                lane_key = f"sync-tracks:{asset_id}"
+                if lane_key in outputs:
+                    outputs[lane_key] = [path if item == old_path else item
+                                         for item in outputs[lane_key]]
+                replacement = repaired_maps[asset_id]
+                warps = [replacement if warp.id == replacement.id else warp for warp in warps]
     from studio.stages.sync_outputs import render_voice_master, segment_voice
 
     if float(sync.get("voice_segment_minutes", 0)) > 0:
@@ -333,6 +363,13 @@ def _run_complex(context: StageContext) -> StageOutput:
                                           indent=2) + "\n", encoding="utf-8")
         artifacts.append(verify_path)
         outputs["verify"] = [verify_path]
+    report_data = json.loads(report.read_text(encoding="utf-8"))
+    report_data["voices"] = {
+        camera.id: str(outputs[f"sync:{camera.id}"][0].relative_to(report.parent))
+        for camera in cameras
+    }
+    report_data["strategies"] = {warp.id: warp.strategy for warp in warps}
+    report.write_text(json.dumps(report_data, indent=2) + "\n", encoding="utf-8")
     return StageOutput(tuple(artifacts), {
         "placements": placements, "audio_warp_maps": warps, "outputs": outputs,
     })

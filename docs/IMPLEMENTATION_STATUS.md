@@ -213,3 +213,21 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   tests; combined suite has 193 passing tests. Actual ML environments/models and
   GPU processing are not exercised; separation full regression and real listening
   acceptance remain open. Automatic content repair remains incomplete.
+
+### Verified repair continuation
+
+- `sync.self_check=repair` rerenders failed clips with a freshly derived
+  whole-clip linear map. It publishes replacements only after repeated content
+  recognition and passed acoustic lag verification. Inconclusive checks do not
+  authorize replacement; errors retain the original selected audio and map.
+- Selected sync paths, all-recorder selected lanes, warp maps and output report
+  update together before segment/master generation. Initial self-check results
+  stay intact; separate repair reports record the candidate acceptance evidence.
+- Six candidate-policy tests cover acceptance, content failure, lag failure,
+  inconclusive lag, skipped clips and backend errors. A stage integration test
+  checks selected lane/map/report updates and downstream segment input.
+- Repair and enhancement are currently mutually exclusive. Local span repair,
+  real Whisper/model acceptance, master crossfades and GPU rendering remain open.
+- Full regression run: 201 tests pass; Ruff on changed Python files and
+  `git diff --check` pass. Recognition and lag acceptance in repair tests use
+  controlled backends; these results do not establish real-model acceptance.

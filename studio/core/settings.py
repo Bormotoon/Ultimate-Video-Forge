@@ -145,7 +145,9 @@ def validate_settings(settings: Settings) -> None:
     _non_negative("sync.max_drift_ms", settings.sync.max_drift_ms)
     _non_negative("sync.voice_segment_minutes", settings.sync.voice_segment_minutes)
     _one_of("sync.recorder_mode", settings.sync.recorder_mode, {"best", "all"})
-    _one_of("sync.self_check", settings.sync.self_check, {"off", "warn"})
+    _one_of("sync.self_check", settings.sync.self_check, {"off", "warn", "repair"})
+    if settings.sync.self_check == "repair" and settings.sync.voice_enhance != "off":
+        raise SettingsError("sync.self_check=repair currently requires voice_enhance=off")
     _one_of("sync.voice_enhance", settings.sync.voice_enhance,
             {"off", "denoise", "denoise_dereverb", "resemble"})
     for name in ("acoustic_grid_s", "acoustic_window_s", "acoustic_min_sharpness"):

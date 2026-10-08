@@ -25,9 +25,14 @@ def test_invalid_settings_fail_before_work(tmp_path: Path) -> None:
         ("roughcut:\n  pause_min_s: .nan\n", "finite"),
         ("unknown:\n  value: true\n", "unknown settings sections"),
         ("transcribe:\n  batch_size: false\n", "batch_size"),
+        ("sync:\n  self_check: repair\n  voice_enhance: denoise\n", "requires"),
     ]
     path = tmp_path / "settings.yaml"
     for content, message in cases:
         path.write_text(content)
         with pytest.raises(SettingsError, match=message):
             load_settings([path])
+
+
+def test_verified_repair_mode_is_available() -> None:
+    assert load_settings([], ["sync.self_check=repair"]).sync.self_check == "repair"
