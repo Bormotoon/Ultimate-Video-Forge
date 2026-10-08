@@ -166,3 +166,15 @@ entry points and recorded project paths in the same change.
   spans, then unloads the shared check model. Keep automatic repair unavailable
   until replacement rendering, warp-map updates and post-repair verification are
   integrated together; local re-alignment alone is not a completed repair feature.
+
+- Preserve separation/enhancement backend algorithms behind a probe facade and
+  bounded disk-logged subprocess utility. Resolve `UVF_SEP_VENV`, the managed
+  separation module and local .sep-venv in that order. Supported enhancement modes
+  are denoise, denoise_dereverb and resemble; other historical modes remain unavailable.
+- Enhancement happens before content check, segmentation and master generation.
+  Backend-conformed audio replaces only the selected voice reference, preserving
+  originals. Optional failures retain originals and publish explicit warning reports.
+- Camera ambience is decoded with stable asset filenames, batch-separated and
+  conformed to original duration/rate/channels/bit-depth before publication. Export
+  attaches ambience as independent audio lanes. Model installation and actual GPU
+  listening/quality acceptance are still outstanding.

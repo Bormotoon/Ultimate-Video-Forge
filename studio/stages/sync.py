@@ -276,6 +276,20 @@ def _run_complex(context: StageContext) -> StageOutput:
         "padding": "silence is outside invertible source maps",
     }, indent=2) + "\n", encoding="utf-8")
     artifacts.append(report)
+    if sync.get("voice_enhance", "off") != "off" or sync.get("ambience"):
+        from studio.stages.sync_audio_steps import process_audio
+
+        enhanced, ambience, processed = process_audio(
+            {camera.id: outputs[f"sync:{camera.id}"][0] for camera in cameras},
+            {camera.id: project.source_dir / camera.path for camera in cameras},
+            report.parent / "audio-processing", sync,
+        )
+        artifacts.extend(processed)
+        for asset_id, path in enhanced.items():
+            outputs[f"sync:{asset_id}"] = [path]
+        for asset_id, path in ambience.items():
+            outputs[f"ambience:{asset_id}"] = [path]
+        outputs["audio_processing"] = [processed[-1]]
     if sync.get("self_check", "off") != "off":
         from studio.stages.sync_check_step import check_voices
 

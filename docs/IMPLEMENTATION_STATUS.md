@@ -200,3 +200,16 @@ an actual Whisper/model/NLE end-to-end acceptance run.
 - Automatic repair rendering and atomic warp-map replacement are not implemented;
   repair mode is deliberately not accepted by settings yet. Ambience/enhancement
   integration, master crossfades and remaining multicam tasks are still pending.
+
+### Optional audio backend continuation
+
+- Migrated preserved separation/enhancement and bounded subprocess logging behind
+  public-media adapters. Supported denoise/denoise_dereverb/resemble modes are
+  configured by sync.voice_enhance; sync.ambience adds separated camera room tone.
+- Enhanced voices feed self-check, segments, master and export. Missing modules
+  retain original voices with explicit warning reports. Ambience is conformed
+  before publication and exported as separate connected audio lanes.
+- Seventeen migrated enhancement regression tests pass plus integration dispatch
+  tests; combined suite has 193 passing tests. Actual ML environments/models and
+  GPU processing are not exercised; separation full regression and real listening
+  acceptance remain open. Automatic content repair remains incomplete.

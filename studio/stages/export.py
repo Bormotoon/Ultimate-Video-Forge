@@ -64,7 +64,7 @@ class ExportStage:
         inputs = [
             describe_artifact(project.work_dir, path)
             for key, paths in project.outputs.items()
-            if key.startswith("sync:") or key == "roughcut"
+            if key.startswith(("sync:", "ambience:")) or key == "roughcut"
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
@@ -123,6 +123,13 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
             clips.append(SequenceClip(
                 f"voice-{asset.id}", voice, placement.in_s, placement.duration_s,
                 placement.offset_s, -camera_index - 1, True, has_video=False,
+            ))
+        room = project.outputs.get(f"ambience:{asset.id}", [])
+        if room and room[0].is_file():
+            clips.append(SequenceClip(
+                f"ambience-{asset.id}", room[0], placement.in_s, placement.duration_s,
+                placement.offset_s, -1000 - camera_index, True, has_video=False,
+                audio_channels=int(media.get("audio_channels") or 2),
             ))
         camera_index += 1
     if not clips:
