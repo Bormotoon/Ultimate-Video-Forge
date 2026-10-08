@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Protocol, TypeVar
+
+from studio.core.enums import StrEnum
 
 
 class TimeDomain(StrEnum):

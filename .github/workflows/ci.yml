@@ -28,7 +28,11 @@ jobs:
           cache: pip
       - name: Install Studio development dependencies
         run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg espeak-ng libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
       - name: Test Studio
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: pytest -q
       - name: Lint Studio
         run: ruff check studio tools tests
@@ -87,6 +91,8 @@ jobs:
           cache: pip
       - name: Install build tools
         run: python -m pip install --upgrade pip && pip install -e ".[dev]"
+      - name: Install media runtime
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Build distributions
         run: python -m build
       - name: Smoke-test the installed wheel outside the checkout
@@ -94,7 +100,8 @@ jobs:
           python -m venv /tmp/studio-wheel
           /tmp/studio-wheel/bin/pip install dist/*.whl
           cd /tmp
-          /tmp/studio-wheel/bin/studio --check-resources
+          /tmp/studio-wheel/bin/studio --version
+          /tmp/studio-wheel/bin/python -m studio.app --check-resources
           /tmp/studio-wheel/bin/python -c "from studio.app import packaged_resources; assert all(packaged_resources())"
       - name: Build and smoke-test the frozen executable
         run: |

@@ -7,11 +7,11 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
-from enum import StrEnum
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from studio.core.enums import StrEnum
 from studio.core.timeline import AudioWarpMap, AudioWarpPiece, SourcePlacement, TimeDomain
 
 PROJECT_SCHEMA_VERSION = 1
@@ -163,7 +163,7 @@ class StageManifest:
     artifacts: list[Artifact]
     status: ArtifactStatus
     producer_version: str
-    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     schema_version: int = MANIFEST_SCHEMA_VERSION
 
     def save(self, path: Path) -> None:

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+from studio.core.enums import StrEnum
 from studio.core.project import Project
 
 

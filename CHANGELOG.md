@@ -27,3 +27,5 @@ All notable changes to Studio will be documented in this file.
   cancellation or errors, and journal recovery before CLI planning.
 - Discovery plan gating validates stage identity, fingerprint, successful status,
   and artifact checksums instead of accepting manifest file existence.
+- Python 3.10-compatible string enums and UTC timestamps; corrected CI system
+  dependencies and installed-wheel resource smoke command.
