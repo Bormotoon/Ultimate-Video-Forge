@@ -1,5 +1,6 @@
 """Structural inputs to the preserved piece-planning algorithms."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -14,7 +15,7 @@ class Anchor(Protocol):
 
 class AlignmentMap(Protocol):
     @property
-    def anchors(self) -> list[Anchor]: ...
+    def anchors(self) -> Sequence[Anchor]: ...
 
     @property
     def offset(self) -> float: ...
