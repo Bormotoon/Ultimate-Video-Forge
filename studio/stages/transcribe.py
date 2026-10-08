@@ -240,7 +240,19 @@ class TranscribeStage:
     def fingerprint(self, project: Project, settings: dict[str, object]) -> str:
         requirements = project.work_dir / "stages" / "prepare" / "requirements.json"
         content = requirements.read_text(encoding="utf-8") if requirements.is_file() else ""
-        return stable_fingerprint("transcribe-v1", content, settings.get("transcribe", {}))
+        requested = json.loads(content).get("transcripts", []) if content else []
+        assets = {asset.id: asset for asset in project.assets}
+        identities = {}
+        for asset_id in requested:
+            asset = assets.get(asset_id)
+            source = project.source_dir / asset.path if asset else None
+            identities[asset_id] = (
+                {"path": str(source), "sha256": _sha256(source)}
+                if source is not None and source.is_file() else {"missing": True}
+            )
+        return stable_fingerprint(
+            "transcribe-v2", content, identities, settings.get("transcribe", {}),
+        )
 
     def run(self, context: StageContext) -> StageOutput:
         requirements_path = context.project.work_dir / "stages" / "prepare" / "requirements.json"
