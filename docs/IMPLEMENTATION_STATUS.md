@@ -349,3 +349,15 @@ an actual Whisper/model/NLE end-to-end acceptance run.
 - Actual Final Cut playback, frame-rounded lip-sync accuracy and mixed-source
   format interpretation remain acceptance gates. Flat export retiming parity is
   not completed by this multicam-only sequence change.
+
+### Flat export retiming continuation
+
+- Export stage now applies affine camera placement rates to ordinary FCPXML and
+  XMEML as well as multicam. FCPXML has linear timeMaps; XMEML has constant speed
+  effects on video, voice, ambience and linked camera channels. Roughcut inverse
+  source in-points, source out/coverage and timeline duration are consistent.
+- Three parameterized stage regressions cover k=0.5, 1.25 and 1 with nonzero
+  in-points and roughcut. Retimed flat FCPXML passed xmllint/1.9 DTD validation.
+- NLE import/playback acceptance remains open, especially Premiere constant speed
+  semantics, source fps differing from sequence fps and sub-frame lip-sync.
+- Full suite: 241 passed; changed-file Ruff and `git diff --check` pass.

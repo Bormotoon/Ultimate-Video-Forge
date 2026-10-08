@@ -69,7 +69,7 @@ class ExportStage:
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
-            "export-v7", project.assets, project.placements, project.audio_warp_maps,
+            "export-v8", project.assets, project.placements, project.audio_warp_maps,
             inputs, settings.get("export", {}), settings.get("roughcut", {}),
             settings.get("program", {}),
         )
@@ -77,7 +77,7 @@ class ExportStage:
     def run(self, context: StageContext) -> StageOutput:
         roughcut = context.settings.get("roughcut", {})
         use_edit = roughcut.get("enabled", True) if isinstance(roughcut, dict) else True
-        sequence = build_sequence(context.project, use_edit=bool(use_edit))
+        sequence = build_sequence(context.project, use_edit=bool(use_edit), retimed=True)
         fcpxml = context.work_dir / "export" / f"{sequence.name}.fcpxml"
         xmeml = context.work_dir / "export" / f"{sequence.name}.xml"
         conf = context.settings.get("export", {})
@@ -87,8 +87,7 @@ class ExportStage:
         if "multicam" in targets:
             from studio.stages.multicam import write_multicam
 
-            multicam_sequence = build_sequence(context.project, use_edit=bool(use_edit),
-                                               retimed=True)
+            multicam_sequence = sequence
             artifacts.append(write_multicam(
                 multicam_sequence, fcpxml.with_name(f"{sequence.name}-multicam.fcpxml"),
                 media_base=context.project.source_dir,
@@ -397,12 +396,22 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
                 _frames(clip.source_in_s, sequence.fps)
             )
             ET.SubElement(item, "out").text = str(
-                _frames(clip.source_in_s + clip.duration_s, sequence.fps)
+                _frames(clip.source_in_s + clip.duration_s / clip.rate, sequence.fps)
             )
+            ET.SubElement(item, "duration").text = str(
+                _frames(clip.timeline_start_s + clip.duration_s, sequence.fps)
+                - _frames(clip.timeline_start_s, sequence.fps)
+            )
+            _xmeml_rate(item, sequence.fps)
+            _xmeml_speed(item, clip.rate, "video" if clip.has_video else "audio")
             file_el = ET.SubElement(item, "file", id=f"file-{clip.asset_id}")
             ET.SubElement(file_el, "name").text = clip.path.name
             ET.SubElement(file_el, "pathurl").text = _xmeml_url(clip.path)
             _xmeml_rate(file_el, sequence.fps)
+            ET.SubElement(file_el, "duration").text = str(max(
+                _frames(other.source_in_s + other.duration_s / other.rate, sequence.fps)
+                for other in sequence.clips if other.asset_id == clip.asset_id
+            ))
             file_media = ET.SubElement(file_el, "media")
             if clip.has_video:
                 sample = ET.SubElement(ET.SubElement(file_media, "video"), "samplecharacteristics")
@@ -432,6 +441,9 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
                     ET.SubElement(audio_item, "enabled").text = (
                         "TRUE" if clip.audio_enabled else "FALSE"
                     )
+                    ET.SubElement(audio_item, "duration").text = item.findtext("duration")
+                    _xmeml_rate(audio_item, sequence.fps)
+                    _xmeml_speed(audio_item, clip.rate, "audio")
                     ET.SubElement(audio_item, "file", id=f"file-{clip.asset_id}")
                     source_track = ET.SubElement(audio_item, "sourcetrack")
                     ET.SubElement(source_track, "mediatype").text = "audio"
@@ -446,6 +458,27 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
         handle.write(b'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n')
         tree.write(handle, encoding="utf-8", xml_declaration=False)
     return output
+
+
+def _xmeml_speed(item: ET.Element, rate: float, media_type: str) -> None:
+    """XMEML constant speed is source frames per timeline frame, in percent."""
+    if abs(rate - 1) <= 1e-9:
+        return
+    effect = ET.SubElement(ET.SubElement(item, "filter"), "effect")
+    for name, value in (("name", "Time Remap"), ("effectid", "timeremap"),
+                        ("effectcategory", "motion"), ("effecttype", "motion"),
+                        ("mediatype", media_type)):
+        ET.SubElement(effect, name).text = value
+    for parameter_id, name, value in (
+        ("variablespeed", "variablespeed", "FALSE"),
+        ("speed", "speed", format(100 / rate, ".12g")),
+        ("reverse", "reverse", "FALSE"),
+        ("frameblending", "frameblending", "FALSE"),
+    ):
+        parameter = ET.SubElement(effect, "parameter")
+        ET.SubElement(parameter, "parameterid").text = parameter_id
+        ET.SubElement(parameter, "name").text = name
+        ET.SubElement(parameter, "value").text = value
 
 
 def xmeml_intervals(path: Path) -> list[tuple[str, float, float]]:

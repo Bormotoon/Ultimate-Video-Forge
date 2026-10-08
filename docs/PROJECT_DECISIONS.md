@@ -276,3 +276,11 @@ entry points and recorded project paths in the same change.
   source endpoint values retain microsecond precision. Resource duration describes
   original source coverage rather than retimed duration. Flat exports retain their
   previous policy; NLE semantic playback acceptance remains outstanding.
+
+- Flat export stage now builds the same affine-retimed sequence as multicam.
+  FCPXML uses its existing linear timeMap; XMEML writes constant timeremap speed
+  effects with percent speed 100/k on video, replacement audio, ambience and
+  linked original camera channels. Timeline start/end/duration and source in/out
+  stay distinct. Source out and file coverage use duration/k; explicit clip rates
+  are emitted. Unity-speed clips have no speed filter. Premiere interpretation of
+  constant-speed effects remains an external import/playback acceptance gate.
