@@ -209,3 +209,14 @@ entry points and recorded project paths in the same change.
   limiter. Enable its latency compensation and express input delays in samples
   rather than rounded milliseconds. A one-sample-offset impulse regression
   verifies exact placement and retained output duration.
+
+- Review master has an explicit CFR policy: `program.fps=auto` uses the first
+  selected camera's reported rate; an explicit string rate such as `30000/1001`
+  overrides it. Supported range is 1-240 fps. Normalize all pieces from actual
+  source presentation timestamps, then trim/pad to cumulative rounded frame
+  boundaries. Explicit concat durations avoid per-piece timestamp rounding drift.
+- Edited transcript positions follow the same frame trim/pad decisions; zero-frame
+  pieces contribute no words. The render report records requested/actual duration,
+  per-piece frame counts and rational output rate. This changes program rendering,
+  not NLE export frame rounding. Preserve libx264 as a CPU encoder alias alongside
+  cpu; validation and encoder selection now accept both consistently.

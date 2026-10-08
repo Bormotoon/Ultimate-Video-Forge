@@ -12,9 +12,9 @@ class EncoderChoice:
 
 
 def select_encoder(requested: str) -> EncoderChoice:
-    if requested not in {"auto", "cpu", "nvenc"}:
+    if requested not in {"auto", "cpu", "libx264", "nvenc"}:
         raise ValueError(f"unknown program encoder: {requested}")
-    if requested == "cpu":
+    if requested in {"cpu", "libx264"}:
         return EncoderChoice(requested, "libx264", "CPU explicitly requested")
     try:
         result = subprocess.run([

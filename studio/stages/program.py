@@ -6,8 +6,10 @@ import json
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
+from studio.core.media import build_atempo_chain
 from studio.core.project import AssetRole, Project, describe_artifact, stable_fingerprint
 from studio.core.timeline import (
     EditMap,
@@ -40,7 +42,7 @@ class ProgramStage:
         edit_path = _edit_path(project)
         edit = edit_path.read_text(encoding="utf-8") if edit_path.is_file() else ""
         return stable_fingerprint(
-            "program-v4", edit, project.placements, project.outputs.get("sync"),
+            "program-v5", edit, project.placements, project.outputs.get("sync"),
             [describe_artifact(project.work_dir, path)
              for key, paths in project.outputs.items() if key.startswith("sync:")
              for path in paths if path.is_file()],
@@ -62,8 +64,10 @@ class ProgramStage:
         conf = conf if isinstance(conf, dict) else {}
         render_report = render_project_program(
             context.project, edit, output, encoder=str(conf.get("encoder", "auto")),
+            fps=str(conf.get("fps", "auto")),
         )
         edited = map_transcript_to_edited(timeline, edit)
+        edited = align_transcript_to_frames(edited, render_report)
         edited_path = context.work_dir / "program" / "program.transcript.json"
         edited.save(edited_path)
         report_path = output.with_name("render.json")
@@ -139,13 +143,30 @@ def program_pieces(project: Project, edit: EditMap) -> list[ProgramPiece]:
 
 def render_project_program(
     project: Project, edit: EditMap, output: Path, *, encoder: str = "auto",
+    fps: str = "auto",
 ) -> dict[str, object]:
     pieces = program_pieces(project, edit)
     first = next(asset for asset in project.assets
                  if project.source_dir / asset.path == pieces[0].video)
     info = first.manual.get("media_info", {})
     width, height = int(info.get("width") or 1920), int(info.get("height") or 1080)
-    fps = str(info.get("fps") or 25)
+    requested_fps = fps
+    rate = Fraction(str(info.get("fps") or 25) if fps == "auto" else fps)
+    if not 1 <= rate <= 240:
+        raise ValueError("program fps must be between 1 and 240")
+    fps = str(rate)
+    # Quantize cumulative boundaries, not each duration independently. Many
+    # sub-frame cuts must not accumulate a frame of error per edit.
+    frame_counts = []
+    cumulative = Fraction(0)
+    previous_frame = 0
+    for piece in pieces:
+        cumulative += Fraction(str(piece.duration_s))
+        end_frame = round(cumulative * rate)
+        frame_counts.append(end_frame - previous_frame)
+        previous_frame = end_frame
+    if previous_frame == 0:
+        raise ValueError("retained duration is shorter than one output frame")
     choice = select_encoder(encoder)
     codec = choice.codec
     fallback_reason = None
@@ -153,25 +174,32 @@ def render_project_program(
     with tempfile.TemporaryDirectory(prefix=".render-", dir=output.parent) as temporary:
         directory = Path(temporary)
         for index, piece in enumerate(pieces):
+            frames = frame_counts[index]
+            if frames == 0:
+                continue
+            rendered_duration = float(Fraction(frames) / rate)
             duration = piece.duration_s / piece.rate
             command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(piece.video)]
             if piece.audio is not None:
                 command.extend(["-i", str(piece.audio)])
                 audio = (f"[1:a]atrim=start={piece.audio_in_s}:duration={duration},"
-                         f"asetpts=PTS-STARTPTS,atempo={1 / piece.rate},"
+                         "asetpts=PTS-STARTPTS,"
+                         + ",".join(build_atempo_chain(1 / piece.rate)) + ","
                          "aresample=48000,aformat=channel_layouts=stereo,"
-                         f"apad,atrim=duration={piece.duration_s}[a]")
+                         f"apad,atrim=duration={rendered_duration}[a]")
             else:
                 audio = ("anullsrc=r=48000:cl=stereo,"
-                         f"atrim=duration={piece.duration_s}[a]")
+                         f"atrim=duration={rendered_duration}[a]")
             video = (f"[0:v]trim=start={piece.video_in_s}:duration={duration},"
                      f"setpts={piece.rate}*(PTS-STARTPTS),"
                      f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                     f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}[v]")
+                     f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                     f"fps={fps},tpad=stop_mode=clone:stop_duration={rendered_duration},"
+                     f"trim=end_frame={frames},setpts=N/({fps}*TB)[v]")
             command.extend(["-filter_complex", video + ";" + audio,
                             "-map", "[v]", "-map", "[a]", "-c:v", codec,
                             "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le",
-                            "-t", str(piece.duration_s), str(directory / f"part-{index}.mkv")])
+                            "-t", str(rendered_duration), str(directory / f"part-{index}.mkv")])
             try:
                 _run_ffmpeg(command)
             except RuntimeError as exc:
@@ -179,14 +207,17 @@ def render_project_program(
                     raise
                 # Regenerate every part to avoid joining different H.264
                 # parameter sets when hardware fails halfway through a job.
-                retry = render_project_program(project, edit, output, encoder="cpu")
+                retry = render_project_program(project, edit, output, encoder="cpu",
+                                               fps=requested_fps)
                 retry.update({"requested_encoder": encoder, "initial_codec": choice.codec,
                               "selection_reason": choice.reason,
                               "runtime_fallback_reason": str(exc)[-2000:]})
                 return retry
         listing = directory / "parts.txt"
         listing.write_text("".join(f"file 'part-{index}.mkv'\n"
-                                   for index in range(len(pieces))), encoding="utf-8")
+                                   f"duration {float(Fraction(frames) / rate):.12f}\n"
+                                   for index, frames in enumerate(frame_counts) if frames),
+                           encoding="utf-8")
         _run_ffmpeg(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat",
                      "-safe", "0", "-i", str(listing), "-c:v", "copy", "-c:a", "aac",
                      "-movflags", "+faststart", str(output)])
@@ -194,7 +225,41 @@ def render_project_program(
             "initial_codec": choice.codec, "final_codec": codec,
             "selection_reason": choice.reason, "runtime_fallback_reason": fallback_reason,
             "width": width, "height": height, "fps": fps, "piece_count": len(pieces),
-            "duration_s": sum(piece.duration_s for piece in pieces)}
+            "requested_fps": requested_fps, "frame_count": previous_frame,
+            "frame_counts": frame_counts, "timing_policy": "CFR cumulative frame boundaries",
+            "piece_durations_s": [piece.duration_s for piece in pieces],
+            "requested_duration_s": sum(piece.duration_s for piece in pieces),
+            "duration_s": float(Fraction(previous_frame) / rate)}
+
+
+def align_transcript_to_frames(transcript: Transcript, report: dict[str, object]) -> Transcript:
+    """Apply frame-boundary trim/pad decisions to edited-time word positions."""
+    rate = float(Fraction(str(report["fps"])))
+    intervals = []
+    original_cursor = rendered_cursor = 0.0
+    for duration, frames in zip(report["piece_durations_s"], report["frame_counts"], strict=True):
+        rendered_duration = frames / rate
+        intervals.append((original_cursor, original_cursor + duration,
+                          rendered_cursor, rendered_duration))
+        original_cursor += duration
+        rendered_cursor += rendered_duration
+    segments = []
+    for segment in transcript.segments:
+        words = []
+        for word in segment.words:
+            mapped = []
+            for start, end, target, duration in intervals:
+                left, right = max(start, word.start), min(end, word.end, start + duration)
+                if right > left:
+                    mapped.append((target + left - start, target + right - start))
+            if mapped:
+                words.append(Word(word.text, mapped[0][0], mapped[-1][1], word.probability))
+        if words:
+            segments.append(Segment(words[0].start, words[-1].end, tuple(words),
+                                    segment.confidence))
+    from dataclasses import replace
+
+    return replace(transcript, duration=rendered_cursor, segments=segments)
 
 
 def _run_ffmpeg(command: list[str]) -> None:

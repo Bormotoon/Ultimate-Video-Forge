@@ -82,6 +82,7 @@ class ExportSettings:
 class ProgramSettings:
     enabled: bool = False
     encoder: str = "auto"
+    fps: str = "auto"
 
 
 @dataclass(slots=True)
@@ -176,7 +177,16 @@ def validate_settings(settings: Settings) -> None:
         -100 <= settings.speakers.silence_floor_db <= 0
     ):
         raise SettingsError("speakers.silence_floor_db must be between -100 and 0")
-    _one_of("program.encoder", settings.program.encoder, {"auto", "nvenc", "libx264"})
+    _one_of("program.encoder", settings.program.encoder, {"auto", "nvenc", "libx264", "cpu"})
+    if settings.program.fps != "auto":
+        from fractions import Fraction
+
+        try:
+            fps = Fraction(settings.program.fps)
+            if not 1 <= fps <= 240:
+                raise ValueError("fps out of range")
+        except (ValueError, ZeroDivisionError) as exc:
+            raise SettingsError("program.fps must be auto or a rate between 1 and 240") from exc
     _positive("roughcut.pause_min_s", settings.roughcut.pause_min_s)
     _non_negative("roughcut.pause_keep_s", settings.roughcut.pause_keep_s)
     _non_negative("roughcut.head_tail_pad_s", settings.roughcut.head_tail_pad_s)

@@ -26,6 +26,8 @@ def test_invalid_settings_fail_before_work(tmp_path: Path) -> None:
         ("unknown:\n  value: true\n", "unknown settings sections"),
         ("transcribe:\n  batch_size: false\n", "batch_size"),
         ("sync:\n  self_check: repair\n  voice_enhance: denoise\n", "requires"),
+        ("program:\n  fps: '0/1'\n", "program.fps"),
+        ("program:\n  fps: 'garbage'\n", "program.fps"),
     ]
     path = tmp_path / "settings.yaml"
     for content, message in cases:
@@ -36,3 +38,10 @@ def test_invalid_settings_fail_before_work(tmp_path: Path) -> None:
 
 def test_verified_repair_mode_is_available() -> None:
     assert load_settings([], ["sync.self_check=repair"]).sync.self_check == "repair"
+
+
+@pytest.mark.parametrize("encoder", ["cpu", "libx264"])
+def test_program_rate_and_cpu_aliases(encoder: str) -> None:
+    settings = load_settings([], [f"program.encoder={encoder}", 'program.fps="30000/1001"'])
+    assert settings.program.fps == "30000/1001"
+    assert settings.program.encoder == encoder

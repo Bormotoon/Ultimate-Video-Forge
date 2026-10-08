@@ -253,3 +253,17 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   on changed files and `git diff --check` pass.
 - Review-program edit joins remain hard cuts. Listening acceptance, VFR/mixed
   source fps acceptance and actual GPU render acceptance remain open.
+
+### Mixed-fps and VFR review master
+
+- Added validated `program.fps` string setting: auto or explicit rational/decimal
+  rate from 1 to 240 fps. Review master normalizes source timestamps to CFR with
+  cumulative frame rounding and explicit concat durations. Edited transcript
+  timing follows the resulting frame padding/trimming, including zero-frame cuts.
+- Real fixtures combine 24 fps, 30000/1001 fps and genuinely variable-frame-time
+  video. Twelve short retained cuts render at both 25 and 30000/1001 fps with
+  verified frame counts, uniform presentation steps and final frame-end duration.
+- Fixed CPU encoder alias mismatch between settings and selector; both cpu and
+  libx264 work. Full suite: 217 passed; changed-file Ruff and diff checks pass.
+- Long-session A/V drift, NLE VFR interpretation and GPU hardware acceptance
+  remain open. Next major processing block is speakers/multicam.
