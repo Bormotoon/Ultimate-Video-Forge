@@ -9,6 +9,10 @@ from studio.core.project import Asset, AssetRole, Project, stable_fingerprint
 from studio.core.timeline import AudioWarpMap, AudioWarpPiece, SourcePlacement, TimeDomain
 from studio.core.transcript import Transcript
 from studio.stages.base import Decision, GpuUse, Requirement, StageContext, StageOutput
+from studio.stages.sync_engine import matching_transcript, render_aligned_clip
+from studio.stages.sync_geometry import PieceConfig
+from studio.stages.sync_match_settings import MatchSettings
+from studio.stages.sync_matcher import align, evaluate_alignment
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +57,8 @@ class SyncStage:
 
     def run(self, context: StageContext) -> StageOutput:
         mode = _sync_mode(context.settings)
+        if mode == "complex":
+            return _run_complex(context)
         cameras = [asset for asset in context.project.assets if asset.role is AssetRole.CAMERA]
         recorders = [asset for asset in context.project.assets if asset.role is AssetRole.RECORDER]
         placements: list[SourcePlacement] = []
@@ -145,6 +151,70 @@ def text_anchors(camera: Transcript, recorder: Transcript) -> list[TextAnchor]:
         for token in camera_words.keys() & recorder_words.keys()
         if token and len(camera_words[token]) == len(recorder_words[token]) == 1
     ]
+
+
+def _run_complex(context: StageContext) -> StageOutput:
+    project = context.project
+    cameras = [asset for asset in project.assets if asset.role is AssetRole.CAMERA]
+    recorders = [asset for asset in project.assets if asset.role is AssetRole.RECORDER]
+    if len(recorders) != 1:
+        raise ValueError("complex rendering currently requires exactly one recorder")
+    recorder = recorders[0]
+    transcript = Transcript.load(project.transcripts[recorder.id])
+    settings = MatchSettings()
+    alignments = []
+    camera_transcripts = []
+    for camera in cameras:
+        candidate = Transcript.load(project.transcripts[camera.id])
+        alignment = align(matching_transcript(candidate), matching_transcript(transcript), settings)
+        verdict = evaluate_alignment(alignment, candidate.duration, settings)
+        if not verdict.accepted:
+            raise ValueError(f"{camera.id}: {verdict.reason_text}")
+        alignments.append(alignment)
+        camera_transcripts.append(candidate)
+    if not alignments:
+        raise ValueError("complex rendering requires a camera")
+    reference = alignments[0]
+    offsets = [reference.offset - reference.k * item.offset / item.k for item in alignments]
+    origin = min(0.0, reference.offset, *offsets)
+    placements = [SourcePlacement(
+        recorder.id, reference.offset - origin, 0.0, transcript.duration,
+        reference.k, "text",
+    )]
+    artifacts = []
+    warps = []
+    outputs = dict(project.outputs)
+    source = project.source_dir / recorder.path
+    for camera, candidate, alignment, offset in zip(
+        cameras, camera_transcripts, alignments, offsets, strict=True,
+    ):
+        placements.append(SourcePlacement(
+            camera.id, offset - origin, 0.0, candidate.duration,
+            reference.k / alignment.k, "text",
+            {"inliers": float(alignment.inliers), "residual_ms": alignment.residual_ms},
+        ))
+        voice = context.work_dir / "stages" / "sync" / "voice" / f"{camera.id}.wav"
+        plan = render_aligned_clip(
+            alignment, PieceConfig(), source, voice,
+            clip_duration_s=candidate.duration, recorder_duration_s=transcript.duration,
+            recorder_words=[(word.start, word.end) for word in transcript.words], strategy=3,
+            source_asset_id=recorder.id, target_asset_id=camera.id,
+            channels=int(recorder.manual.get("media_info", {}).get("audio_channels") or 1),
+        )
+        warps.append(plan.warp)
+        artifacts.append(voice)
+        outputs[f"sync:{camera.id}"] = [voice]
+    report = context.work_dir / "stages" / "sync" / "output.json"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(json.dumps({
+        "schema_version": 1, "mode": "complex", "strategy": 3,
+        "voices": {camera.id: f"voice/{camera.id}.wav" for camera in cameras},
+        "padding": "silence is outside invertible source maps",
+    }, indent=2) + "\n", encoding="utf-8")
+    artifacts.append(report)
+    return StageOutput(tuple(artifacts), {
+        "placements": placements, "audio_warp_maps": warps, "outputs": outputs,
+    })
 
 
 def fit_alignment(anchors: list[TextAnchor]) -> tuple[float, float, float]:
