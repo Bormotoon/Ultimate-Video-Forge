@@ -96,6 +96,8 @@ class SpeakerSettings:
     margin_db: float = 6.0
     silence_floor_db: float = -60.0
     step_s: float = 0.05
+    min_turn_s: float = 0.3
+    max_gap_s: float = 0.3
     tracks: dict[str, str] = field(default_factory=dict)
 
 
@@ -171,6 +173,8 @@ def validate_settings(settings: Settings) -> None:
     _one_of("speakers.method", settings.speakers.method, {"auto", "mics", "off"})
     _non_negative("speakers.margin_db", settings.speakers.margin_db)
     _positive("speakers.step_s", settings.speakers.step_s)
+    _non_negative("speakers.min_turn_s", settings.speakers.min_turn_s)
+    _non_negative("speakers.max_gap_s", settings.speakers.max_gap_s)
     if settings.speakers.step_s > 1:
         raise SettingsError("speakers.step_s must not exceed 1 second")
     if not math.isfinite(settings.speakers.silence_floor_db) or not (

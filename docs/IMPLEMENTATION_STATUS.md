@@ -267,3 +267,14 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   libx264 work. Full suite: 217 passed; changed-file Ruff and diff checks pass.
 - Long-session A/V drift, NLE VFR interpretation and GPU hardware acceptance
   remain open. Next major processing block is speakers/multicam.
+
+### Speaker short-turn smoothing
+
+- Microphone attribution has configurable conservative short-island smoothing,
+  preserving uncertain and overlapping speech, pauses and genuine handoffs.
+  Raw microphone evidence remains published separately from smoothed turns.
+- Eight regressions cover isolated islands, disabled smoothing, unknown/overlap,
+  different neighbors, pauses, long turns, short neighbors and overlapping turns.
+  Full suite: 225 passed; changed-file Ruff and diff checks pass.
+- Pyannote integration, speaker-driven camera switching and true NLE multicam
+  export remain open; smoothing does not establish real-world speaker accuracy.

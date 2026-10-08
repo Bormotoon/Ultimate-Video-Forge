@@ -220,3 +220,11 @@ entry points and recorded project paths in the same change.
   per-piece frame counts and rational output rate. This changes program rendering,
   not NLE export frame rounding. Preserve libx264 as a CPU encoder alias alongside
   cpu; validation and encoder selection now accept both consistently.
+
+- Microphone speaker attribution now smooths isolated known-speaker A-B-A islands
+  shorter than `speakers.min_turn_s` (default 0.3 seconds) only between two stable
+  same-speaker neighbors, with gaps within `speakers.max_gap_s` (default 0.3).
+  Unknown/overlap, overlapping turns, real handoffs and short neighboring turns
+  are retained. Decisions use original neighbors in one pass to avoid cascades.
+  Zero min_turn_s disables smoothing. Raw attribution is retained separately in
+  diarization.raw.json / speakers_raw; reports record the policy and thresholds.

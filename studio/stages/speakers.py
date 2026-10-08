@@ -68,7 +68,7 @@ class SpeakersStage:
         identities = [describe_artifact(project.source_dir, project.source_dir / asset.path)
                       for asset in project.assets if asset.id in selected]
         return stable_fingerprint(
-            "speakers-v2", content, tracks, identities, project.placements, conf,
+            "speakers-v3", content, tracks, identities, project.placements, conf,
         )
 
     def run(self, context: StageContext) -> StageOutput:
@@ -100,16 +100,28 @@ class SpeakersStage:
             transcript.words, envelopes, step_s=step,
             margin_db=float(conf.get("margin_db", 6.0)),
             silence_floor_db=float(conf.get("silence_floor_db", -60.0)),
+            max_gap_s=float(conf.get("max_gap_s", 0.3)),
+        )
+        raw_turns = turns
+        turns = smooth_short_turns(
+            turns, min_turn_s=float(conf.get("min_turn_s", 0.3)),
+            max_gap_s=float(conf.get("max_gap_s", 0.3)),
         )
         output = context.work_dir / "stages" / "speakers" / "diarization.json"
         save_turns(output, turns)
+        raw_output = output.with_name("diarization.raw.json")
+        save_turns(raw_output, raw_turns)
         report = output.with_name("report.json")
         report.write_text(json.dumps({
             "schema_version": 1, "time_domain": "timeline", "method": "mics",
             "tracks": tracks, "step_s": step, "map": "SourcePlacement",
+            "smoothing": {"min_turn_s": float(conf.get("min_turn_s", 0.3)),
+                          "max_gap_s": float(conf.get("max_gap_s", 0.3)),
+                          "policy": "isolated A-B-A known-speaker islands only"},
         }, indent=2) + "\n", encoding="utf-8")
-        return StageOutput((output, report), {
-            "outputs": {**context.project.outputs, "speakers": [output, report]},
+        return StageOutput((output, report, raw_output), {
+            "outputs": {**context.project.outputs, "speakers": [output, report],
+                        "speakers_raw": [raw_output]},
         })
 
 
@@ -178,6 +190,7 @@ def assign_words_to_mics(
     step_s: float = 0.05,
     margin_db: float = 6.0,
     silence_floor_db: float = -60.0,
+    max_gap_s: float = 0.3,
 ) -> list[SpeakerTurn]:
     assignments: list[SpeakerTurn] = []
     for word in words:
@@ -201,7 +214,33 @@ def assign_words_to_mics(
             second_db = 10 * math.log10(max(energies[1][1], 1e-12))
             speaker = energies[0][0] if first_db - second_db >= margin_db else "overlap"
         assignments.append(SpeakerTurn(word.start, word.end, speaker))
-    return merge_adjacent_turns(assignments)
+    return merge_adjacent_turns(assignments, max_gap_s)
+
+
+def smooth_short_turns(
+    turns: list[SpeakerTurn], *, min_turn_s: float = 0.3, max_gap_s: float = 0.3,
+) -> list[SpeakerTurn]:
+    """Relabel isolated short known-speaker islands using original neighbors."""
+    if any(not math.isfinite(value) or value < 0 for value in (min_turn_s, max_gap_s)):
+        raise ValueError("speaker smoothing thresholds must be finite and non-negative")
+    if min_turn_s == 0:
+        return list(turns)
+    result = list(turns)
+    for index in range(1, len(turns) - 1):
+        previous, current, following = turns[index - 1:index + 2]
+        if (previous.speaker in {"unknown", "overlap"}
+                or current.speaker in {"unknown", "overlap"}
+                or previous.speaker != following.speaker
+                or previous.speaker == current.speaker
+                or current.end - current.start >= min_turn_s
+                or previous.end - previous.start < min_turn_s
+                or following.end - following.start < min_turn_s
+                or not 0 <= current.start - previous.end <= max_gap_s
+                or not 0 <= following.start - current.end <= max_gap_s
+                or not previous.source == current.source == following.source):
+            continue
+        result[index] = SpeakerTurn(current.start, current.end, previous.speaker, current.source)
+    return merge_adjacent_turns(result, max_gap_s)
 
 
 def merge_adjacent_turns(turns: list[SpeakerTurn], max_gap_s: float = 0.3) -> list[SpeakerTurn]:
