@@ -60,3 +60,38 @@ def test_flat_exports_retime_all_media_after_roughcut(tmp_path: Path, rate: floa
     assert all(item.findtext("enabled") == "FALSE" for item in linked_audio)
     assert all(item.findtext("filter/effect/mediatype") == "audio"
                for item in linked_audio if rate != 1)
+
+
+def test_mixed_source_fps_use_distinct_source_and_sequence_clocks(tmp_path: Path) -> None:
+    project = Project(tmp_path, tmp_path / "work")
+    for name, fps, width in [("a", "25", 1920), ("b", "30000/1001", 1280)]:
+        asset = Asset(name, Path(f"{name}.mov"), "video", AssetRole.CAMERA)
+        asset.manual["media_info"] = {"fps": fps, "width": width, "height": 720,
+                                      "audio_codec": "aac", "audio_channels": 1}
+        project.assets.append(asset)
+        project.placements.append(SourcePlacement(name, 0, 2, 4, 1.25))
+    result = ExportStage().run(StageContext(project, {"export": {
+        "targets": ["fcpxml", "xmeml", "multicam"],
+    }}, project.work_dir))
+    fcpxml_path = next(path for path in result.artifacts if path.name == "Studio.fcpxml")
+    root = ET.parse(fcpxml_path).getroot()
+    formats = {element.get("id"): element for element in root.findall("resources/format")}
+    asset_b = next(asset for asset in root.findall("resources/asset") if asset.get("name") == "b")
+    fmt = formats[asset_b.get("format")]
+    assert fmt.get("frameDuration") == "1001/30000s"
+    assert fmt.get("width") == "1280"
+    xmeml_path = next(path for path in result.artifacts if path.suffix == ".xml")
+    xmeml = ET.parse(xmeml_path).getroot()
+    b = next(item for item in xmeml.findall(".//video/track/clipitem")
+             if item.findtext("name") == "b")
+    assert b.findtext("start") == "0"
+    assert b.findtext("end") == "125"  # five seconds in the 25 fps sequence
+    assert b.findtext("in") == "60"
+    assert b.findtext("out") == "180"  # source seconds 2..6 at 30000/1001
+    assert b.findtext("rate/timebase") == "30"
+    assert b.findtext("rate/ntsc") == "TRUE"
+    assert b.findtext("file/media/video/samplecharacteristics/width") == "1280"
+    linked = next(item for item in xmeml.findall(".//audio/track/clipitem")
+                  if item.findtext("name") == "b")
+    assert linked.findtext("in") == "60"
+    assert linked.findtext("rate/ntsc") == "TRUE"

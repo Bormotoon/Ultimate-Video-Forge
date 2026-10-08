@@ -284,3 +284,9 @@ entry points and recorded project paths in the same change.
   stay distinct. Source out and file coverage use duration/k; explicit clip rates
   are emitted. Unity-speed clips have no speed filter. Premiere interpretation of
   constant-speed effects remains an external import/playback acceptance gate.
+
+- Export clips retain source fps and picture dimensions separately from the
+  sequence format. XMEML source in/out, file coverage and linked source channels
+  use the source clock; sequence start/end use the sequence clock. FCPXML video
+  assets reference distinct source format resources, preserving rational rates
+  and dimensions. Replacement WAVs use the sequence frame clock for XML indexing.

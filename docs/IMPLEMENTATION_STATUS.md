@@ -361,3 +361,13 @@ an actual Whisper/model/NLE end-to-end acceptance run.
 - NLE import/playback acceptance remains open, especially Premiere constant speed
   semantics, source fps differing from sequence fps and sub-frame lip-sync.
 - Full suite: 241 passed; changed-file Ruff and `git diff --check` pass.
+
+### Mixed-format export continuation
+
+- Source video fps/dimensions now accompany export clips. FCPXML references
+  source format resources; XMEML source in/out and file coverage use source fps,
+  including linked camera channels, while sequence start/end retain sequence fps.
+- Mixed 25 and 30000/1001 fps regression checks nonzero source in-points, affine
+  speed, source dimensions and audio channel indexing. Generated flat FCPXML
+  passes 1.9 DTD validation. Full suite: 242 passed; changed-file Ruff passes.
+- Actual mixed-format NLE import/playback and speed interpretation remain open.

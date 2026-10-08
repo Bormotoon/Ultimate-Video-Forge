@@ -27,6 +27,9 @@ class SequenceClip:
     audio_enabled: bool = True
     audio_channels: int = 2
     rate: float = 1.0
+    source_fps: Fraction | None = None
+    source_width: int | None = None
+    source_height: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +72,7 @@ class ExportStage:
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
-            "export-v8", project.assets, project.placements, project.audio_warp_maps,
+            "export-v9", project.assets, project.placements, project.audio_warp_maps,
             inputs, settings.get("export", {}), settings.get("roughcut", {}),
             settings.get("program", {}),
         )
@@ -168,6 +171,9 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
                 audio_enabled=voice is None,
                 audio_channels=int(media.get("audio_channels") or 2),
                 rate=rate,
+                source_fps=Fraction(str(media.get("fps") or "25")),
+                source_width=int(media.get("width") or 1920),
+                source_height=int(media.get("height") or 1080),
             )
         )
         if voice is not None:
@@ -260,6 +266,7 @@ def write_fcpxml(
         height=str(sequence.height),
     )
     resource_ids: dict[str, str] = {}
+    formats = {}
     for index, clip in enumerate(sequence.clips, 2):
         if clip.asset_id in resource_ids:
             continue
@@ -283,6 +290,17 @@ def write_fcpxml(
                 "media-rep", kind="original-media", src=_media_src(clip.path, media_base)
             )
         )
+        if clip.has_video:
+            source_fps = clip.source_fps or sequence.fps
+            key = (source_fps, clip.source_width or sequence.width,
+                   clip.source_height or sequence.height)
+            if key not in formats:
+                format_id = f"source-format-{len(formats) + 1}"
+                formats[key] = format_id
+                ET.SubElement(resources, "format", id=format_id,
+                              frameDuration=f"{source_fps.denominator}/{source_fps.numerator}s",
+                              width=str(key[1]), height=str(key[2]))
+            asset_element.set("format", formats[key])
     library = ET.SubElement(root, "library")
     event = ET.SubElement(library, "event", name="Studio")
     project = ET.SubElement(event, "project", name=sequence.name)
@@ -383,6 +401,7 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
         for index, clip in enumerate(
             (item for item in sequence.clips if item.lane == lane), 1
         ):
+            source_fps = clip.source_fps or sequence.fps
             item = ET.SubElement(track, "clipitem", id=f"v-{lane}-{index}")
             ET.SubElement(item, "name").text = clip.path.stem
             ET.SubElement(item, "enabled").text = "TRUE"
@@ -393,31 +412,31 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
                 _frames(clip.timeline_start_s + clip.duration_s, sequence.fps)
             )
             ET.SubElement(item, "in").text = str(
-                _frames(clip.source_in_s, sequence.fps)
+                _frames(clip.source_in_s, source_fps)
             )
             ET.SubElement(item, "out").text = str(
-                _frames(clip.source_in_s + clip.duration_s / clip.rate, sequence.fps)
+                _frames(clip.source_in_s + clip.duration_s / clip.rate, source_fps)
             )
             ET.SubElement(item, "duration").text = str(
                 _frames(clip.timeline_start_s + clip.duration_s, sequence.fps)
                 - _frames(clip.timeline_start_s, sequence.fps)
             )
-            _xmeml_rate(item, sequence.fps)
+            _xmeml_rate(item, source_fps)
             _xmeml_speed(item, clip.rate, "video" if clip.has_video else "audio")
             file_el = ET.SubElement(item, "file", id=f"file-{clip.asset_id}")
             ET.SubElement(file_el, "name").text = clip.path.name
             ET.SubElement(file_el, "pathurl").text = _xmeml_url(clip.path)
-            _xmeml_rate(file_el, sequence.fps)
+            _xmeml_rate(file_el, source_fps)
             ET.SubElement(file_el, "duration").text = str(max(
-                _frames(other.source_in_s + other.duration_s / other.rate, sequence.fps)
+                _frames(other.source_in_s + other.duration_s / other.rate, source_fps)
                 for other in sequence.clips if other.asset_id == clip.asset_id
             ))
             file_media = ET.SubElement(file_el, "media")
             if clip.has_video:
                 sample = ET.SubElement(ET.SubElement(file_media, "video"), "samplecharacteristics")
-                _xmeml_rate(sample, sequence.fps)
-                ET.SubElement(sample, "width").text = str(sequence.width)
-                ET.SubElement(sample, "height").text = str(sequence.height)
+                _xmeml_rate(sample, source_fps)
+                ET.SubElement(sample, "width").text = str(clip.source_width or sequence.width)
+                ET.SubElement(sample, "height").text = str(clip.source_height or sequence.height)
             if clip.has_audio:
                 file_audio = ET.SubElement(file_media, "audio")
                 ET.SubElement(file_audio, "channelcount").text = str(clip.audio_channels)
@@ -442,7 +461,7 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
                         "TRUE" if clip.audio_enabled else "FALSE"
                     )
                     ET.SubElement(audio_item, "duration").text = item.findtext("duration")
-                    _xmeml_rate(audio_item, sequence.fps)
+                    _xmeml_rate(audio_item, source_fps)
                     _xmeml_speed(audio_item, clip.rate, "audio")
                     ET.SubElement(audio_item, "file", id=f"file-{clip.asset_id}")
                     source_track = ET.SubElement(audio_item, "sourcetrack")
