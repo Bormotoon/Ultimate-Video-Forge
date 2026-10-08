@@ -26,6 +26,7 @@ class SequenceClip:
     has_video: bool = True
     audio_enabled: bool = True
     audio_channels: int = 2
+    rate: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +69,7 @@ class ExportStage:
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
-            "export-v6", project.assets, project.placements, project.audio_warp_maps,
+            "export-v7", project.assets, project.placements, project.audio_warp_maps,
             inputs, settings.get("export", {}), settings.get("roughcut", {}),
             settings.get("program", {}),
         )
@@ -86,17 +87,14 @@ class ExportStage:
         if "multicam" in targets:
             from studio.stages.multicam import write_multicam
 
-            camera_ids = {asset.id for asset in context.project.assets
-                          if asset.role is AssetRole.CAMERA}
-            if any(abs(item.k - 1) > 1e-9 for item in context.project.placements
-                   if item.asset_id in camera_ids):
-                raise ValueError("multicam export requires unretimed camera placements")
+            multicam_sequence = build_sequence(context.project, use_edit=bool(use_edit),
+                                               retimed=True)
             artifacts.append(write_multicam(
-                sequence, fcpxml.with_name(f"{sequence.name}-multicam.fcpxml"),
+                multicam_sequence, fcpxml.with_name(f"{sequence.name}-multicam.fcpxml"),
                 media_base=context.project.source_dir,
                 version=str(conf.get("fcpxml_version", "1.9")),
                 camera_plan=multicam_camera_plan(context.project, context.settings,
-                                                bool(use_edit), sequence),
+                                                bool(use_edit), multicam_sequence),
             ))
         if "fcpxml" in targets:
             write_fcpxml(
@@ -145,7 +143,8 @@ def multicam_camera_plan(project: Project, settings: dict, use_edit: bool,
     return EditMap("multicam-selection", tuple(ranges))
 
 
-def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = True) -> Sequence:
+def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = True,
+                   retimed: bool = False) -> Sequence:
     assets = {asset.id: asset for asset in project.assets}
     clips: list[SequenceClip] = []
     camera_index = 0
@@ -156,30 +155,35 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
         media = asset.manual.get("media_info", {})
         voices = project.outputs.get(f"sync:{asset.id}", [])
         voice = next((path for path in voices if path.is_file()), None)
+        rate = placement.k if retimed else 1.0
+        duration = placement.duration_s * rate
         clips.append(
             SequenceClip(
                 asset.id,
                 project.source_dir / asset.path,
                 placement.in_s,
-                placement.duration_s,
+                duration,
                 placement.offset_s,
                 camera_index,
                 bool(media.get("audio_codec")),
                 audio_enabled=voice is None,
                 audio_channels=int(media.get("audio_channels") or 2),
+                rate=rate,
             )
         )
         if voice is not None:
             clips.append(SequenceClip(
-                f"voice-{asset.id}", voice, placement.in_s, placement.duration_s,
+                f"voice-{asset.id}", voice, placement.in_s, duration,
                 placement.offset_s, -camera_index - 1, True, has_video=False,
+                rate=rate,
             ))
         room = project.outputs.get(f"ambience:{asset.id}", [])
         if room and room[0].is_file():
             clips.append(SequenceClip(
-                f"ambience-{asset.id}", room[0], placement.in_s, placement.duration_s,
+                f"ambience-{asset.id}", room[0], placement.in_s, duration,
                 placement.offset_s, -1000 - camera_index, True, has_video=False,
                 audio_channels=int(media.get("audio_channels") or 2),
+                rate=rate,
             ))
         camera_index += 1
     if not clips:
@@ -207,7 +211,8 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
                     edited_start = timeline_to_edited(start, edit)
                     assert edited_start is not None
                     edited_clips.append(replace(
-                        clip, source_in_s=clip.source_in_s + start - clip.timeline_start_s,
+                        clip, source_in_s=clip.source_in_s
+                        + (start - clip.timeline_start_s) / clip.rate,
                         timeline_start_s=edited_start, duration_s=end - start,
                     ))
             clips = edited_clips
@@ -268,7 +273,7 @@ def write_fcpxml(
             name=clip.path.stem,
             start="0s",
             duration=_frame_time(max(
-                item.source_in_s + item.duration_s for item in sequence.clips
+                item.source_in_s + item.duration_s / item.rate for item in sequence.clips
                 if item.asset_id == clip.asset_id
             ), sequence.fps),
             hasVideo="1" if clip.has_video else "0",
@@ -309,6 +314,21 @@ def write_fcpxml(
         )
         if clip.has_audio and not clip.audio_enabled:
             ET.SubElement(element, "adjust-volume", amount="-96dB")
+        if abs(clip.rate - 1) > 1e-9:
+            # FCPXML start is in the adjusted clip clock; timeMap values
+            # remain in the original media clock, including nonzero in-points.
+            adjusted_start = clip.source_in_s * clip.rate
+            element.set("start", _frame_time(adjusted_start, sequence.fps))
+            time_map = ET.Element("timeMap", frameSampling="floor", preservesPitch="1")
+            ET.SubElement(time_map, "timept", time=_frame_time(adjusted_start, sequence.fps),
+                          value=_rational(clip.source_in_s, 1_000_000), interp="linear")
+            ET.SubElement(time_map, "timept",
+                          time=_rational(
+                              _parse_time(element.get("start"))
+                              + _parse_time(element.get("duration")), 1_000_000),
+                          value=_rational(clip.source_in_s + clip.duration_s / clip.rate,
+                                          1_000_000), interp="linear")
+            element.insert(0, time_map)
     for marker in sequence.markers:
         ET.SubElement(
             bed, "marker", start=_frame_time(marker.at_s, sequence.fps),

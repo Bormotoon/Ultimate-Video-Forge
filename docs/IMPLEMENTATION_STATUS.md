@@ -336,3 +336,16 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   generated voice/ambience document passes FCPXML 1.9 DTD validation. Full suite:
   236 passed; changed-file Ruff and diff checks pass. Listening/NLE import and
   camera-retiming acceptance remain open.
+
+### Affine multicam retiming
+
+- Multicam supports camera placements with k != 1 via linear FCPXML timeMaps;
+  synchronized voice and ambience follow the same map. Roughcut intersects in
+  timeline time and computes source in-points through the inverse affine rate.
+- Two regressions cover slow/fast maps, nonzero source in-points, roughcut clipping,
+  audio map parity and source resource duration. Generated retimed voice/ambience
+  XML passes FCPXML 1.9 DTD validation. Full suite: 238 passed; changed-file Ruff
+  and diff checks pass.
+- Actual Final Cut playback, frame-rounded lip-sync accuracy and mixed-source
+  format interpretation remain acceptance gates. Flat export retiming parity is
+  not completed by this multicam-only sequence change.

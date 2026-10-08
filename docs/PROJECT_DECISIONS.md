@@ -268,3 +268,11 @@ entry points and recorded project paths in the same change.
   independent audio-angle selection. Child source starts retain roughcut in-points;
   composite-local offsets start at zero. Angle children are ordered by offset.
   A voice/ambience fixture passed FCPXML 1.9 DTD validation with xmllint.
+
+- Multicam now carries affine SourcePlacement.k into a dedicated retimed
+  sequence: timeline durations multiply by k, roughcut source in-points divide
+  elapsed timeline time by k. Camera, replacement voice and ambience use identical
+  linear FCPXML timeMap geometry. Adjusted clip start/end are frame-rounded;
+  source endpoint values retain microsecond precision. Resource duration describes
+  original source coverage rather than retimed duration. Flat exports retain their
+  previous policy; NLE semantic playback acceptance remains outstanding.

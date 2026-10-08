@@ -1,4 +1,4 @@
-"""FCPXML multicam resources from an aligned, unretimed sequence."""
+"""FCPXML multicam resources from an aligned sequence with affine time maps."""
 
 import xml.etree.ElementTree as ET
 from pathlib import Path

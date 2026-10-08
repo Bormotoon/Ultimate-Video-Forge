@@ -91,3 +91,46 @@ def test_ambience_is_connected_inside_selected_audio_angle(tmp_path: Path) -> No
     assert [(source.get("angleID"), source.get("srcEnable")) for source in sources] == [
         ("angle-1", "video"), ("angle-2", "audio"),
     ]
+
+
+def test_affine_multicam_trims_in_source_clock_and_retimes_audio(tmp_path: Path) -> None:
+    import json
+
+    from studio.core.project import Asset, AssetRole, Project
+    from studio.core.timeline import SourcePlacement
+    from studio.stages.export import build_sequence
+
+    project = Project(tmp_path, tmp_path / "work")
+    project.assets = [Asset("a", Path("a.mov"), "video", AssetRole.CAMERA)]
+    project.placements = [SourcePlacement("a", 2, 1, 4, 1.25)]
+    voice, room = tmp_path / "voice.wav", tmp_path / "room.wav"
+    voice.touch()
+    room.touch()
+    edit = tmp_path / "edit.json"
+    edit.write_text(json.dumps({"mode": "cut", "keep": [{"start": 3.25, "end": 5.75}]}))
+    project.outputs = {"sync:a": [voice], "ambience:a": [room], "roughcut": [edit]}
+    sequence = build_sequence(project, retimed=True)
+    assert len(sequence.clips) == 3
+    assert all(clip.source_in_s == 2 and clip.duration_s == 2.5
+               and clip.rate == 1.25 for clip in sequence.clips)
+    path = write_multicam(sequence, tmp_path / "retimed.fcpxml", media_base=tmp_path)
+    root = ET.parse(path).getroot()
+    maps = root.findall("./resources/media/multicam/mc-angle//timeMap")
+    assert len(maps) == 3
+    for time_map in maps:
+        points = time_map.findall("timept")
+        assert [_parse_time(point.get("time")) for point in points] == [2.48, 4.96]
+        assert [_parse_time(point.get("value")) for point in points] == [2, 4]
+    assert _parse_time(root.find(".//project/sequence").get("duration")) == 2.48
+
+
+def test_fast_camera_map_preserves_source_endpoints(tmp_path: Path) -> None:
+    sequence = Sequence("Fast", Fraction(25), 1920, 1080, (
+        SequenceClip("a", tmp_path / "a.mov", 2, 1, 0, 0, True, rate=0.5),
+    ))
+    path = write_multicam(sequence, tmp_path / "fast.fcpxml", media_base=tmp_path)
+    root = ET.parse(path).getroot()
+    points = root.findall("./resources/media/multicam/mc-angle/asset-clip/timeMap/timept")
+    assert [_parse_time(point.get("time")) for point in points] == [1, 2]
+    assert [_parse_time(point.get("value")) for point in points] == [2, 4]
+    assert _parse_time(root.find("./resources/asset").get("duration")) == 4
