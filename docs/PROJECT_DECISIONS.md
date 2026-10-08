@@ -199,3 +199,13 @@ entry points and recorded project paths in the same change.
   A runtime NVENC failure in auto mode regenerates all pieces on CPU, avoiding
   concatenation of differing hardware/software H.264 parameter sets. The render
   report records selection, fallback reason, format and retained duration.
+
+- Voice master uses configurable linear complementary crossfades
+  (`sync.master_crossfade_ms`, default 10 ms) only when switching between
+  sources with real shared timeline coverage. Fades occur before the switch;
+  the timeline is not shortened and gaps are not filled with invented audio.
+  Adjacent intervals belonging to one selected source are merged first.
+- PCM tests exposed uncompensated 5 ms lookahead latency in the timeline mix
+  limiter. Enable its latency compensation and express input delays in samples
+  rather than rounded milliseconds. A one-sample-offset impulse regression
+  verifies exact placement and retained output duration.

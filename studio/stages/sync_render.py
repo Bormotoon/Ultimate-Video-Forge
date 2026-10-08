@@ -657,8 +657,8 @@ def mix_clips_on_timeline(
                 path.name,
                 offset,
             )
-        delay_ms = max(0, round(offset * 1000))
-        delay_arg = "|".join([str(delay_ms)] * channels) if channels > 1 else str(delay_ms)
+        delay_samples = max(0, round(offset * sample_rate))
+        delay_arg = "|".join([f"{delay_samples}S"] * channels)
         filter_parts.append(
             f"[{i}:a]aresample={sample_rate}:resampler=soxr,"
             f"aformat=sample_fmts=fltp:channel_layouts={layout},"
@@ -670,7 +670,8 @@ def mix_clips_on_timeline(
         # Sum in float so the mix itself never clips, then bound the result at
         # full scale before it reaches an integer codec.
         "aformat=sample_fmts=fltp,"
-        "alimiter=level_in=1:level_out=1:limit=1.0:attack=5:release=50:level=disabled,"
+        "alimiter=level_in=1:level_out=1:limit=1.0:attack=5:release=50:"
+        "level=disabled:latency=1,"
         f"apad,atrim=0:{total_duration:.6f},asetpts=PTS-STARTPTS[out]"
     )
     filter_complex = ";".join(filter_parts)

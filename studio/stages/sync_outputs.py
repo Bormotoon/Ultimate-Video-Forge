@@ -46,7 +46,10 @@ def segment_voice(source: Path, directory: Path, minutes: float) -> tuple[Path, 
 
 def render_voice_master(
     placements: list[SourcePlacement], voices: dict[str, Path], output: Path,
+    *, crossfade_ms: float = 10.0,
 ) -> Path:
+    if not math.isfinite(crossfade_ms) or crossfade_ms < 0:
+        raise ValueError("master crossfade must be finite and non-negative")
     candidates = [item for item in placements if item.asset_id in voices]
     if not candidates:
         raise ValueError("no synchronized voice is available for the master")
@@ -54,18 +57,34 @@ def render_voice_master(
                          for value in (item.offset_s, item.offset_s + item.duration_s * item.k)})
     import tempfile
 
+    intervals = []
+    for start, end in zip(boundaries, boundaries[1:], strict=False):
+        available = [item for item in candidates
+                     if item.offset_s <= start
+                     and item.offset_s + item.duration_s * item.k >= end - 1e-9]
+        if not available:
+            continue
+        selected = available[0]
+        if intervals and intervals[-1][2] == selected and intervals[-1][1] == start:
+            intervals[-1] = (intervals[-1][0], end, selected)
+        else:
+            intervals.append((start, end, selected))
+    fades = [0.0] * len(intervals)
+    for index in range(1, len(intervals)):
+        previous_start, previous_end, _previous = intervals[index - 1]
+        start, end, selected = intervals[index]
+        if abs(previous_end - start) < 1e-9:
+            # Crossfade before the switch only where both source files exist.
+            # Linear complementary gains avoid doubling correlated dialogue.
+            fades[index] = max(0.0, min(
+                crossfade_ms / 1000, start - selected.offset_s,
+                (previous_end - previous_start) / 2, (end - start) / 2,
+            ))
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".master-", dir=output.parent) as temporary:
         clips = []
-        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:], strict=False)):
-            available = [item for item in candidates
-                         if item.offset_s <= start
-                         and item.offset_s + item.duration_s * item.k >= end - 1e-9]
-            if not available:
-                continue
-            # Overlapping cameras carry the same dialogue. Select one voice,
-            # never sum all camera replacements into a louder duplicate.
-            selected = available[0]
+        for index, (start, end, selected) in enumerate(intervals):
+            start -= fades[index]
             cut = Path(temporary) / f"part-{index}.wav"
             source_start = (start - selected.offset_s) / selected.k
             source_end = (end - selected.offset_s) / selected.k
@@ -90,5 +109,19 @@ def render_voice_master(
                 ], capture_output=True, text=True)
                 if result.returncode:
                     raise RuntimeError(f"master retiming failed: {result.stderr.strip()}")
+            fade_out = fades[index + 1] if index + 1 < len(fades) else 0
+            if fades[index] or fade_out:
+                filters = []
+                if fades[index]:
+                    filters.append(f"afade=t=in:st=0:d={fades[index]}:curve=tri")
+                if fade_out:
+                    filters.append(f"afade=t=out:st={end - start - fade_out}:"
+                                   f"d={fade_out}:curve=tri")
+                faded = cut.with_name(f"faded-{index}.wav")
+                subprocess.run([
+                    "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(cut),
+                    "-af", ",".join(filters), "-c:a", "pcm_s24le", str(faded),
+                ], capture_output=True, text=True, check=True)
+                cut = faded
             clips.append((cut, start))
         return mix_clips_on_timeline(clips, boundaries[-1], 48000, output, channels=2)

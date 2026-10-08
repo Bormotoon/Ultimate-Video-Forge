@@ -241,3 +241,15 @@ an actual Whisper/model/NLE end-to-end acceptance run.
 - Local real probe found no h264_nvenc encoder in ffmpeg and selected libx264.
   Real CPU media render and controlled GPU success/failure/timeout tests pass.
   Full suite: 208 passed. Hardware GPU encoding acceptance remains open.
+
+### Voice master crossfades
+
+- Added `sync.master_crossfade_ms` (10 ms default; zero disables) with linear
+  complementary fades in real source overlaps, preserving original timeline
+  length and silence gaps. No fade is fabricated across non-overlapping sources.
+- Fixed timeline-mix limiter latency and sample offset rounding. Real PCM tests
+  verify smooth opposite-polarity switches, unchanged correlated-dialogue gain,
+  silence gaps and one-sample impulse placement. Full suite: 212 passed; Ruff
+  on changed files and `git diff --check` pass.
+- Review-program edit joins remain hard cuts. Listening acceptance, VFR/mixed
+  source fps acceptance and actual GPU render acceptance remain open.

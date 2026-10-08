@@ -35,6 +35,7 @@ class SyncSettings:
     verify: bool = False
     voice_segment_minutes: float = 0.0
     master_wav: bool = False
+    master_crossfade_ms: float = 10.0
     self_check: str = "off"
     voice_enhance: str = "off"
     ambience: bool = False
@@ -144,6 +145,7 @@ def validate_settings(settings: Settings) -> None:
         raise SettingsError("sync.strategy must be 1, 2, or 3")
     _non_negative("sync.max_drift_ms", settings.sync.max_drift_ms)
     _non_negative("sync.voice_segment_minutes", settings.sync.voice_segment_minutes)
+    _non_negative("sync.master_crossfade_ms", settings.sync.master_crossfade_ms)
     _one_of("sync.recorder_mode", settings.sync.recorder_mode, {"best", "all"})
     _one_of("sync.self_check", settings.sync.self_check, {"off", "warn", "repair"})
     if settings.sync.self_check == "repair" and settings.sync.voice_enhance != "off":

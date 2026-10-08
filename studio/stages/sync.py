@@ -344,6 +344,7 @@ def _run_complex(context: StageContext) -> StageOutput:
         master = render_voice_master(
             placements, {camera.id: outputs[f"sync:{camera.id}"][0] for camera in cameras},
             context.work_dir / "export" / "voice-master.wav",
+            crossfade_ms=float(sync.get("master_crossfade_ms", 10.0)),
         )
         artifacts.append(master)
         outputs["master_wav"] = [master]
