@@ -261,3 +261,10 @@ entry points and recorded project paths in the same change.
 - A generated multicam document passed xmllint against Apple's FCPXML 1.9 DTD
   obtained from the CommandPost mirror. DTD validation checks structure, not
   Final Cut playback, media relinking or actual angle-switch import acceptance.
+
+- Multicam ambience is now connected inside a composite audio angle alongside
+  the synchronized voice (or camera audio when no replacement exists). Select
+  this single composite angle for audio rather than relying on simultaneous
+  independent audio-angle selection. Child source starts retain roughcut in-points;
+  composite-local offsets start at zero. Angle children are ordered by offset.
+  A voice/ambience fixture passed FCPXML 1.9 DTD validation with xmllint.

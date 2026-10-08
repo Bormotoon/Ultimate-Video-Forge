@@ -325,3 +325,14 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   FCPXML 1.9 DTD from the CommandPost mirror (external temporary validation asset).
 - Final Cut import/playback, camera retiming and ambience selection remain open.
 - Full regression run: 235 passed; changed-file Ruff and `git diff --check` pass.
+
+### Multicam ambience continuation
+
+- Selected audio angle now combines synchronized voice and corresponding camera
+  ambience via a composite clip with connected background audio. Camera audio
+  is the primary component when no replacement voice exists. Source in-points
+  are preserved independently of composite-local offsets.
+- Structural test covers a nonzero source in-point and selected audio angle;
+  generated voice/ambience document passes FCPXML 1.9 DTD validation. Full suite:
+  236 passed; changed-file Ruff and diff checks pass. Listening/NLE import and
+  camera-retiming acceptance remain open.

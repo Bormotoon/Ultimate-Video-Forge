@@ -68,3 +68,26 @@ def test_speaker_plan_is_mapped_across_removed_ranges(tmp_path: Path) -> None:
     plan = multicam_camera_plan(project, {"program": {"speaker_cameras": {
         "Alice": "a", "Bob": "b"}, "min_shot_s": 0}}, True, sequence)
     assert plan.keep == (KeepRange(0, 2, "a"), KeepRange(2, 4, "b"))
+
+
+def test_ambience_is_connected_inside_selected_audio_angle(tmp_path: Path) -> None:
+    sequence = Sequence("Room", Fraction(25), 1920, 1080, (
+        SequenceClip("a", tmp_path / "a.mov", 6, 2, 0, 0, True, audio_enabled=False),
+        SequenceClip("voice-a", tmp_path / "voice.wav", 6, 2, 0, -1, True, has_video=False),
+        SequenceClip("ambience-a", tmp_path / "room.wav", 6, 2, 0, -1000, True,
+                     has_video=False),
+    ))
+    path = write_multicam(sequence, tmp_path / "room.fcpxml", media_base=tmp_path)
+    root = ET.parse(path).getroot()
+    angles = root.findall("./resources/media/multicam/mc-angle")
+    assert len(angles) == 2
+    composite = angles[1].find("clip")
+    assert composite.get("start") == "0s"
+    children = composite.findall("asset-clip")
+    assert [_parse_time(child.get("start")) for child in children] == [6, 6]
+    assert [_parse_time(child.get("offset")) for child in children] == [0, 0]
+    assert children[1].get("lane") == "-1"
+    sources = root.findall(".//project/sequence/spine/mc-clip/mc-source")
+    assert [(source.get("angleID"), source.get("srcEnable")) for source in sources] == [
+        ("angle-1", "video"), ("angle-2", "audio"),
+    ]

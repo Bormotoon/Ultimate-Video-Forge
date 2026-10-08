@@ -4,7 +4,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from studio.core.timeline import EditMap
-from studio.stages.export import Sequence, _frame_time, write_fcpxml
+from studio.stages.export import Sequence, _frame_time, _parse_time, write_fcpxml
 
 
 def write_multicam(sequence: Sequence, output: Path, *, media_base: Path,
@@ -22,7 +22,11 @@ def write_multicam(sequence: Sequence, output: Path, *, media_base: Path,
     media = ET.SubElement(resources, "media", id="mc-resource", name=sequence.name + " Multicam")
     multicam = ET.SubElement(media, "multicam", format="r1", tcStart="0s", tcFormat="NDF")
     angles = {}
+    elements = {}
     for clip, element in zip(sequence.clips, list(bed.findall("asset-clip")), strict=True):
+        elements[id(clip)] = element
+        if clip.asset_id.startswith("ambience-"):
+            continue
         key = (clip.has_video, clip.lane)
         if key not in angles:
             angle_id = f"angle-{len(angles) + 1}"
@@ -30,6 +34,44 @@ def write_multicam(sequence: Sequence, output: Path, *, media_base: Path,
                                        angleID=angle_id)
         element.attrib.pop("lane", None)
         angles[key].append(element)
+    for camera in videos:
+        room = next((clip for clip in sequence.clips
+                     if clip.asset_id == f"ambience-{camera.asset_id}"
+                     and abs(clip.timeline_start_s - camera.timeline_start_s) < 1e-9
+                     and abs(clip.duration_s - camera.duration_s) < 1e-9), None)
+        if room is None:
+            continue
+        voice = next((clip for clip in sequence.clips
+                      if clip.asset_id == f"voice-{camera.asset_id}"
+                      and abs(clip.timeline_start_s - camera.timeline_start_s) < 1e-9
+                      and abs(clip.duration_s - camera.duration_s) < 1e-9), None)
+        key = (False, voice.lane if voice else room.lane)
+        if key not in angles:
+            angles[key] = ET.SubElement(multicam, "mc-angle", name=f"Audio {camera.path.stem}",
+                                       angleID=f"angle-{len(angles) + 1}")
+        angle = angles[key]
+        primary = elements[id(voice or camera)]
+        if voice:
+            angle.remove(primary)
+        else:
+            from copy import deepcopy
+
+            primary = deepcopy(primary)
+            primary.set("srcEnable", "audio")
+            for adjustment in primary.findall("adjust-volume"):
+                primary.remove(adjustment)
+        composite = ET.SubElement(angle, "clip", name=f"Voice and ambience {camera.path.stem}",
+                                  offset=_frame_time(camera.timeline_start_s, sequence.fps),
+                                  start="0s", duration=_frame_time(camera.duration_s, sequence.fps))
+        primary.set("offset", "0s")
+        composite.append(primary)
+        background = elements[id(room)]
+        background.set("offset", "0s")
+        background.set("lane", "-1")
+        composite.append(background)
+        elements[("audio", id(camera))] = angle
+    for angle in angles.values():
+        angle[:] = sorted(angle, key=lambda element: _parse_time(element.get("offset", "0s")))
     # Partition coverage so the project never selects an unavailable angle.
     boundaries = sorted({0.0} | {value for clip in sequence.clips
                                  for value in (clip.timeline_start_s,
@@ -60,15 +102,17 @@ def write_multicam(sequence: Sequence, output: Path, *, media_base: Path,
                   and clip.timeline_start_s <= start + 1e-9
                   and clip.timeline_start_s + clip.duration_s >= end - 1e-9]
         video_angle = angles[(True, selected.lane)].get("angleID")
+        audio_angle = elements.get(("audio", id(selected)))
         ET.SubElement(element, "mc-source", angleID=video_angle,
-                      srcEnable="video" if voices else "all")
-        if voices:
+                      srcEnable="video" if voices or audio_angle is not None else "all")
+        if audio_angle is not None:
+            ET.SubElement(element, "mc-source", angleID=audio_angle.get("angleID"),
+                          srcEnable="audio")
+        elif voices:
             ET.SubElement(element, "mc-source",
                           angleID=angles[(False, voices[0].lane)].get("angleID"), srcEnable="audio")
     # Markers use multicam source time within the corresponding project clip.
     for marker in sequence.markers:
-        from studio.stages.export import _parse_time
-
         for element in spine.findall("mc-clip"):
             start = _parse_time(element.get("start"))
             end = start + _parse_time(element.get("duration"))
