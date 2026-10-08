@@ -72,7 +72,7 @@ class ExportStage:
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
-            "export-v9", project.assets, project.placements, project.audio_warp_maps,
+            "export-v10", project.assets, project.placements, project.audio_warp_maps,
             inputs, settings.get("export", {}), settings.get("roughcut", {}),
             settings.get("program", {}),
         )
@@ -395,6 +395,8 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
     ET.SubElement(characteristics, "height").text = str(sequence.height)
     ET.SubElement(characteristics, "pixelaspectratio").text = "square"
     ET.SubElement(characteristics, "fielddominance").text = "none"
+    channel_tracks = {}
+    link_groups = []
     for lane in sorted({clip.lane for clip in sequence.clips}):
         lane_clips = [clip for clip in sequence.clips if clip.lane == lane]
         track = ET.SubElement(video if lane_clips[0].has_video else audio, "track")
@@ -450,8 +452,12 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
             elif clip.has_audio:
                 # Preserve camera sound as separate, linked channel clipitems;
                 # original channels remain available even when voice replaces them.
+                group = [item]
                 for channel in range(1, clip.audio_channels + 1):
-                    audio_track = ET.SubElement(audio, "track")
+                    key = (lane, channel)
+                    if key not in channel_tracks:
+                        channel_tracks[key] = ET.SubElement(audio, "track")
+                    audio_track = channel_tracks[key]
                     audio_item = ET.SubElement(
                         audio_track, "clipitem", id=f"a-{lane}-{index}-{channel}",
                     )
@@ -467,10 +473,25 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
                     source_track = ET.SubElement(audio_item, "sourcetrack")
                     ET.SubElement(source_track, "mediatype").text = "audio"
                     ET.SubElement(source_track, "trackindex").text = str(channel)
-                    for owner in (item, audio_item):
-                        for linked in (item, audio_item):
-                            link = ET.SubElement(owner, "link")
-                            ET.SubElement(link, "linkclipref").text = linked.get("id")
+                    group.append(audio_item)
+                link_groups.append(group)
+    # Resolve track indices after all external-audio and camera-channel tracks
+    # exist. Each member links to the full group, not just its video partner.
+    locations = {}
+    for media_type, container in (("video", video), ("audio", audio)):
+        for track_index, track in enumerate(container.findall("track"), 1):
+            for clip_index, item in enumerate(track.findall("clipitem"), 1):
+                locations[item.get("id")] = (media_type, track_index, clip_index)
+    for group_index, group in enumerate(link_groups, 1):
+        for owner in group:
+            for linked in group:
+                link = ET.SubElement(owner, "link")
+                ET.SubElement(link, "linkclipref").text = linked.get("id")
+                media_type, track_index, clip_index = locations[linked.get("id")]
+                ET.SubElement(link, "mediatype").text = media_type
+                ET.SubElement(link, "trackindex").text = str(track_index)
+                ET.SubElement(link, "clipindex").text = str(clip_index)
+                ET.SubElement(link, "groupindex").text = str(group_index)
     ET.indent(root)
     tree = ET.ElementTree(root)
     with output.open("wb") as handle:

@@ -371,3 +371,13 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   speed, source dimensions and audio channel indexing. Generated flat FCPXML
   passes 1.9 DTD validation. Full suite: 242 passed; changed-file Ruff passes.
 - Actual mixed-format NLE import/playback and speed interpretation remain open.
+
+### XMEML channel/link hardening
+
+- Original camera channels reuse stable lane/channel tracks across cuts; video
+  and all channel siblings link to the complete group with resolved media/track/
+  clip/group indices. Replaced original sound remains disabled and external voice
+  stays separate. Retiming filters are preserved on each channel.
+- Regression covers three cuts, three camera channels, replacement voice and
+  resolution of every link. Full suite: 243 passed; changed-file Ruff and diff
+  checks pass. Premiere link/import and playback acceptance remain open.

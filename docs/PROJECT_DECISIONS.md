@@ -290,3 +290,9 @@ entry points and recorded project paths in the same change.
   use the source clock; sequence start/end use the sequence clock. FCPXML video
   assets reference distinct source format resources, preserving rational rates
   and dimensions. Replacement WAVs use the sequence frame clock for XML indexing.
+
+- XMEML camera-channel tracks are reused per camera lane/channel across roughcut
+  pieces. Every video/channel member links to the complete sibling group, with
+  media type, track index, clip index and group index resolved after tracks exist.
+  This avoids per-cut audio-track proliferation and partial stereo/multichannel
+  links. External voice tracks remain separate from the original camera group.
