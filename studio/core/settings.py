@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import math
+import types
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Union, get_args, get_origin, get_type_hints
 
 import yaml
 
@@ -36,6 +37,10 @@ class TranscribeSettings:
     compute_type: str = "auto"
     mode: str = "fast"
     batch_size: int = 16
+    beam_size: int = 5
+    quality_beam_size: int = 10
+    initial_prompt: str = ""
+    use_cache: bool = True
     glossary: list[str] = field(default_factory=list)
     keep_fillers: bool = True
 
@@ -46,6 +51,12 @@ class RoughcutSettings:
     mode: str = "cut"
     pause_min_s: float = 1.0
     pause_keep_s: float = 0.4
+    silence_threshold_db: float = -40.0
+    head_tail_pad_s: float = 0.2
+    detect_retakes: bool = True
+    retake_min_words: int = 4
+    retake_max_gap_s: float = 6.0
+    phrase_gap_threshold: float = 0.6
 
 
 @dataclass(slots=True)
@@ -66,6 +77,15 @@ class ComputeSettings:
 
 
 @dataclass(slots=True)
+class SpeakerSettings:
+    method: str = "auto"
+    margin_db: float = 6.0
+    silence_floor_db: float = -60.0
+    step_s: float = 0.05
+    tracks: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class Settings:
     scan: ScanSettings = field(default_factory=ScanSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
@@ -74,6 +94,7 @@ class Settings:
     export: ExportSettings = field(default_factory=ExportSettings)
     program: ProgramSettings = field(default_factory=ProgramSettings)
     compute: ComputeSettings = field(default_factory=ComputeSettings)
+    speakers: SpeakerSettings = field(default_factory=SpeakerSettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,6 +120,11 @@ def load_settings(paths: list[Path], overrides: list[str] | None = None) -> Sett
 
 
 def validate_settings(settings: Settings) -> None:
+    for section_name in Settings.__dataclass_fields__:
+        section = getattr(settings, section_name)
+        for name, expected in get_type_hints(type(section)).items():
+            if not _matches_type(getattr(section, name), expected):
+                raise SettingsError(f"{section_name}.{name} has an invalid value type")
     _one_of("scan.grouping", settings.scan.grouping, {"auto", "folders", "names"})
     _positive("scan.probe_timeout_s", settings.scan.probe_timeout_s)
     _one_of("sync.mode", settings.sync.mode, {"auto", "camera", "simple", "complex"})
@@ -109,9 +135,36 @@ def validate_settings(settings: Settings) -> None:
     _one_of("transcribe.mode", settings.transcribe.mode, {"fast", "quality"})
     if settings.transcribe.batch_size < 1:
         raise SettingsError("transcribe.batch_size must be at least 1")
+    for name in ("batch_size", "beam_size", "quality_beam_size"):
+        value = getattr(settings.transcribe, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise SettingsError(f"transcribe.{name} must be a positive integer")
+    if not isinstance(settings.transcribe.glossary, list) or not all(
+        isinstance(item, str) for item in settings.transcribe.glossary
+    ):
+        raise SettingsError("transcribe.glossary must be a list of strings")
     _one_of("roughcut.mode", settings.roughcut.mode, {"cut", "markers"})
+    _one_of("speakers.method", settings.speakers.method, {"auto", "mics", "off"})
+    _non_negative("speakers.margin_db", settings.speakers.margin_db)
+    _positive("speakers.step_s", settings.speakers.step_s)
+    if settings.speakers.step_s > 1:
+        raise SettingsError("speakers.step_s must not exceed 1 second")
+    if not math.isfinite(settings.speakers.silence_floor_db) or not (
+        -100 <= settings.speakers.silence_floor_db <= 0
+    ):
+        raise SettingsError("speakers.silence_floor_db must be between -100 and 0")
+    _one_of("program.encoder", settings.program.encoder, {"auto", "nvenc", "libx264"})
     _positive("roughcut.pause_min_s", settings.roughcut.pause_min_s)
     _non_negative("roughcut.pause_keep_s", settings.roughcut.pause_keep_s)
+    _non_negative("roughcut.head_tail_pad_s", settings.roughcut.head_tail_pad_s)
+    _non_negative("roughcut.retake_max_gap_s", settings.roughcut.retake_max_gap_s)
+    _positive("roughcut.phrase_gap_threshold", settings.roughcut.phrase_gap_threshold)
+    if settings.roughcut.retake_min_words < 1:
+        raise SettingsError("roughcut.retake_min_words must be a positive integer")
+    threshold = settings.roughcut.silence_threshold_db
+    if (not isinstance(threshold, (float, int)) or isinstance(threshold, bool)
+            or not math.isfinite(threshold) or not -100 <= threshold <= 0):
+        raise SettingsError("roughcut.silence_threshold_db must be between -100 and 0")
     if settings.roughcut.pause_keep_s >= settings.roughcut.pause_min_s:
         raise SettingsError("roughcut.pause_keep_s must be less than pause_min_s")
     unknown = set(settings.export.targets) - {"fcpxml", "xmeml"}
@@ -133,9 +186,31 @@ def _construct(data: dict[str, Any]) -> Settings:
             export=ExportSettings(**_section(data, "export")),
             program=ProgramSettings(**_section(data, "program")),
             compute=ComputeSettings(**_section(data, "compute")),
+            speakers=SpeakerSettings(**_section(data, "speakers")),
         )
     except TypeError as exc:
         raise SettingsError(str(exc)) from exc
+
+
+def _matches_type(value: Any, expected: Any) -> bool:
+    origin = get_origin(expected)
+    if origin in (Union, types.UnionType):
+        return any(_matches_type(value, item) for item in get_args(expected))
+    if origin is list:
+        return isinstance(value, list) and all(
+            _matches_type(item, get_args(expected)[0]) for item in value
+        )
+    if origin is dict:
+        key_type, value_type = get_args(expected)
+        return isinstance(value, dict) and all(
+            _matches_type(key, key_type) and _matches_type(item, value_type)
+            for key, item in value.items()
+        )
+    if expected is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, expected)
 
 
 def _section(data: dict[str, Any], name: str) -> dict[str, Any]:

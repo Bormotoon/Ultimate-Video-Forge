@@ -7,8 +7,9 @@ import gc
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -95,6 +96,22 @@ class FasterWhisperBackend:
         return self._model
 
     def transcribe(self, audio: Path, settings: TranscribeSettings) -> Transcript:
+        current = settings
+        while True:
+            try:
+                return self._transcribe_once(audio, current)
+            except RuntimeError as exc:
+                if "out of memory" not in str(exc).lower():
+                    raise
+                if current.mode == "fast" and current.batch_size > 1:
+                    current = replace(current, batch_size=max(1, current.batch_size // 2))
+                elif current.mode == "fast":
+                    current = replace(current, mode="quality", quality_beam_size=1)
+                else:
+                    raise
+                self.unload()
+
+    def _transcribe_once(self, audio: Path, settings: TranscribeSettings) -> Transcript:
         model = self._ensure_model()
         kwargs: dict[str, Any] = {
             "language": settings.language,
@@ -173,8 +190,23 @@ class WhisperEngine:
         if self.settings.use_cache:
             cached = self._load(cache_path)
             if cached is not None:
+                cached.source_audio = path
                 return cached
-        transcript = self.backend.transcribe(path, self.settings)
+        if stream_index is None:
+            transcript = self.backend.transcribe(path, self.settings)
+        else:
+            if (not isinstance(stream_index, int)
+                    or isinstance(stream_index, bool) or stream_index < 0):
+                raise ValueError("audio stream index must be a non-negative integer")
+            with tempfile.TemporaryDirectory(prefix="uvf-transcribe-") as temporary:
+                decoded = Path(temporary) / "selected.wav"
+                subprocess.run(
+                    ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path),
+                     "-map", f"0:{stream_index}", "-vn", "-ac", "1", "-ar", "16000",
+                     "-c:a", "pcm_s16le", str(decoded)],
+                    check=True, capture_output=True,
+                )
+                transcript = self.backend.transcribe(decoded, self.settings)
         transcript.source_audio = path
         if self.settings.use_cache:
             self._save(cache_path, transcript)

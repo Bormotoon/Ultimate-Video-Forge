@@ -56,6 +56,7 @@ def build_plan(
                 (
                     dependency
                     for dependency in stage.after
+                    if dependency not in getattr(stage, "optional_after", ())
                     if decisions[dependency].kind is not DecisionKind.RUN
                 ),
                 None,

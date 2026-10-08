@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import math
+import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
 
-from studio.core.project import Project, stable_fingerprint
-from studio.core.transcript import Word
+from studio.core.project import AssetRole, Project, describe_artifact, stable_fingerprint
+from studio.core.timeline import SourcePlacement
+from studio.core.transcript import Transcript, Word
 from studio.stages.base import Decision, GpuUse, Requirement, StageContext, StageOutput
 
 
@@ -29,14 +31,28 @@ class SpeakersStage:
     gpu = GpuUse.NONE
 
     def requirements(self, settings: dict[str, object]) -> list[Requirement]:
-        return []
+        return [Requirement("binary", "ffmpeg", "decode microphone channels")]
 
     def decide(self, project: Project, settings: dict[str, object]) -> Decision:
         speakers = settings.get("speakers", {})
-        method = str(speakers.get("method", "off")) if isinstance(speakers, dict) else "off"
-        return Decision.skip("speaker detection is off") if method == "off" else Decision.run(
-            {"method": method}
-        )
+        conf = speakers if isinstance(speakers, dict) else {}
+        method = str(conf.get("method", "auto"))
+        if method == "off":
+            return Decision.skip("speaker detection is off")
+        tracks = microphone_tracks(project, conf)
+        if len(set(tracks.values())) < 2:
+            return (Decision.skip("fewer than two microphone speakers") if method == "auto"
+                    else Decision.blocked("two microphone speakers are required",
+                                          "configure speakers.tracks"))
+        if "timeline" not in project.transcripts:
+            return Decision.blocked("timeline transcript is missing", "run timeline")
+        missing = {key.split(":", 1)[0] for key in tracks} - {
+            placement.asset_id for placement in project.placements
+        }
+        if missing:
+            return Decision.blocked(f"microphone placements are missing: {sorted(missing)}",
+                                    "align recorder tracks before speaker attribution")
+        return Decision.run({"method": "mics", "tracks": tracks})
 
     def fingerprint(self, project: Project, settings: dict[str, object]) -> str:
         transcript = project.transcripts.get("timeline")
@@ -45,10 +61,114 @@ class SpeakersStage:
             if transcript and transcript.is_file()
             else ""
         )
-        return stable_fingerprint("speakers-v1", content, settings.get("speakers", {}))
+        conf = settings.get("speakers", {})
+        conf = conf if isinstance(conf, dict) else {}
+        tracks = microphone_tracks(project, conf)
+        selected = {key.split(":", 1)[0] for key in tracks}
+        identities = [describe_artifact(project.source_dir, project.source_dir / asset.path)
+                      for asset in project.assets if asset.id in selected]
+        return stable_fingerprint(
+            "speakers-v2", content, tracks, identities, project.placements, conf,
+        )
 
     def run(self, context: StageContext) -> StageOutput:
-        raise RuntimeError("speaker stage requires decoded microphone envelopes")
+        conf = context.settings.get("speakers", {})
+        conf = conf if isinstance(conf, dict) else {}
+        transcript = Transcript.load(context.project.transcripts["timeline"])
+        step = float(conf.get("step_s", 0.05))
+        tracks = microphone_tracks(context.project, conf)
+        placements = {item.asset_id: item for item in context.project.placements}
+        assets = {asset.id: asset for asset in context.project.assets}
+        decoded: dict[str, np.ndarray] = {}
+        envelopes: dict[str, np.ndarray] = {}
+        for track, speaker in tracks.items():
+            asset_id, channel_text = track.rsplit(":", 1)
+            asset = assets[asset_id]
+            if asset_id not in decoded:
+                decoded[asset_id] = decode_channels(
+                    context.project.source_dir / asset.path,
+                    int(asset.manual.get("media_info", {}).get("audio_channels") or 1),
+                )
+            channel = int(channel_text)
+            samples = decoded[asset_id][:, channel]
+            envelope = timeline_envelope(samples, placements[asset_id], transcript.duration,
+                                         step_s=step)
+            # Several files/channels assigned to one speaker share one lane.
+            envelopes[speaker] = np.maximum(envelopes.get(speaker, np.zeros_like(envelope)),
+                                            envelope)
+        turns = assign_words_to_mics(
+            transcript.words, envelopes, step_s=step,
+            margin_db=float(conf.get("margin_db", 6.0)),
+            silence_floor_db=float(conf.get("silence_floor_db", -60.0)),
+        )
+        output = context.work_dir / "stages" / "speakers" / "diarization.json"
+        save_turns(output, turns)
+        report = output.with_name("report.json")
+        report.write_text(json.dumps({
+            "schema_version": 1, "time_domain": "timeline", "method": "mics",
+            "tracks": tracks, "step_s": step, "map": "SourcePlacement",
+        }, indent=2) + "\n", encoding="utf-8")
+        return StageOutput((output, report), {
+            "outputs": {**context.project.outputs, "speakers": [output, report]},
+        })
+
+
+def microphone_tracks(project: Project, conf: dict[str, object]) -> dict[str, str]:
+    configured = conf.get("tracks", {})
+    if not isinstance(configured, dict):
+        raise ValueError("speakers.tracks must map asset:channel to speaker")
+    tracks = dict(configured)
+    assets = {asset.id: asset for asset in project.assets if asset.role is AssetRole.RECORDER}
+    if not tracks:
+        for asset in assets.values():
+            channels = int(asset.manual.get("media_info", {}).get("audio_channels") or 1)
+            if channels > 1 and conf.get("method", "auto") == "auto":
+                continue
+            for channel in range(channels):
+                tracks[f"{asset.id}:{channel}"] = f"{asset.id}-ch{channel + 1}"
+    for key, speaker in tracks.items():
+        if not isinstance(key, str) or not isinstance(speaker, str) or not speaker.strip():
+            raise ValueError("speaker tracks require nonempty string names")
+        try:
+            asset_id, channel = key.rsplit(":", 1)
+            number = int(channel)
+        except ValueError as exc:
+            raise ValueError(f"invalid microphone track: {key}; use asset_id:channel") from exc
+        if asset_id not in assets:
+            raise ValueError(f"unknown recorder asset: {asset_id}")
+        count = int(assets[asset_id].manual.get("media_info", {}).get("audio_channels") or 1)
+        if not 0 <= number < count:
+            raise ValueError(f"microphone channel out of range: {key}")
+    return tracks
+
+
+def decode_channels(path: Path, channels: int, sample_rate: int = 16000) -> np.ndarray:
+    result = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-map", "0:a:0",
+         "-vn", "-ar", str(sample_rate), "-ac", str(channels), "-f", "f32le", "-"],
+        capture_output=True,
+    )
+    if result.returncode:
+        raise RuntimeError(f"microphone decode failed: {result.stderr.decode(errors='replace')}")
+    return np.frombuffer(result.stdout, dtype="<f4").reshape(-1, channels)
+
+
+def timeline_envelope(
+    samples: np.ndarray, placement: SourcePlacement, duration_s: float,
+    *, step_s: float = 0.05, sample_rate: int = 16000,
+) -> np.ndarray:
+    # Integrate sample energy over each mapped bin rather than interpolating a
+    # single sample; affine drift and negative offsets preserve RMS evidence.
+    count = math.ceil(duration_s / step_s)
+    cumulative = np.concatenate(([0.0], np.cumsum(np.square(samples), dtype=np.float64)))
+    boundaries = np.arange(count + 1) * step_s
+    source_times = placement.in_s + (boundaries - placement.offset_s) / placement.k
+    source_times = np.clip(source_times, placement.in_s,
+                           placement.in_s + placement.duration_s)
+    positions = np.clip(np.round(source_times * sample_rate).astype(np.int64), 0, len(samples))
+    lengths = np.diff(positions)
+    energies = np.diff(cumulative[positions]) / np.maximum(lengths, 1)
+    return np.sqrt(np.maximum(energies, 0))
 
 
 def assign_words_to_mics(
@@ -57,6 +177,7 @@ def assign_words_to_mics(
     *,
     step_s: float = 0.05,
     margin_db: float = 6.0,
+    silence_floor_db: float = -60.0,
 ) -> list[SpeakerTurn]:
     assignments: list[SpeakerTurn] = []
     for word in words:
@@ -71,7 +192,7 @@ def assign_words_to_mics(
             key=lambda item: item[1],
             reverse=True,
         )
-        if not energies:
+        if not energies or 10 * math.log10(max(energies[0][1], 1e-12)) < silence_floor_db:
             speaker = "unknown"
         elif len(energies) == 1:
             speaker = energies[0][0]

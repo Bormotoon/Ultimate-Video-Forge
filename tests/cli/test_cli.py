@@ -23,6 +23,7 @@ def test_scan_and_plan_fixture_through_workers(tmp_path: Path, capsys) -> None: 
         "transcribe",
         "sync",
         "timeline",
+        "speakers",
         "roughcut",
         "export",
         "program",

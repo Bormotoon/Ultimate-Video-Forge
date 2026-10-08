@@ -51,13 +51,22 @@ class SyncStage:
         transcripts = {
             asset_id: path.read_text(encoding="utf-8")
             for asset_id, path in project.transcripts.items()
-            if path.is_file()
+            if asset_id in {asset.id for asset in project.assets} and path.is_file()
         }
-        return stable_fingerprint("sync-v1", transcripts, settings.get("sync", {}))
+        from studio.stages.transcribe import _sha256
+
+        return stable_fingerprint(
+            "sync-v2", transcripts, project.assets,
+            {asset.id: _sha256(project.source_dir / asset.path)
+             for asset in project.assets if asset.role is AssetRole.RECORDER},
+            settings.get("sync", {}),
+        )
 
     def run(self, context: StageContext) -> StageOutput:
         mode = _sync_mode(context.settings)
-        if mode == "complex":
+        if mode == "complex" or (mode in {"auto", "simple"} and any(
+            asset.role is AssetRole.RECORDER for asset in context.project.assets
+        )):
             return _run_complex(context)
         cameras = [asset for asset in context.project.assets if asset.role is AssetRole.CAMERA]
         recorders = [asset for asset in context.project.assets if asset.role is AssetRole.RECORDER]
@@ -185,6 +194,9 @@ def _run_complex(context: StageContext) -> StageOutput:
     warps = []
     outputs = dict(project.outputs)
     source = project.source_dir / recorder.path
+    sync = context.settings.get("sync", {})
+    sync = sync if isinstance(sync, dict) else {}
+    mode = _sync_mode(context.settings)
     for camera, candidate, alignment, offset in zip(
         cameras, camera_transcripts, alignments, offsets, strict=True,
     ):
@@ -194,10 +206,16 @@ def _run_complex(context: StageContext) -> StageOutput:
             {"inliers": float(alignment.inliers), "residual_ms": alignment.residual_ms},
         ))
         voice = context.work_dir / "stages" / "sync" / "voice" / f"{camera.id}.wav"
+        selected = choose_sync_mode(
+            mode, candidate.duration, alignment.k, alignment.residual_ms / 1000,
+            max_drift_ms=float(sync.get("max_drift_ms", 20.0)),
+        )
+        strategy = int(sync.get("strategy", 3)) if selected == "complex" else 1
         plan = render_aligned_clip(
             alignment, PieceConfig(), source, voice,
             clip_duration_s=candidate.duration, recorder_duration_s=transcript.duration,
-            recorder_words=[(word.start, word.end) for word in transcript.words], strategy=3,
+            recorder_words=[(word.start, word.end) for word in transcript.words],
+            strategy=strategy,
             source_asset_id=recorder.id, target_asset_id=camera.id,
             channels=int(recorder.manual.get("media_info", {}).get("audio_channels") or 1),
         )
@@ -207,7 +225,8 @@ def _run_complex(context: StageContext) -> StageOutput:
     report = context.work_dir / "stages" / "sync" / "output.json"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(json.dumps({
-        "schema_version": 1, "mode": "complex", "strategy": 3,
+        "schema_version": 1, "mode": mode,
+        "strategies": {warp.target_asset_id: warp.strategy for warp in warps},
         "voices": {camera.id: f"voice/{camera.id}.wav" for camera in cameras},
         "padding": "silence is outside invertible source maps",
     }, indent=2) + "\n", encoding="utf-8")

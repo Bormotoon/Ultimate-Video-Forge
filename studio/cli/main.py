@@ -16,8 +16,9 @@ from studio.core.project import Project
 from studio.core.publication import recover_publications
 from studio.core.settings import SettingsError, load_settings
 from studio.core.workspace import project_lock
+from studio.stages.events import StageEvent
 from studio.stages.planner import build_plan
-from studio.stages.runner import run_stage_process
+from studio.stages.runner import StageProcessError, run_stage_process
 from studio.stages.worker import stage_registry
 
 
@@ -62,15 +63,30 @@ def _run_discovery(
     return Project.load(project_path)
 
 
-def _run_pipeline(source: Path, overrides: list[str] | None = None) -> Project:
+def _run_pipeline(
+    source: Path, overrides: list[str] | None = None, *,
+    only: set[str] | None = None, skip: set[str] | None = None,
+    stream: bool = False,
+) -> Project:
     project, project_path, settings_path = _project(source)
     settings = _settings(settings_path, overrides)
     registry = stage_registry()
+    unknown = ((only or set()) | (skip or set())) - registry.keys()
+    if unknown:
+        raise SettingsError(f"unknown stages: {sorted(unknown)}")
+
+    def forward(event: StageEvent) -> None:
+        print(event.to_json(), flush=True)
+
     with project_lock(project.work_dir):
         recover_publications(project.work_dir)
+        failures: dict[str, str] = {}
         while True:
             project = Project.load(project_path)
-            plan = build_plan(registry.values(), project, settings)
+            plan = build_plan(
+                registry.values(), project, settings, only=only,
+                skip=(skip or set()) | failures.keys(),
+            )
             candidate = next(
                 (
                     item
@@ -81,13 +97,31 @@ def _run_pipeline(source: Path, overrides: list[str] | None = None) -> Project:
             )
             if candidate is None:
                 break
-            run_stage_process(
-                candidate.stage_id,
-                project_path,
-                settings_path,
-                candidate.fingerprint,
-                effective_settings=settings,
-            )
+            try:
+                run_stage_process(
+                    candidate.stage_id,
+                    project_path,
+                    settings_path,
+                    candidate.fingerprint,
+                    effective_settings=settings,
+                    on_event=forward if stream else None,
+                )
+            except StageProcessError as exc:
+                failures[candidate.stage_id] = str(exc)
+                print(str(exc), file=sys.stderr)
+        report = {
+            "schema_version": 1,
+            "status": "failed" if failures else "ok",
+            "failures": failures,
+            "stages": [{"id": item.stage_id, "decision": item.decision.kind.value,
+                        "reason": item.decision.reason, "reuse": item.will_reuse}
+                       for item in plan.stages],
+        }
+        (project.work_dir / "report.json").write_text(
+            json.dumps(report, indent=2) + "\n", encoding="utf-8",
+        )
+        if failures:
+            raise StageProcessError(f"pipeline failed: {', '.join(failures)}; see report.json")
     return Project.load(project_path)
 
 
@@ -118,7 +152,17 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("source", type=Path)
         command.add_argument("--json", action="store_true")
         command.add_argument("--set", action="append", default=[])
+        if name == "run":
+            command.add_argument("--only", nargs="+", metavar="STAGE")
+            command.add_argument("--skip", nargs="+", metavar="STAGE")
+            command.add_argument("--events", action="store_true")
     commands.add_parser("doctor")
+    review = commands.add_parser("review")
+    review.add_argument("source", type=Path)
+    review.add_argument("--cut")
+    action = review.add_mutually_exclusive_group()
+    action.add_argument("--accept", action="store_true")
+    action.add_argument("--reject", action="store_true")
     return parser
 
 
@@ -128,14 +172,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SettingsError as exc:
         print(f"settings error: {exc}", file=sys.stderr)
         return 2
+    except ValueError as exc:
+        print(f"input error: {exc}", file=sys.stderr)
+        return 2
+    except (StageProcessError, OSError, RuntimeError) as exc:
+        print(f"run error: {exc}", file=sys.stderr)
+        return 1
 
 
 def _main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "doctor":
         return _doctor()
+    if args.command == "review":
+        from studio.stages.roughcut import review_cut
+
+        project, _, _ = _project(args.source)
+        with project_lock(project.work_dir):
+            recover_publications(project.work_dir)
+            if args.cut:
+                if not (args.accept or args.reject):
+                    raise ValueError("review --cut requires --accept or --reject")
+                review_cut(project, args.cut, accepted=args.accept)
+            elif args.accept or args.reject:
+                raise ValueError("review --accept/--reject requires --cut")
+            paths = project.outputs.get("roughcut", [])
+            if not paths:
+                raise ValueError("no roughcut decisions to review")
+            print(paths[0].read_text(encoding="utf-8"), end="")
+        return 0
     project = (
-        _run_pipeline(args.source, args.set)
+        _run_pipeline(
+            args.source, args.set, only=set(args.only or []), skip=set(args.skip or []),
+            stream=args.events,
+        )
         if args.command == "run"
         else _run_discovery(
             args.source, include_prepare=args.command == "plan", overrides=args.set

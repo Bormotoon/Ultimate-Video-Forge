@@ -11,7 +11,8 @@ from studio.stages.base import Decision, GpuUse, Requirement, StageContext, Stag
 class TimelineStage:
     id = "timeline"
     title = "Timeline transcript"
-    after: tuple[str, ...] = ("transcribe",)
+    after: tuple[str, ...] = ("transcribe", "sync")
+    optional_after = ("sync",)
     gpu = GpuUse.NONE
 
     def requirements(self, settings: dict[str, object]) -> list[Requirement]:

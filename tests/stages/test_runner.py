@@ -80,6 +80,25 @@ def test_large_stderr_does_not_deadlock_worker(
     assert children[0].returncode == 0
 
 
+def test_events_are_forwarded_before_worker_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, settings = _project(tmp_path)
+    children = _worker_script(
+        monkeypatch,
+        "import time; print('{\"t\":\"start\",\"stage\":\"scan\"}', flush=True); "
+        "time.sleep(0.3); print('{\"t\":\"done\",\"stage\":\"scan\",\"status\":\"ok\"}')",
+    )
+    observed = []
+
+    def receive(event):
+        observed.append((event.type.value, children[0].poll()))
+
+    run_stage_process("scan", project, settings, "fp", on_event=receive)
+    assert observed[0] == ("start", None)
+    assert [event for event, _ in observed] == ["start", "done"]
+
+
 def test_buffered_events_are_validated_after_worker_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

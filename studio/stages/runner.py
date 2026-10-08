@@ -7,9 +7,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any
 
 import yaml
@@ -39,6 +41,7 @@ def run_stage_process(
     effective_settings: dict[str, Any] | None = None,
     cancelled: Callable[[], bool] = lambda: False,
     terminate_after_s: float = 5.0,
+    on_event: Callable[[StageEvent], None] | None = None,
 ) -> RunResult:
     settings = (
         effective_settings
@@ -55,7 +58,7 @@ def run_stage_process(
         snapshot.write_text(yaml.safe_dump(settings), encoding="utf-8")
         return _run_stage_process(
             stage_id, project_path, snapshot, settings_path, fingerprint,
-            settings, cancelled, terminate_after_s,
+            settings, cancelled, terminate_after_s, on_event,
         )
 
 
@@ -68,6 +71,7 @@ def _run_stage_process(
     settings: dict[str, Any],
     cancelled: Callable[[], bool],
     terminate_after_s: float,
+    on_event: Callable[[StageEvent], None] | None,
 ) -> RunResult:
     project = Project.load(project_path)
     initial_project = project_path.read_bytes()
@@ -90,28 +94,66 @@ def _run_stage_process(
         errors="replace",
         start_new_session=os.name != "nt",
     )
+    messages: Queue[str | None] = Queue()
+    diagnostics: list[str] = []
+
+    def read_stdout() -> None:
+        assert process.stdout is not None
+        try:
+            for line in process.stdout:
+                messages.put(line)
+        finally:
+            messages.put(None)
+
+    def read_stderr() -> None:
+        assert process.stderr is not None
+        for chunk in iter(lambda: process.stderr.read(8192), ""):
+            diagnostics.append(chunk)
+            # Keep a bounded diagnostic tail even for noisy native libraries.
+            if len(diagnostics) > 32:
+                del diagnostics[0]
+
+    readers = [threading.Thread(target=read_stdout), threading.Thread(target=read_stderr)]
+    for reader in readers:
+        reader.start()
+    events: list[StageEvent] = []
     try:
         while True:
             if cancelled():
                 raise StageProcessError(f"stage {stage_id} was cancelled")
             try:
-                # communicate drains BOTH pipes while the deadline keeps
-                # cancellation responsive even when stdout stays silent.
-                stdout, stderr = process.communicate(timeout=0.1)
+                line = messages.get(timeout=0.1)
+            except Empty:
+                continue
+            if line is None:
                 break
+            if not line.strip():
+                continue
+            event = _parse_event(line, stage_id, events)
+            events.append(event)
+            if on_event is not None:
+                on_event(event)
+        while process.poll() is None:
+            if cancelled():
+                raise StageProcessError(f"stage {stage_id} was cancelled")
+            try:
+                process.wait(timeout=0.1)
             except subprocess.TimeoutExpired:
                 continue
+        readers[1].join()
         if process.returncode != 0:
             raise StageProcessError(
-                f"stage {stage_id} exited {process.returncode}: {stderr.strip()}"
+                f"stage {stage_id} exited {process.returncode}: {''.join(diagnostics).strip()}"
             )
-        events = _parse_events(stdout, stage_id)
+        _parse_events("\n".join(event.to_json() for event in events), stage_id)
     except BaseException:
         _stop_process_tree(process, terminate_after_s)
         raise
     finally:
         if process.poll() is None:
             _stop_process_tree(process, terminate_after_s)
+        for reader in readers:
+            reader.join()
         if process.stdout is not None:
             process.stdout.close()
         if process.stderr is not None:
@@ -184,20 +226,25 @@ def _parse_events(stdout: str, stage_id: str) -> list[StageEvent]:
     for line in stdout.splitlines():
         if not line.strip():
             continue
-        try:
-            event = StageEvent.from_json(line)
-        except (ValueError, TypeError) as exc:
-            raise StageProcessError(f"stage {stage_id}: {exc}") from exc
-        if event.stage != stage_id:
-            raise StageProcessError(f"worker emitted event for unexpected stage {event.stage}")
-        if events and events[-1].type is EventType.DONE:
-            raise StageProcessError(f"stage {stage_id} emitted an event after done")
+        event = _parse_event(line, stage_id, events)
         events.append(event)
     if not events or events[0].type is not EventType.START:
         raise StageProcessError(f"stage {stage_id} exited without a start event")
     if events[-1].type is not EventType.DONE or events[-1].payload.get("status") != "ok":
         raise StageProcessError(f"stage {stage_id} exited without a successful done event")
     return events
+
+
+def _parse_event(line: str, stage_id: str, events: list[StageEvent]) -> StageEvent:
+    try:
+        event = StageEvent.from_json(line)
+    except (ValueError, TypeError) as exc:
+        raise StageProcessError(f"stage {stage_id}: {exc}") from exc
+    if event.stage != stage_id:
+        raise StageProcessError(f"worker emitted event for unexpected stage {event.stage}")
+    if events and events[-1].type is EventType.DONE:
+        raise StageProcessError(f"stage {stage_id} emitted an event after done")
+    return event
 
 
 def _stop_process_tree(process: subprocess.Popen[str], grace_s: float) -> None:

@@ -1,8 +1,13 @@
+import json
+import subprocess
 from pathlib import Path
 
-from studio.core.timeline import EditMap, KeepRange, TimeDomain
+import pytest
+
+from studio.core.project import Asset, AssetRole, Project
+from studio.core.timeline import EditMap, KeepRange, SourcePlacement, TimeDomain
 from studio.core.transcript import Segment, Transcript, Word
-from studio.stages.program import map_transcript_to_edited
+from studio.stages.program import map_transcript_to_edited, render_project_program
 
 
 def test_program_transcript_uses_edited_time_and_drops_cut_words() -> None:
@@ -31,3 +36,33 @@ def test_program_transcript_uses_edited_time_and_drops_cut_words() -> None:
         ("again", 4, 5),
     ]
     assert result.duration == 7
+
+
+def test_render_uses_placement_and_synced_audio_on_real_media(tmp_path: Path) -> None:
+    camera = tmp_path / "camera.mp4"
+    voice = tmp_path / "voice.wav"
+    subprocess.run([
+        "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+        "color=c=red:s=160x120:r=25:d=3", "-c:v", "libx264", str(camera),
+    ], check=True)
+    subprocess.run([
+        "ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i",
+        "sine=frequency=440:duration=3", str(voice),
+    ], check=True)
+    project = Project(tmp_path, tmp_path / "_studio")
+    project.assets = [Asset("cam", Path("camera.mp4"), "video", AssetRole.CAMERA)]
+    project.assets[0].manual["media_info"] = {"width":160, "height":120, "fps":25}
+    project.placements = [SourcePlacement("cam", 10, 0, 3)]
+    project.outputs["sync:cam"] = [voice]
+    edit = EditMap("cut", (KeepRange(10.4, 11.2), KeepRange(12, 12.6)))
+    output = tmp_path / "program.mp4"
+    render_project_program(project, edit, output)
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(output)
+    ], check=True, capture_output=True, text=True)
+    data = json.loads(probe.stdout)
+    assert {stream["codec_type"] for stream in data["streams"]} == {"audio", "video"}
+    assert float(data["format"]["duration"]) == pytest.approx(1.4, abs=0.08)
+    assert next(stream for stream in data["streams"] if stream["codec_type"] == "video")[
+        "width"
+    ] == 160

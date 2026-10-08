@@ -66,6 +66,17 @@ def test_cycles_are_rejected(tmp_path: Path) -> None:
         build_plan([_Stage("a", ("b",)), _Stage("b", ("a",))], _project(tmp_path), {})
 
 
+def test_optional_dependency_preserves_order_without_blocking(tmp_path: Path) -> None:
+    export = _Stage("export", ("sync", "roughcut"))
+    export.optional_after = ("roughcut",)
+    plan = build_plan(
+        [export, _Stage("roughcut", ("sync",)), _Stage("sync")],
+        _project(tmp_path), {}, skip={"roughcut"},
+    )
+    assert [item.stage_id for item in plan.stages] == ["sync", "roughcut", "export"]
+    assert plan.stages[-1].decision.kind.value == "run"
+
+
 @pytest.mark.parametrize("damage", ["malformed", "stale", "wrong_stage", "failed", "artifact"])
 def test_invalid_discovery_blocks_main_plan(tmp_path: Path, damage: str) -> None:
     project = _project(tmp_path)
