@@ -290,3 +290,14 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   holds, coverage fallback/manual precedence, removed ranges and invalid mappings.
 - Full suite: 230 passed; changed-file Ruff and diff checks pass. Pyannote,
   NLE multicam export and real-world speaker/camera acceptance remain open.
+
+### Isolated pyannote integration
+
+- Explicit pyannote method uses the managed diarization environment; missing
+  environments block planning. Configure speakers.model/device; model credentials
+  use HF_TOKEN in the environment. Primary-source turns map to timeline with
+  clipping, explicit overlap resolution and retained raw turns/logs.
+- Controlled stage mapping/overlap and missing-module preflight regressions pass.
+  Full suite: 232 passed. Real gated model download, inference, GPU usage and
+  speaker accuracy have not been exercised. Auto remains microphone-based;
+  cross-file speaker identity matching and true NLE multicam export remain open.

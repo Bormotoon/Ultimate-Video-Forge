@@ -101,6 +101,8 @@ class SpeakerSettings:
     min_turn_s: float = 0.3
     max_gap_s: float = 0.3
     tracks: dict[str, str] = field(default_factory=dict)
+    model: str = "pyannote/speaker-diarization-3.1"
+    device: str = "cpu"
 
 
 @dataclass(slots=True)
@@ -172,7 +174,8 @@ def validate_settings(settings: Settings) -> None:
     ):
         raise SettingsError("transcribe.glossary must be a list of strings")
     _one_of("roughcut.mode", settings.roughcut.mode, {"cut", "markers"})
-    _one_of("speakers.method", settings.speakers.method, {"auto", "mics", "off"})
+    _one_of("speakers.method", settings.speakers.method, {"auto", "mics", "pyannote", "off"})
+    _one_of("speakers.device", settings.speakers.device, {"cpu", "cuda"})
     _non_negative("speakers.margin_db", settings.speakers.margin_db)
     _positive("speakers.step_s", settings.speakers.step_s)
     _non_negative("speakers.min_turn_s", settings.speakers.min_turn_s)

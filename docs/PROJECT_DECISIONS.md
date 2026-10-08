@@ -237,3 +237,11 @@ entry points and recorded project paths in the same change.
   Camera decisions are recorded in render.json; they do not modify roughcut input
   or NLE exports. Adjacent camera cuts are merged for transcript retention so
   words crossing a camera switch are not removed.
+
+- Explicit `speakers.method=pyannote` runs the existing isolated diarization
+  module on one primary source, decoding mono 16 kHz audio. HF_TOKEN is read only
+  from the environment. Default model is pyannote/speaker-diarization-3.1; device
+  is explicitly cpu or cuda. Source turns map through SourcePlacement and are
+  clipped to timeline coverage. Intersecting speaker labels become overlap;
+  raw turns and bounded subprocess logs are preserved. Labels are anonymous and
+  local to this source, not matched to microphone names. Auto remains mics-only.

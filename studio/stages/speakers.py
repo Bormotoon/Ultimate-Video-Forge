@@ -39,6 +39,15 @@ class SpeakersStage:
         method = str(conf.get("method", "auto"))
         if method == "off":
             return Decision.skip("speaker detection is off")
+        if method == "pyannote":
+            from studio.modules.manager import ModuleManager
+
+            if "timeline" not in project.transcripts:
+                return Decision.blocked("timeline transcript is missing", "run timeline")
+            if not ModuleManager().installed("diarization"):
+                return Decision.blocked("diarization module is missing",
+                                        "install diarization module")
+            return Decision.run({"method": "pyannote"})
         tracks = microphone_tracks(project, conf)
         if len(set(tracks.values())) < 2:
             return (Decision.skip("fewer than two microphone speakers") if method == "auto"
@@ -63,18 +72,26 @@ class SpeakersStage:
         )
         conf = settings.get("speakers", {})
         conf = conf if isinstance(conf, dict) else {}
-        tracks = microphone_tracks(project, conf)
+        tracks = {} if conf.get("method") == "pyannote" else microphone_tracks(project, conf)
         selected = {key.split(":", 1)[0] for key in tracks}
+        if conf.get("method") == "pyannote":
+            from studio.stages.timeline import _primary_source_id
+
+            selected = ({Transcript.load(transcript).metadata.get("source_asset_id")
+                         or _primary_source_id(project)} if transcript and transcript.is_file()
+                        else {_primary_source_id(project)})
         identities = [describe_artifact(project.source_dir, project.source_dir / asset.path)
                       for asset in project.assets if asset.id in selected]
         return stable_fingerprint(
-            "speakers-v3", content, tracks, identities, project.placements, conf,
+            "speakers-v4", content, tracks, identities, project.placements, conf,
         )
 
     def run(self, context: StageContext) -> StageOutput:
         conf = context.settings.get("speakers", {})
         conf = conf if isinstance(conf, dict) else {}
         transcript = Transcript.load(context.project.transcripts["timeline"])
+        if conf.get("method") == "pyannote":
+            return run_pyannote(context, transcript, conf)
         step = float(conf.get("step_s", 0.05))
         tracks = microphone_tracks(context.project, conf)
         placements = {item.asset_id: item for item in context.project.placements}
@@ -152,6 +169,59 @@ def microphone_tracks(project: Project, conf: dict[str, object]) -> dict[str, st
         if not 0 <= number < count:
             raise ValueError(f"microphone channel out of range: {key}")
     return tracks
+
+
+def run_pyannote(context: StageContext, transcript: Transcript, conf: dict) -> StageOutput:
+    from studio.stages.speaker_backend import diarize
+    from studio.stages.timeline import _primary_source_id
+
+    source_id = transcript.metadata.get("source_asset_id") or _primary_source_id(context.project)
+    asset = next(asset for asset in context.project.assets if asset.id == source_id)
+    placement = next((item for item in context.project.placements
+                      if item.asset_id == source_id), None)
+    if placement is None:
+        raise ValueError("pyannote source placement is missing; run sync")
+    directory = context.work_dir / "stages" / "speakers"
+    raw = diarize(context.project.source_dir / asset.path, directory,
+                  model=str(conf.get("model", "pyannote/speaker-diarization-3.1")),
+                  device=str(conf.get("device", "cpu")))
+    turns = []
+    for item in raw:
+        start = max(float(item["start"]), placement.in_s)
+        end = min(float(item["end"]), placement.in_s + placement.duration_s)
+        if end <= start:
+            continue
+        left = max(0.0, placement.offset_s + (start - placement.in_s) * placement.k)
+        right = min(transcript.duration,
+                    placement.offset_s + (end - placement.in_s) * placement.k)
+        if right > left:
+            turns.append(SpeakerTurn(left, right, item["speaker"], "pyannote"))
+    # Preserve intersecting turns as explicit overlap for camera selection.
+    boundaries = sorted({value for turn in turns for value in (turn.start, turn.end)})
+    resolved = []
+    for start, end in zip(boundaries, boundaries[1:], strict=False):
+        active = {turn.speaker for turn in turns if turn.start <= start and turn.end >= end}
+        if active:
+            resolved.append(SpeakerTurn(start, end,
+                                       next(iter(active)) if len(active) == 1 else "overlap",
+                                       "pyannote"))
+    output = directory / "diarization.json"
+    raw_output = directory / "diarization.raw.json"
+    save_turns(raw_output, turns)
+    save_turns(output, smooth_short_turns(merge_adjacent_turns(resolved, 0),
+                                        min_turn_s=float(conf.get("min_turn_s", 0.3)),
+                                        max_gap_s=0))
+    report = directory / "report.json"
+    report.write_text(json.dumps({"schema_version": 1, "time_domain": "timeline",
+                                 "method": "pyannote", "source_asset_id": source_id,
+                                 "model": conf.get("model", "pyannote/speaker-diarization-3.1"),
+                                 "device": conf.get("device", "cpu"),
+                                 "labels": "anonymous, local to one primary source"},
+                                indent=2) + "\n", encoding="utf-8")
+    logs = tuple(sorted((directory / "logs").glob("*.log")))
+    return StageOutput((output, raw_output, report, *logs), {"outputs": {
+        **context.project.outputs, "speakers": [output, report], "speakers_raw": [raw_output],
+    }})
 
 
 def decode_channels(path: Path, channels: int, sample_rate: int = 16000) -> np.ndarray:
