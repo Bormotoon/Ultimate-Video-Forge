@@ -4,6 +4,8 @@ from pathlib import Path
 
 from studio.core.timeline import TimeDomain
 from studio.core.transcript import Transcript
+from studio.stages.sync_acoustic import refine_piece_boundaries
+from studio.stages.sync_acoustic_settings import AcousticSettings
 from studio.stages.sync_geometry import AlignmentMap, PieceSettings
 from studio.stages.sync_match_settings import MatchSettings
 from studio.stages.sync_matcher import align, evaluate_alignment
@@ -55,6 +57,7 @@ def render_aligned_clip(
     source_asset_id: str, target_asset_id: str,
     sample_rate: int = 48000, channels: int = 1, codec: str = "pcm_s24le",
     fade_ms: int = 10, stretch_method: str = "auto",
+    camera_audio: Path | None = None,
 ) -> RenderedAudioPlan:
     if strategy not in {1, 2, 3}:
         raise ValueError("synchronization strategy must be 1, 2, or 3")
@@ -62,6 +65,11 @@ def render_aligned_clip(
         alignment, clip_duration_s, recorder_duration_s, strategy, settings,
         rec_word_gaps=recorder_word_gaps(recorder_words), rec_words=recorder_words,
     )
+    if camera_audio is not None:
+        lead, pieces = refine_piece_boundaries(
+            pieces, lead, camera_audio, source, clip_duration_s, recorder_duration_s,
+            AcousticSettings(),
+        )
     if any(start < 0 or start + duration > recorder_duration_s + 1e-6
            for start, duration, _factor in pieces):
         raise ValueError("piece plan reads outside the recorder")

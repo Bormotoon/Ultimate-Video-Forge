@@ -172,3 +172,8 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   and warp maps. Disjoint sessions, lane export and discovery optimization remain.
 - Combined suite: 149 tests pass. This does not close the external sync acceptance
   gates or the remaining WhisperSync enhancement/self-check/multicam tasks.
+
+- Boundary Flex is connected to recorder rendering with `sync.boundary_flex=true`.
+  Realized waveform verification is migrated and exposed through `sync.verify`
+  and CLI `verify`; identical generated audio passes the real measurement/CLI test.
+  Enhancement, ambience, self-check/repair and master/segment outputs remain open.

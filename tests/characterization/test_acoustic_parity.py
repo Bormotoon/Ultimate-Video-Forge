@@ -5,12 +5,14 @@ import numpy as np
 import pytest
 from whispersync.engine.acoustic import gcc_phat as frozen_gcc
 
+from studio.cli.main import main
 from studio.core.project import Asset, AssetKind, AssetRole, Project
 from studio.core.transcript import Transcript
 from studio.stages.base import StageContext
 from studio.stages.sync import SyncStage
 from studio.stages.sync_acoustic import gcc_phat
 from studio.stages.sync_alignment import align_sources
+from studio.stages.sync_verify import measure
 
 
 def test_gcc_matches_frozen_algorithm() -> None:
@@ -44,6 +46,9 @@ def test_acoustic_alignment_finds_offset_without_transcript(tmp_path: Path) -> N
     assert fitted.offset == pytest.approx(-2, abs=0.01)
     assert fitted.k == pytest.approx(1)
     assert fitted.inliers >= 3
+    verification = measure(camera, camera, grid_s=2, window_s=1)
+    assert verification.verdict(20)[0] == "passed"
+    assert main(["verify", str(camera), str(camera), "--grid-s", "2", "--window-s", "1"]) == 0
     project = Project(tmp_path, tmp_path / "_studio", assets=[
         Asset("primary", recorder.name, AssetKind.VIDEO, AssetRole.CAMERA),
         Asset("second", camera.name, AssetKind.VIDEO, AssetRole.CAMERA),

@@ -143,3 +143,9 @@ entry points and recorded project paths in the same change.
 - Keep conservative prepare transcript requirements until acoustic evidence is
   integrated into discovery. Rendering multiple recorders still eagerly renders
   candidate lanes before selection; optimization follows correctness tests.
+
+- Boundary Flex is opt-in during migration and now runs on planned pieces before
+  rendering via the preserved acoustic implementation. `sync.verify` publishes
+  realized lag/coverage verdicts; `uvf verify CAMERA VOICE` returns nonzero for
+  failed or inconclusive measurements. Convert numpy scalars to JSON numbers at
+  the report boundary. No unmeasured window is counted as successful sync.

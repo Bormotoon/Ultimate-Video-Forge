@@ -157,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--skip", nargs="+", metavar="STAGE")
             command.add_argument("--events", action="store_true")
     commands.add_parser("doctor")
+    verify = commands.add_parser("verify")
+    verify.add_argument("camera", type=Path)
+    verify.add_argument("voice", type=Path)
+    verify.add_argument("--grid-s", type=float, default=5.0)
+    verify.add_argument("--window-s", type=float, default=4.0)
+    verify.add_argument("--threshold-ms", type=float, default=20.0)
     review = commands.add_parser("review")
     review.add_argument("source", type=Path)
     review.add_argument("--cut")
@@ -184,6 +190,14 @@ def _main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "doctor":
         return _doctor()
+    if args.command == "verify":
+        from studio.stages.sync_verify import measure, validate_parameters
+
+        validate_parameters(args.grid_s, args.window_s, median_threshold_ms=args.threshold_ms)
+        report = measure(args.camera, args.voice, grid_s=args.grid_s, window_s=args.window_s)
+        status, reason = report.verdict(args.threshold_ms)
+        print(json.dumps({"status": status, "reason": reason, **report.summary()}, indent=2))
+        return 0 if status == "passed" else 1
     if args.command == "review":
         from studio.stages.roughcut import review_cut
 

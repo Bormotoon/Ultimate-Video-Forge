@@ -31,6 +31,8 @@ class SyncSettings:
     acoustic_window_s: float = 8.0
     acoustic_min_sharpness: float = 50.0
     recorder_mode: str = "best"
+    boundary_flex: bool = False
+    verify: bool = False
 
 
 @dataclass(slots=True)

@@ -232,6 +232,7 @@ def _run_complex(context: StageContext) -> StageOutput:
             strategy=strategy,
             source_asset_id=recorder.id, target_asset_id=camera.id,
             channels=int(recorder.manual.get("media_info", {}).get("audio_channels") or 1),
+            camera_audio=project.source_dir / camera.path if sync.get("boundary_flex") else None,
         )
         warps.append(plan.warp)
         artifacts.append(voice)
@@ -255,6 +256,8 @@ def _run_complex(context: StageContext) -> StageOutput:
                 strategy=int(sync.get("strategy", 3)) if extra_mode == "complex" else 1,
                 source_asset_id=extra.id, target_asset_id=camera.id,
                 channels=int(extra.manual.get("media_info", {}).get("audio_channels") or 1),
+                camera_audio=(project.source_dir / camera.path
+                              if sync.get("boundary_flex") else None),
             )
             warps.append(extra_plan.warp)
             artifacts.append(extra_voice)
@@ -273,6 +276,22 @@ def _run_complex(context: StageContext) -> StageOutput:
         "padding": "silence is outside invertible source maps",
     }, indent=2) + "\n", encoding="utf-8")
     artifacts.append(report)
+    if sync.get("verify"):
+        from studio.stages.sync_verify import measure
+
+        measurements = []
+        for camera, candidate in zip(cameras, camera_transcripts, strict=True):
+            verification = measure(project.source_dir / camera.path,
+                                   outputs[f"sync:{camera.id}"][0],
+                                   source_duration_s=candidate.duration)
+            status, reason = verification.verdict(20.0)
+            measurements.append({"asset_id": camera.id, "status": status, "reason": reason,
+                                 **verification.summary()})
+        verify_path = report.with_name("verify.json")
+        verify_path.write_text(json.dumps({"schema_version": 1, "clips": measurements},
+                                          indent=2) + "\n", encoding="utf-8")
+        artifacts.append(verify_path)
+        outputs["verify"] = [verify_path]
     return StageOutput(tuple(artifacts), {
         "placements": placements, "audio_warp_maps": warps, "outputs": outputs,
     })
