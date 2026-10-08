@@ -39,7 +39,7 @@ class ScanStage:
             )
             for path in files
         ]
-        return stable_fingerprint("scan-v1", identities, settings.get("scan", {}))
+        return stable_fingerprint("scan-v2", identities, settings.get("scan", {}))
 
     def run(self, context: StageContext) -> StageOutput:
         assets, warnings = scan(context.project.source_dir)

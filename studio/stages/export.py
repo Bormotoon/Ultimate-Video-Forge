@@ -31,7 +31,7 @@ class SequenceClip:
     source_width: int | None = None
     source_height: int | None = None
     audio_sample_rate: int = 48000
-    audio_depth: int = 16
+    audio_depth: int | None = 16
     audio_role: str = "dialogue"
 
 
@@ -75,7 +75,7 @@ class ExportStage:
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
-            "export-v11", project.assets, project.placements, project.audio_warp_maps,
+            "export-v12", project.assets, project.placements, project.audio_warp_maps,
             inputs, settings.get("export", {}), settings.get("roughcut", {}),
             settings.get("program", {}),
         )
@@ -178,7 +178,8 @@ def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = T
                 source_width=int(media.get("width") or 1920),
                 source_height=int(media.get("height") or 1080),
                 audio_sample_rate=int(media.get("audio_sample_rate") or 48000),
-                audio_depth=int(media.get("audio_bits_per_sample") or 16),
+                audio_depth=(int(media["audio_bits_per_sample"])
+                             if media.get("audio_bits_per_sample") else None),
             )
         )
         if voice is not None:
@@ -476,7 +477,8 @@ def write_xmeml(sequence: Sequence, output: Path) -> Path:
                 file_audio = ET.SubElement(file_media, "audio")
                 ET.SubElement(file_audio, "channelcount").text = str(clip.audio_channels)
                 sample = ET.SubElement(file_audio, "samplecharacteristics")
-                ET.SubElement(sample, "depth").text = str(clip.audio_depth)
+                if clip.audio_depth is not None:
+                    ET.SubElement(sample, "depth").text = str(clip.audio_depth)
                 ET.SubElement(sample, "samplerate").text = str(clip.audio_sample_rate)
             if not clip.has_video:
                 source_track = ET.SubElement(item, "sourcetrack")

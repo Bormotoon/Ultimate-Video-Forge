@@ -392,3 +392,14 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   replaced with actual WAV headers; invalid media does not silently pass probing.
 - Full suite: 244 passed; changed-file Ruff and diff checks pass. Camera bit-depth
   discovery and actual NLE role/audio-layout interpretation remain open.
+
+### Camera audio depth discovery
+
+- Scan stores selected-stream audio bit depth and XMEML exports it when known.
+  AAC unknown depth stays absent; packed 24-bit precision takes precedence over
+  storage width. Scan/export fingerprint versions invalidate older results.
+- Real MOV fixtures verify 24-bit PCM at 44.1 kHz and AAC unknown depth through
+  scan and export. Controlled multistream probe checks default-stream selection.
+  Full suite: 246 passed; changed-file Ruff and diff checks pass.
+- Actual NLE acceptance and explicit multi-audio-stream export selection remain
+  open; depth discovery does not establish a complete stream-selection contract.

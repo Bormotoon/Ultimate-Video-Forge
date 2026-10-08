@@ -302,3 +302,9 @@ entry points and recorded project paths in the same change.
   audio file rather than camera defaults. Invalid audio fails instead of claiming
   a successful export. FCPXML assets expose channels/rate and dialogue/effects
   roles; XMEML emits actual sample rate and depth. Camera metadata comes from scan.
+
+- Media probe now records audio_bits_per_sample for the selected default audio
+  stream, preferring bits_per_raw_sample over storage bits_per_sample. Unknown
+  depth (e.g. AAC) stays unknown and XMEML omits depth rather than inventing 16-bit
+  precision. Scan fingerprint advances to invalidate cached metadata without the
+  new field; existing MediaInfo constructors remain compatible via default None.

@@ -42,6 +42,7 @@ class MediaInfo:
     audio_stream_index: int | None
     is_cfr: bool
     tags: dict[str, str]
+    audio_bits_per_sample: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +99,10 @@ def probe(path: Path, timeout_s: float = 30.0) -> MediaInfo:
         audio_stream_index=audio_index,
         is_cfr=is_cfr,
         tags=tags,
+        audio_bits_per_sample=(
+            _int((audio or {}).get("bits_per_raw_sample"))
+            or _int((audio or {}).get("bits_per_sample"))
+        ),
     )
 
 
