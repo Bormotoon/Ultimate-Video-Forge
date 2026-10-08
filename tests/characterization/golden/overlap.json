@@ -1,0 +1,8 @@
+{
+  "intervals": {"a": [0.0, 10.0], "b": [3.0, 7.0], "c": [12.0, 17.0], "voice": [1.0, 9.0]},
+  "spine": ["a", "c"],
+  "promoted_lane": "2",
+  "source_audio": "video",
+  "voice_src": "audio/voice.wav",
+  "frame_duration": "1/25s"
+}

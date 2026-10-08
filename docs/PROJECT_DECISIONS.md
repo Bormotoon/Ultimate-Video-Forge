@@ -24,4 +24,6 @@ local repository `/srv/storage/docs/Studio/`, through commit `b95d3c6`.
 The destination already contains its own initial documentation commit. Bring
 the implementation history into this repository while preserving its existing
 documentation and Git remote; do not overwrite either repository or force-push.
+The implementation is now merged into the destination with both parent histories
+preserved. Existing destination README, MIT license, plan, and remote win conflicts.
 The package and command names still need migration from `studio`.

@@ -1,0 +1,23 @@
+venv/
+.sep-venv/
+models/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.env
+output/
+whisper_cache/
+report.json
+.vscode/
+.idea/
+.DS_Store
+
+# Reference material (Gemini conversation export)
+*.html
+*_files/

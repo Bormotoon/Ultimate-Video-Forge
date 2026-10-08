@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "podcast-reels-forge"
+dynamic = ["version"]
+description = "Turn long podcasts into viral vertical Reels/Shorts/TikTok clips, fully locally."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Podcast Reels Forge Contributors" }]
+keywords = [
+  "whisper", "faster-whisper", "reels", "shorts", "tiktok",
+  "subtitles", "ffmpeg", "llm", "llama-cpp", "video",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Environment :: GPU :: NVIDIA CUDA",
+  "Intended Audience :: End Users/Desktop",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+  "faster-whisper>=1.1.1,<2",
+  "ctranslate2>=4.6.0,<5",
+  "torch>=2.7.0,<3",
+  "tqdm>=4.66.0,<5",
+  "coloredlogs>=15.0.1,<16",
+  "requests>=2.31.0,<3",
+  "aiohttp>=3.9.0,<4",
+  "PyYAML>=6.0.1,<7",
+  "opencv-python-headless>=4.8.0,<5",
+  "platformdirs>=4.0.0,<5",
+  "fonttools>=4.40.0,<5",
+  "Pillow>=10.0.0,<13",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4.0", "ruff>=0.1.0", "mypy>=1.5.0", "types-requests", "types-PyYAML"]
+diarization = ["pyannote.audio>=3.1"]
+# YouTube keeps changing how it serves video, so keep this one current:
+#   pip install -U yt-dlp
+youtube = ["yt-dlp>=2025.1.0"]
+
+[project.urls]
+Homepage = "https://github.com/Bormotoon/Podcast-Reels-Forge"
+Repository = "https://github.com/Bormotoon/Podcast-Reels-Forge"
+Issues = "https://github.com/Bormotoon/Podcast-Reels-Forge/issues"
+Changelog = "https://github.com/Bormotoon/Podcast-Reels-Forge/blob/main/CHANGELOG.md"
+
+[tool.setuptools.dynamic]
+version = { attr = "podcast_reels_forge.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["podcast_reels_forge*"]
+
+# Набор правил задан явно. Без него ruff берёт СВОЙ дефолт, а он меняется между
+# выпусками: 0.16.0 расширил его так, что неизменённое дерево дало 116 находок и
+# уронило CI (2026-07-27). Расширять список — отдельное осознанное решение, а не
+# побочный эффект обновления линтера.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -1,0 +1,16 @@
+# Pinned dependency set for the OPTIONAL separation environment (.sep-venv),
+# used by --ambience-track and the denoise/dereverb voice-enhancement modes.
+#
+# Pinned because the main lock file does not cover this environment at all: the
+# setup script installed a bare `audio-separator[gpu]`, so two machines set up
+# a week apart could run different model code and produce different separation
+# — with nothing recording which version made a given result.
+#
+# Requires Python 3.12: audio-separator's dependency stack does not yet support
+# the newer Python the main application runs on, which is why this environment
+# is separate in the first place.
+#
+# Verified combination (Linux, CUDA 12.x, Python 3.12). When bumping, re-run
+# setup_sep_venv.sh and listen to the ambience output before committing — an
+# upgrade here changes audio, not just versions.
+audio-separator[gpu]==0.44.2

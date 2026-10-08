@@ -883,7 +883,7 @@ compute:    {allow_cpu: false}
 - [x] Принять решения из раздела 2. См. `docs/PROJECT_DECISIONS.md`.
 - [x] Определить политику исходных репозиториев: по решению владельца не изменяем их; разработка только в Ultimate Video Forge.
 - [ ] Зафиксировать `HEAD`, Python, lock-файлы и статус рабочих деревьев обоих проектов. Для WhisperSync сохранить patchset незакоммиченных файлов отдельным patch-файлом и принять решение: закоммитить его в исходнике или перенести вручную до subtree.
-- [ ] Создать репозиторий и импортировать оба проекта с историей:
+- [x] Создать репозиторий и импортировать оба проекта с историей: реализация Studio импортирована merge с сохранением обоих subtree и исходной истории Ultimate Video Forge.
   ```bash
   git init studio && cd studio && git commit --allow-empty -m "chore: start"
   git subtree add --prefix=legacy/whispersync /home/borm/VibeCoding/WhisperSync main

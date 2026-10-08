@@ -1,0 +1,5 @@
+/* Temporary bootstrap theme; the migrated WhisperSync theme replaces this. */
+QWidget {
+    background: #151817;
+    color: #f4f0e7;
+}

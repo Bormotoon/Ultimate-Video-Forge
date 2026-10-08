@@ -1,0 +1,21 @@
+# Upper bounds are the next major: a nightly unattended run must not pick up a
+# breaking release on its own. yt-dlp (below) is the exception — keep it fresh.
+faster-whisper>=1.1.1,<2
+ctranslate2>=4.6.0,<5
+torch>=2.7.0,<3
+tqdm>=4.66.0,<5
+coloredlogs>=15.0.1,<16
+requests>=2.31.0,<3
+aiohttp>=3.9.0,<4
+PyYAML>=6.0.1,<7
+opencv-python-headless>=4.8.0,<5
+platformdirs>=4.0.0,<5
+# fonttools + Pillow measure subtitle text with the real font (line breaks) and
+# read its family name; without them line breaks fall back to a rough guess.
+fonttools>=4.40.0,<5
+Pillow>=10.0.0,<13
+
+# Optional. Needed only to pull episodes straight off YouTube (the `fetch` stage).
+# YouTube keeps changing how it serves video, so install it with -U and update it
+# when downloads start failing:  pip install -U yt-dlp
+# yt-dlp>=2025.1.0

@@ -1,0 +1,24 @@
+{
+  "audio": "recorder.wav",
+  "source_audio": "recorder.wav",
+  "model": "tiny",
+  "device": "cpu",
+  "compute_type": "float32",
+  "mode": "fast",
+  "language": "en",
+  "duration": 5.0,
+  "timing_version": 2,
+  "segments": [
+    {"start": 0.125, "end": 1.5, "text": "Hello world.", "words": [
+      {"start": 0.125, "end": 0.75, "word": "Hello", "probability": 0.988},
+      {"start": 0.8, "end": 1.5, "word": "world.", "probability": 0.9}
+    ]},
+    {"start": 3.0, "end": 4.0, "text": "Again", "words": [
+      {"start": 3.0, "end": 4.0, "word": "Again", "probability": 0.8}
+    ]}
+  ],
+  "sentences": [
+    {"start": 0.125, "end": 1.5, "text": "Hello world.", "segment_count": 1},
+    {"start": 3.0, "end": 4.0, "text": "Again", "segment_count": 1}
+  ]
+}

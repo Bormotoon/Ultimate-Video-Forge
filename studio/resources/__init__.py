@@ -1,0 +1,1 @@
+"""Packaged Studio resources."""

@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "studio"
+version = "0.1.0.dev0"
+description = "Local desktop workflow for synchronized podcast production"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Bormotoon" }]
+dependencies = [
+    "numpy>=1.26.0,<3",
+    "platformdirs>=4.0.0,<5",
+    "PyQt6>=6.7.0,<7",
+    "PyYAML>=6.0.1,<7",
+]
+
+[project.optional-dependencies]
+whisper = [
+    "ctranslate2>=4.6.0,<5",
+    "faster-whisper>=1.1.1,<2",
+]
+dev = [
+    "build>=1.2.0,<2",
+    "mypy>=1.10.0,<3",
+    "pyinstaller>=6.0.0,<7",
+    "pytest>=8.0.0,<10",
+    "ruff>=0.5.0,<1",
+    "types-PyYAML>=6.0.0",
+]
+
+[project.scripts]
+studio = "studio.cli.main:main"
+studio-gui = "studio.app:gui_main"
+
+[tool.setuptools.packages.find]
+include = ["studio*"]
+
+[tool.setuptools.package-data]
+"studio.resources" = [
+    "fonts/*",
+    "fonts/licenses/*",
+    "prompts/en/*",
+    "prompts/ru/*",
+    "subtitle_editor/*",
+    "subtitle_editor/assets/*",
+]
+"studio.gui" = ["*.qss"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+disallow_untyped_defs = true
+warn_return_any = true
+warn_unused_configs = true
