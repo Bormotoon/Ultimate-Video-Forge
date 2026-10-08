@@ -25,6 +25,11 @@ The nonlinear plan overshoots its 30-second clip by about 44.6 ms. This is froze
 behavior, not an approved Studio warp-coverage policy: assembly trims to the clip
 duration, so a future adapter must explicitly reconcile the rendered endpoint.
 
+`test_render_parity.py` compares the migrated Studio renderer with the frozen
+engine sample for sample for mixed copy/resample/atempo pieces, fades, leading
+silence, final trimming, and tail padding. The renderer and map adapter exist as
+standalone building blocks; SyncStage still needs the real piece planner wired in.
+
 These tests are a migration oracle, not a claim that Studio matches it yet.
 In particular, legacy fingerprint adoption is documented rather than approved:
 Studio requires complete manifests and checked artifacts. Do not update golden

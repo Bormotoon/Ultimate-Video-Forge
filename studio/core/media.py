@@ -3,11 +3,29 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
+
+WAV_MUX_ARGS = ["-rf64", "auto"]
+
+
+def build_atempo_chain(factor: float) -> list[str]:
+    if not math.isfinite(factor) or factor <= 0:
+        raise ValueError("tempo factor must be finite and positive")
+    filters: list[str] = []
+    remaining = factor
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    filters.append(f"atempo={remaining:.6f}")
+    return filters
 
 
 @dataclass(frozen=True, slots=True)

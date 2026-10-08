@@ -29,3 +29,5 @@ All notable changes to Studio will be documented in this file.
   and artifact checksums instead of accepting manifest file existence.
 - Python 3.10-compatible string enums and UTC timestamps; corrected CI system
   dependencies and installed-wheel resource smoke command.
+- Lossless WhisperSync rendering utilities migrated into Studio, with a typed
+  render-plan facade and sample-for-sample frozen-engine parity checks.
