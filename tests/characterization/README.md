@@ -17,7 +17,13 @@ The Hybrid golden pins pause absorption of a one-second offset, unchanged
 speech rates, contiguous source coverage, and sentence placement. Real ffmpeg
 tests pin PCM format, sample counts for copy/resample/atempo, and exact source
 samples on the unchanged-rate path. This is an initial Hybrid oracle, not full
-coverage of nonlinear drift, Boundary Flex, self-check, or assembled audio.
+coverage of self-check or all Hybrid edge cases. Additional cases pin nonlinear
+clock pieces and test Boundary Flex correction direction and contiguous geometry
+with controlled GCC measurements. Real assembly checks exact PCM ordering and
+leading/trailing silence; it does not substitute for acoustic end-to-end checks.
+The nonlinear plan overshoots its 30-second clip by about 44.6 ms. This is frozen
+behavior, not an approved Studio warp-coverage policy: assembly trims to the clip
+duration, so a future adapter must explicitly reconcile the rendered endpoint.
 
 These tests are a migration oracle, not a claim that Studio matches it yet.
 In particular, legacy fingerprint adoption is documented rather than approved:
