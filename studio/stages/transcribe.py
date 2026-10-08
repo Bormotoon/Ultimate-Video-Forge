@@ -243,7 +243,7 @@ class TranscribeStage:
         return stable_fingerprint("transcribe-v1", content, settings.get("transcribe", {}))
 
     def run(self, context: StageContext) -> StageOutput:
-        requirements_path = context.work_dir / "stages" / "prepare" / "requirements.json"
+        requirements_path = context.project.work_dir / "stages" / "prepare" / "requirements.json"
         requirements = json.loads(requirements_path.read_text(encoding="utf-8"))
         asset_by_id = {asset.id: asset for asset in context.project.assets}
         settings = TranscribeSettings.from_mapping(context.settings.get("transcribe", {}))

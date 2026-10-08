@@ -23,3 +23,5 @@ All notable changes to Studio will be documented in this file.
 - Initial installable Studio package and packaged UI resources.
 - Deterministic two-camera, recorder, drift, pause, retake, and GoPro chapter fixture generator.
 - CI for Python 3.10-3.13, both frozen legacy test baselines, clean wheel installs, PyInstaller, and cross-platform artifact imports.
+- Recoverable stage publication with private worker outputs, rollback on
+  cancellation or errors, and journal recovery before CLI planning.

@@ -14,7 +14,8 @@ from typing import Any
 
 import yaml
 
-from studio.core.project import ArtifactStatus, Project, StageManifest, describe_artifact
+from studio.core.project import Artifact, ArtifactStatus, Project, StageManifest, describe_artifact
+from studio.core.publication import publish_files, recover_publications
 from studio.core.settings import load_settings
 from studio.stages.events import EventType, StageEvent
 
@@ -45,6 +46,8 @@ def run_stage_process(
         else load_settings([settings_path]).to_dict()
     )
     project = Project.load(project_path)
+    recover_publications(project.work_dir)
+    project = Project.load(project_path)
     # A private snapshot keeps the worker's inputs identical to the planner's,
     # even if the project YAML changes while the worker is running.
     with tempfile.TemporaryDirectory(prefix=".settings-", dir=project.work_dir) as temporary:
@@ -67,9 +70,16 @@ def _run_stage_process(
     terminate_after_s: float,
 ) -> RunResult:
     project = Project.load(project_path)
+    initial_project = project_path.read_bytes()
+    private_project = snapshot.parent / "input-project.json"
+    private_project.write_bytes(initial_project)
+    output_dir = snapshot.parent / "output"
+    output_dir.mkdir()
+    result_project = snapshot.parent / "result-project.json"
     command = [
         sys.executable, "-m", "studio.stages.worker", stage_id,
-        str(project_path), str(snapshot),
+        str(private_project), str(snapshot),
+        "--output-dir", str(output_dir), "--result-project", str(result_project),
     ]
     process = subprocess.Popen(
         command,
@@ -111,7 +121,35 @@ def _run_stage_process(
         for event in events
         if event.type is EventType.ARTIFACT
     ]
-    artifacts = [describe_artifact(project.work_dir, path) for path in artifact_paths]
+    artifacts: list[Artifact] = []
+    replacements: list[tuple[Path, Path]] = []
+    path_mapping: dict[str, str] = {}
+    for path in artifact_paths:
+        try:
+            relative = path.resolve().relative_to(output_dir.resolve())
+        except ValueError as exc:
+            raise StageProcessError(f"artifact outside worker output directory: {path}") from exc
+        if not relative.parts or relative.parts[0] not in {"stages", "export", "program", "reels"}:
+            raise StageProcessError(f"invalid artifact target: {relative}")
+        destination = project.work_dir / relative
+        artifact = describe_artifact(output_dir, output_dir / relative)
+        artifacts.append(Artifact(str(relative), artifact.sha256, artifact.size))
+        replacements.append((path, destination))
+        path_mapping[str(path)] = str(destination)
+    if not result_project.is_file():
+        raise StageProcessError("worker did not return a project result")
+    candidate = Project.load(result_project)
+    if candidate.source_dir != project.source_dir or candidate.work_dir != project.work_dir:
+        raise StageProcessError("worker changed project root directories")
+    candidate.transcripts = {
+        key: Path(path_mapping.get(str(value), str(value)))
+        for key, value in candidate.transcripts.items()
+    }
+    candidate.outputs = {
+        key: [Path(path_mapping.get(str(value), str(value))) for value in values]
+        for key, values in candidate.outputs.items()
+    }
+    candidate.save(result_project)
     manifest = StageManifest(
         stage=stage_id,
         fingerprint=fingerprint,
@@ -124,7 +162,20 @@ def _run_stage_process(
         status=ArtifactStatus.OK,
         producer_version=project.producer_version,
     )
-    manifest.save(project.work_dir / "manifests" / f"{stage_id}.json")
+    private_manifest = snapshot.parent / "manifest.json"
+    manifest.save(private_manifest)
+    replacements.extend([
+        (result_project, project_path),
+        (private_manifest, project.work_dir / "manifests" / f"{stage_id}.json"),
+    ])
+    if cancelled():
+        raise StageProcessError(f"stage {stage_id} was cancelled")
+    if project_path.read_bytes() != initial_project:
+        raise StageProcessError("project changed while the worker was running")
+    try:
+        publish_files(project.work_dir, replacements, cancelled=cancelled)
+    except InterruptedError as exc:
+        raise StageProcessError(f"stage {stage_id} was cancelled") from exc
     return RunResult(tuple(events), manifest)
 
 

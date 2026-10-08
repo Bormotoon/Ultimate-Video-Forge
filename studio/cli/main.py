@@ -13,6 +13,7 @@ from typing import Any
 
 from studio import __version__
 from studio.core.project import Project
+from studio.core.publication import recover_publications
 from studio.core.settings import SettingsError, load_settings
 from studio.core.workspace import project_lock
 from studio.stages.planner import build_plan
@@ -48,6 +49,7 @@ def _run_discovery(
     if include_prepare:
         selected.append(stage_registry()["prepare"])
     with project_lock(project.work_dir):
+        recover_publications(project.work_dir)
         for stage in selected:
             project = Project.load(project_path)
             fingerprint = stage.fingerprint(project, settings)
@@ -65,6 +67,7 @@ def _run_pipeline(source: Path, overrides: list[str] | None = None) -> Project:
     settings = _settings(settings_path, overrides)
     registry = stage_registry()
     with project_lock(project.work_dir):
+        recover_publications(project.work_dir)
         while True:
             project = Project.load(project_path)
             plan = build_plan(registry.values(), project, settings)

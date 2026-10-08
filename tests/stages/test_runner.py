@@ -28,7 +28,10 @@ def _worker_script(
     children: list[subprocess.Popen[str]] = []
 
     def launch(command: list[str], **kwargs: Any) -> subprocess.Popen[str]:
-        process = real_popen([sys.executable, "-c", script], **kwargs)
+        setup = "import shutil, sys; shutil.copyfile(sys.argv[1], sys.argv[2]); "
+        process = real_popen(
+            [sys.executable, "-c", setup + script, command[4], command[-1]], **kwargs
+        )
         children.append(process)
         return process
 
@@ -102,7 +105,9 @@ def test_buffered_events_are_validated_after_worker_exit(
 def test_real_worker_failure_has_stderr_diagnostic_and_failed_event(tmp_path: Path) -> None:
     project, settings = _project(tmp_path)
     result = subprocess.run(
-        [sys.executable, "-m", "studio.stages.worker", "unknown", str(project), str(settings)],
+        [sys.executable, "-m", "studio.stages.worker", "unknown", str(project), str(settings),
+         "--output-dir", str(tmp_path / "output"),
+         "--result-project", str(tmp_path / "result.json")],
         capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 1
@@ -110,3 +115,25 @@ def test_real_worker_failure_has_stderr_diagnostic_and_failed_event(tmp_path: Pa
     assert json.loads(result.stdout) == {"t": "done", "stage": "unknown", "status": "failed"}
     with pytest.raises(StageProcessError, match="unknown stage"):
         run_stage_process("unknown", project, settings, "fp")
+
+
+def test_worker_partial_output_never_overwrites_published_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, settings = _project(tmp_path)
+    original_project = project.read_bytes()
+    artifact = project.parent / "stages" / "scan" / "report.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"old report")
+    script = (
+        "from pathlib import Path; "
+        "root = Path(sys.argv[2]).parent / 'output' / 'stages' / 'scan'; "
+        "root.mkdir(parents=True); (root / 'report.json').write_bytes(b'partial'); "
+        "sys.exit(7)"
+    )
+    _worker_script(monkeypatch, script)
+    with pytest.raises(StageProcessError, match="exited 7"):
+        run_stage_process("scan", project, settings, "fp")
+    assert artifact.read_bytes() == b"old report"
+    assert project.read_bytes() == original_project
+    assert not list(project.parent.glob(".settings-*"))

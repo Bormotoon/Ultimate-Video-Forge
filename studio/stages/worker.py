@@ -43,7 +43,10 @@ def _emit(event: StageEvent) -> None:
     print(event.to_json(), flush=True)
 
 
-def execute(stage_id: str, project_path: Path, settings_path: Path) -> int:
+def execute(
+    stage_id: str, project_path: Path, settings_path: Path,
+    output_dir: Path, result_project: Path,
+) -> int:
     stage = stage_registry().get(stage_id)
     if stage is None:
         raise ValueError(f"unknown stage: {stage_id}")
@@ -57,15 +60,15 @@ def execute(stage_id: str, project_path: Path, settings_path: Path) -> int:
             settings = loaded
     _emit(StageEvent(EventType.START, stage_id))
     with redirect_stdout(sys.stderr):
-        output = stage.run(StageContext(project, settings, project.work_dir))
+        output = stage.run(StageContext(project, settings, output_dir))
     for key, value in output.project_changes.items():
         if not hasattr(project, key):
             raise ValueError(f"stage returned unknown project field: {key}")
         setattr(project, key, value)
-    project.save(project_path)
+    project.save(result_project)
     for artifact in output.artifacts:
         _emit(StageEvent(EventType.ARTIFACT, stage_id, {"path": str(artifact)}))
-    _emit(StageEvent(EventType.DONE, stage_id, {"status": "ok"}))
+    _emit(StageEvent(EventType.DONE, stage_id, {"status": "ok", "output": str(result_project)}))
     return 0
 
 
@@ -74,13 +77,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("stage_id")
     parser.add_argument("project", type=Path)
     parser.add_argument("settings", type=Path)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--result-project", required=True, type=Path)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return execute(args.stage_id, args.project, args.settings)
+        return execute(
+            args.stage_id, args.project, args.settings, args.output_dir, args.result_project
+        )
     except Exception as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr, flush=True)
         _emit(StageEvent(EventType.DONE, args.stage_id, {"status": "failed"}))

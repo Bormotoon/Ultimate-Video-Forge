@@ -14,9 +14,12 @@ phase complete merely because a similarly named module exists.
   SourcePlacement, AudioWarpMap, and EditMap contracts.
 - Planner and JSON-lines subprocess runner foundations. Effective settings are
   snapshotted per worker; silent cancellation and large stderr are tested with
-  real processes. Atomic file helpers exist, but stage artifacts and project
-  changes are NOT yet published as a transaction. Live event forwarding and
-  Windows process-tree cancellation remain open.
+   real processes. Workers write private results; the runner validates artifact
+   checksums and publishes files, project, and manifest with a rollback journal.
+   Error/cancellation rollback and killed-publisher recovery are tested. Recovery
+   runs under the CLI project lock before planning. This is recoverable multi-file
+   publication, not simultaneous filesystem visibility or proven power-loss
+   durability. Live event forwarding and Windows tree cancellation remain open.
 - Media scan, prepare input declaration, Whisper stage facade and content
   cache, affine text-anchor placement, timeline transcript, deterministic
   pause rough cut, program transcript mapping, microphone energy attribution,
@@ -42,7 +45,9 @@ phase complete merely because a similarly named module exists.
   before use on real material.
 - Full characterization/golden migration of WhisperSync matcher, RANSAC,
   acoustic fallback, strategies 1/2/3, piece renderer, Boundary Flex,
-  ambience, enhancement, self-check, repair, segments, and verification.
+   ambience, enhancement, self-check, repair, segments, and verification.
+   Initial frozen-source transcript/export, fingerprint, lock, and process
+   characterization tests exist; the Hybrid contracts remain to be captured.
 - FCPXML behavior parity for connected clips, auditions, roles, synchronized
   rendered audio, relative relinking, multicam, and rough-cut markers.
 - Editable Material screen, persistent manual overrides, RecorderTrack model,
