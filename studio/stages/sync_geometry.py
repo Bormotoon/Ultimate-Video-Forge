@@ -1,5 +1,6 @@
 """Structural inputs to the preserved piece-planning algorithms."""
 
+from dataclasses import dataclass
 from typing import Protocol
 
 
@@ -28,3 +29,9 @@ class PieceSettings(Protocol):
 
     @property
     def seam_snap_max_s(self) -> float: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PieceConfig:
+    phrase_gap_threshold: float = 0.6
+    seam_snap_max_s: float = 0.4
