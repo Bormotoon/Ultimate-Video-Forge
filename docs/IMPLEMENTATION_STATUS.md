@@ -160,3 +160,15 @@ an actual Whisper/model/NLE end-to-end acceptance run.
 - Pyannote, short-turn smoothing, RecorderTrack GUI controls and nonlinear warped
   attribution remain open. The current implementation does not establish complete
   speaker/multicam phase acceptance.
+
+### Sequential processing migration: acoustic alignment
+
+- Auto/simple now use migrated waveform-first alignment; complex has waveform
+  fallback. GCC output matches the frozen implementation. Real offset audio with
+  no transcript is found and camera-only placement retains the measured offset.
+- Multiple overlapping recorders are aligned onto the shared primary clock and
+  rendered independently. Best mode selects one voice; all mode publishes all
+  lanes under sync-tracks keys. Subprocess regression covers two recorder outputs
+  and warp maps. Disjoint sessions, lane export and discovery optimization remain.
+- Combined suite: 149 tests pass. This does not close the external sync acceptance
+  gates or the remaining WhisperSync enhancement/self-check/multicam tasks.

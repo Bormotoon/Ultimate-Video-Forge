@@ -27,6 +27,10 @@ class SyncSettings:
     mode: str = "auto"
     strategy: int = 3
     max_drift_ms: float = 20.0
+    acoustic_grid_s: float = 30.0
+    acoustic_window_s: float = 8.0
+    acoustic_min_sharpness: float = 50.0
+    recorder_mode: str = "best"
 
 
 @dataclass(slots=True)
@@ -131,6 +135,9 @@ def validate_settings(settings: Settings) -> None:
     if settings.sync.strategy not in {1, 2, 3}:
         raise SettingsError("sync.strategy must be 1, 2, or 3")
     _non_negative("sync.max_drift_ms", settings.sync.max_drift_ms)
+    _one_of("sync.recorder_mode", settings.sync.recorder_mode, {"best", "all"})
+    for name in ("acoustic_grid_s", "acoustic_window_s", "acoustic_min_sharpness"):
+        _positive(f"sync.{name}", getattr(settings.sync, name))
     _one_of("transcribe.device", settings.transcribe.device, {"auto", "cuda", "cpu"})
     _one_of("transcribe.mode", settings.transcribe.mode, {"fast", "quality"})
     if settings.transcribe.batch_size < 1:

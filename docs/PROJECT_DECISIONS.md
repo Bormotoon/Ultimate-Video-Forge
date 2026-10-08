@@ -127,3 +127,19 @@ entry points and recorded project paths in the same change.
   combine by maximum envelope instead of inventing duplicate speaker identities.
 - Persist Forge-compatible turn lists and a separate timeline-domain provenance
   report. Fingerprints include selected source content, placements and assignments.
+
+### Sequential processing migration: acoustic alignment
+
+- Preserve the full frozen acoustic algorithm in sync_acoustic.py, replacing only
+  configuration/decoder dependencies. Auto/simple use waveform evidence first;
+  complex uses text first with waveform fallback. Both paths use the existing
+  acceptance gate; ambiguous/insufficient waveform evidence never becomes placement.
+- Place camera-only projects in the first camera's clock, then normalize the
+  earliest offset to zero. Retain affine clock factors rather than discard drift.
+- Multiple recorders share the first recorder reference clock. Independently align
+  each recorder and each camera/recorder pair. Fail when common-clock evidence is
+  missing; disjoint recorder sessions are not guessed. Choose best voice by residual
+  then inlier count; all mode additionally publishes every rendered recorder lane.
+- Keep conservative prepare transcript requirements until acoustic evidence is
+  integrated into discovery. Rendering multiple recorders still eagerly renders
+  candidate lanes before selection; optimization follows correctness tests.
