@@ -3,12 +3,12 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "studio"
+name = "ultimate-video-forge"
 version = "0.1.0.dev0"
 description = "Local desktop workflow for synchronized podcast production"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
-license = "PolyForm-Noncommercial-1.0.0"
+license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Bormotoon" }]
 dependencies = [
@@ -33,6 +33,9 @@ dev = [
 ]
 
 [project.scripts]
+uvf = "studio.cli.main:main"
+ultimate-video-forge = "studio.cli.main:main"
+uvf-gui = "studio.app:gui_main"
 studio = "studio.cli.main:main"
 studio-gui = "studio.app:gui_main"
 

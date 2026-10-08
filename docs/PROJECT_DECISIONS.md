@@ -27,3 +27,8 @@ documentation and Git remote; do not overwrite either repository or force-push.
 The implementation is now merged into the destination with both parent histories
 preserved. Existing destination README, MIT license, plan, and remote win conflicts.
 The package and command names still need migration from `studio`.
+
+Distribution identity is `ultimate-video-forge`, with `uvf`,
+`ultimate-video-forge`, and `uvf-gui` entry points. Keep the internal `studio`
+namespace and old commands during migration to avoid invalidating subprocess
+entry points and recorded project paths in the same change.
