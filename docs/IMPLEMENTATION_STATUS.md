@@ -231,3 +231,13 @@ an actual Whisper/model/NLE end-to-end acceptance run.
 - Full regression run: 201 tests pass; Ruff on changed Python files and
   `git diff --check` pass. Recognition and lag acceptance in repair tests use
   controlled backends; these results do not establish real-model acceptance.
+
+### Program encoder selection
+
+- `program.encoder=auto` probes actual NVENC encoding and selects libx264 when
+  unavailable. Explicit cpu/nvenc modes retain their requested behavior; runtime
+  auto-mode GPU failures retry the whole job on CPU. `program/render.json` is
+  published as `program_report` with encoder selection and fallback diagnostics.
+- Local real probe found no h264_nvenc encoder in ffmpeg and selected libx264.
+  Real CPU media render and controlled GPU success/failure/timeout tests pass.
+  Full suite: 208 passed. Hardware GPU encoding acceptance remains open.

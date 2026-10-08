@@ -192,3 +192,10 @@ entry points and recorded project paths in the same change.
 - Repair currently requires voice_enhance=off so an accepted rerender cannot
   silently bypass requested enhancement. Local span repair and a real-model
   end-to-end acceptance gate remain open; this is not full legacy repair parity.
+
+- Program encoder auto-selection performs a bounded real one-frame NVENC encode
+  probe. Auto falls back to libx264 on unavailable hardware/drivers or timeout;
+  explicit nvenc fails with the probe error and explicit cpu skips hardware probes.
+  A runtime NVENC failure in auto mode regenerates all pieces on CPU, avoiding
+  concatenation of differing hardware/software H.264 parameter sets. The render
+  report records selection, fallback reason, format and retained duration.

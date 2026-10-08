@@ -1,6 +1,7 @@
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -8,6 +9,7 @@ from studio.core.project import Asset, AssetRole, Project
 from studio.core.timeline import EditMap, KeepRange, SourcePlacement, TimeDomain
 from studio.core.transcript import Segment, Transcript, Word
 from studio.stages.program import map_transcript_to_edited, render_project_program
+from studio.stages.program_encoder import EncoderChoice
 
 
 def test_program_transcript_uses_edited_time_and_drops_cut_words() -> None:
@@ -56,7 +58,8 @@ def test_render_uses_placement_and_synced_audio_on_real_media(tmp_path: Path) ->
     project.outputs["sync:cam"] = [voice]
     edit = EditMap("cut", (KeepRange(10.4, 11.2), KeepRange(12, 12.6)))
     output = tmp_path / "program.mp4"
-    render_project_program(project, edit, output)
+    report = render_project_program(project, edit, output, encoder="cpu")
+    assert report["final_codec"] == "libx264"
     probe = subprocess.run([
         "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(output)
     ], check=True, capture_output=True, text=True)
@@ -66,3 +69,30 @@ def test_render_uses_placement_and_synced_audio_on_real_media(tmp_path: Path) ->
     assert next(stream for stream in data["streams"] if stream["codec_type"] == "video")[
         "width"
     ] == 160
+
+
+def test_runtime_gpu_failure_rerenders_all_parts_on_cpu(tmp_path: Path) -> None:
+    project = Project(tmp_path, tmp_path / "work")
+    project.assets = [Asset("cam", Path("camera.mp4"), "video", AssetRole.CAMERA)]
+    project.assets[0].manual["media_info"] = {"width": 160, "height": 120, "fps": 25}
+    project.placements = [SourcePlacement("cam", 0, 0, 3)]
+    edit = EditMap("cut", (KeepRange(0, 1), KeepRange(2, 3)))
+    commands = []
+
+    def run(command):
+        commands.append(command.copy())
+        if len(commands) == 2:
+            raise RuntimeError("GPU disappeared")
+
+    with patch("studio.stages.program.select_encoder", side_effect=[
+        EncoderChoice("auto", "h264_nvenc", "probe passed"),
+        EncoderChoice("cpu", "libx264", "CPU requested"),
+    ]), patch("studio.stages.program._run_ffmpeg", side_effect=run):
+        report = render_project_program(project, edit, tmp_path / "out.mp4")
+    assert report["requested_encoder"] == "auto"
+    assert report["initial_codec"] == "h264_nvenc"
+    assert report["final_codec"] == "libx264"
+    assert report["runtime_fallback_reason"] == "GPU disappeared"
+    assert [cmd[cmd.index("-c:v") + 1] for cmd in commands] == [
+        "h264_nvenc", "h264_nvenc", "libx264", "libx264", "copy",
+    ]

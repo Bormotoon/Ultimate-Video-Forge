@@ -18,6 +18,7 @@ from studio.core.timeline import (
 )
 from studio.core.transcript import Segment, Transcript, Word
 from studio.stages.base import Decision, GpuUse, Requirement, StageContext, StageOutput
+from studio.stages.program_encoder import select_encoder
 
 
 class ProgramStage:
@@ -39,7 +40,7 @@ class ProgramStage:
         edit_path = _edit_path(project)
         edit = edit_path.read_text(encoding="utf-8") if edit_path.is_file() else ""
         return stable_fingerprint(
-            "program-v3", edit, project.placements, project.outputs.get("sync"),
+            "program-v4", edit, project.placements, project.outputs.get("sync"),
             [describe_artifact(project.work_dir, path)
              for key, paths in project.outputs.items() if key.startswith("sync:")
              for path in paths if path.is_file()],
@@ -59,16 +60,18 @@ class ProgramStage:
         output.parent.mkdir(parents=True, exist_ok=True)
         conf = context.settings.get("program", {})
         conf = conf if isinstance(conf, dict) else {}
-        render_project_program(
+        render_report = render_project_program(
             context.project, edit, output, encoder=str(conf.get("encoder", "auto")),
         )
         edited = map_transcript_to_edited(timeline, edit)
         edited_path = context.work_dir / "program" / "program.transcript.json"
         edited.save(edited_path)
+        report_path = output.with_name("render.json")
+        report_path.write_text(json.dumps(render_report, indent=2) + "\n", encoding="utf-8")
         transcripts = {**context.project.transcripts, "edited": edited_path}
-        outputs = {**context.project.outputs, "program": [output]}
+        outputs = {**context.project.outputs, "program": [output], "program_report": [report_path]}
         return StageOutput(
-            (output, edited_path), {"transcripts": transcripts, "outputs": outputs}
+            (output, edited_path, report_path), {"transcripts": transcripts, "outputs": outputs}
         )
 
 
@@ -136,14 +139,17 @@ def program_pieces(project: Project, edit: EditMap) -> list[ProgramPiece]:
 
 def render_project_program(
     project: Project, edit: EditMap, output: Path, *, encoder: str = "auto",
-) -> None:
+) -> dict[str, object]:
     pieces = program_pieces(project, edit)
     first = next(asset for asset in project.assets
                  if project.source_dir / asset.path == pieces[0].video)
     info = first.manual.get("media_info", {})
     width, height = int(info.get("width") or 1920), int(info.get("height") or 1080)
     fps = str(info.get("fps") or 25)
-    codec = "h264_nvenc" if encoder == "nvenc" else "libx264"
+    choice = select_encoder(encoder)
+    codec = choice.codec
+    fallback_reason = None
+    output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".render-", dir=output.parent) as temporary:
         directory = Path(temporary)
         for index, piece in enumerate(pieces):
@@ -166,13 +172,29 @@ def render_project_program(
                             "-map", "[v]", "-map", "[a]", "-c:v", codec,
                             "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le",
                             "-t", str(piece.duration_s), str(directory / f"part-{index}.mkv")])
-            _run_ffmpeg(command)
+            try:
+                _run_ffmpeg(command)
+            except RuntimeError as exc:
+                if encoder != "auto" or codec != "h264_nvenc":
+                    raise
+                # Regenerate every part to avoid joining different H.264
+                # parameter sets when hardware fails halfway through a job.
+                retry = render_project_program(project, edit, output, encoder="cpu")
+                retry.update({"requested_encoder": encoder, "initial_codec": choice.codec,
+                              "selection_reason": choice.reason,
+                              "runtime_fallback_reason": str(exc)[-2000:]})
+                return retry
         listing = directory / "parts.txt"
         listing.write_text("".join(f"file 'part-{index}.mkv'\n"
                                    for index in range(len(pieces))), encoding="utf-8")
         _run_ffmpeg(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat",
                      "-safe", "0", "-i", str(listing), "-c:v", "copy", "-c:a", "aac",
                      "-movflags", "+faststart", str(output)])
+    return {"schema_version": 1, "requested_encoder": encoder,
+            "initial_codec": choice.codec, "final_codec": codec,
+            "selection_reason": choice.reason, "runtime_fallback_reason": fallback_reason,
+            "width": width, "height": height, "fps": fps, "piece_count": len(pieces),
+            "duration_s": sum(piece.duration_s for piece in pieces)}
 
 
 def _run_ffmpeg(command: list[str]) -> None:
