@@ -68,7 +68,7 @@ class ExportStage:
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
-            "export-v3", project.assets, project.placements, project.audio_warp_maps,
+            "export-v4", project.assets, project.placements, project.audio_warp_maps,
             inputs, settings.get("export", {}), settings.get("roughcut", {}),
         )
 
@@ -82,6 +82,19 @@ class ExportStage:
         conf = conf if isinstance(conf, dict) else {}
         artifacts = []
         targets = conf.get("targets", ["fcpxml", "xmeml"])
+        if "multicam" in targets:
+            from studio.stages.multicam import write_multicam
+
+            camera_ids = {asset.id for asset in context.project.assets
+                          if asset.role is AssetRole.CAMERA}
+            if any(abs(item.k - 1) > 1e-9 for item in context.project.placements
+                   if item.asset_id in camera_ids):
+                raise ValueError("multicam export requires unretimed camera placements")
+            artifacts.append(write_multicam(
+                sequence, fcpxml.with_name(f"{sequence.name}-multicam.fcpxml"),
+                media_base=context.project.source_dir,
+                version=str(conf.get("fcpxml_version", "1.9")),
+            ))
         if "fcpxml" in targets:
             write_fcpxml(
                 sequence, fcpxml, media_base=context.project.source_dir,

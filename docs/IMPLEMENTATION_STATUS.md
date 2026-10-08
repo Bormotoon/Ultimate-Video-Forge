@@ -301,3 +301,16 @@ an actual Whisper/model/NLE end-to-end acceptance run.
   Full suite: 232 passed. Real gated model download, inference, GPU usage and
   speaker accuracy have not been exercised. Auto remains microphone-based;
   cross-file speaker identity matching and true NLE multicam export remain open.
+
+### FCPXML multicam writer
+
+- Added optional export.targets entry multicam, producing a separate
+  Studio-multicam.fcpxml with native multicam resources, angle lanes and
+  available-angle project selection. Synchronized voice is selected independently
+  of picture; repeated camera files share their lane and uncovered ranges are gaps.
+- Structural regression checks resources, repeated-angle clips, refs, video/audio
+  selections and coverage gaps. Full suite: 233 passed; changed-file Ruff and
+  diff checks pass. Final Cut/DTD acceptance has not been performed.
+- Camera placements with k != 1 are rejected for multicam until retiming support
+  exists. Speaker-driven NLE angle selection, ambience selection and actual
+  NLE import acceptance remain open; this is a first writer, not completed parity.

@@ -213,7 +213,7 @@ def validate_settings(settings: Settings) -> None:
         raise SettingsError("roughcut.silence_threshold_db must be between -100 and 0")
     if settings.roughcut.pause_keep_s >= settings.roughcut.pause_min_s:
         raise SettingsError("roughcut.pause_keep_s must be less than pause_min_s")
-    unknown = set(settings.export.targets) - {"fcpxml", "xmeml"}
+    unknown = set(settings.export.targets) - {"fcpxml", "xmeml", "multicam"}
     if unknown:
         raise SettingsError(f"export.targets contains unsupported values: {sorted(unknown)}")
 

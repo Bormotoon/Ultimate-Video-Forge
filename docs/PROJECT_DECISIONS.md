@@ -245,3 +245,11 @@ entry points and recorded project paths in the same change.
   clipped to timeline coverage. Intersecting speaker labels become overlap;
   raw turns and bounded subprocess logs are preserved. Labels are anonymous and
   local to this source, not matched to microphone names. Auto remains mics-only.
+
+- Optional export target multicam creates a separate FCPXML media/multicam
+  resource with mc-angle video/audio lanes and project mc-clip/mc-source angle
+  selection. Coverage partitions choose available video angles and corresponding
+  synchronized voice angles; uncovered picture ranges remain gaps. Existing
+  fcpxml/xmeml targets retain their behavior. Camera drift retiming is explicitly
+  rejected for this target until multicam time maps are implemented. This writer
+  is structurally tested, not yet validated by Final Cut import or an Apple DTD.
