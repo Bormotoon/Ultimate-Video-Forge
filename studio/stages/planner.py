@@ -37,9 +37,8 @@ def build_plan(
     only = only or set()
     skip = skip or set()
     discovery_complete = all(
-        stage_id not in {stage.id for stage in ordered}
-        or _manifest_path(project, stage_id).is_file()
-        for stage_id in DISCOVERY_STAGES
+        _reusable_manifest(project, stage.id, stage.fingerprint(project, settings))
+        for stage in ordered if stage.id in DISCOVERY_STAGES
     )
 
     for stage in ordered:
@@ -65,11 +64,9 @@ def build_plan(
                 decision = Decision.skip(f"dependency {failed_dependency} did not run")
 
         fingerprint = stage.fingerprint(project, settings)
-        manifest = _load_manifest(_manifest_path(project, stage.id))
         reuse = (
             decision.kind is DecisionKind.RUN
-            and manifest is not None
-            and manifest.reusable(project.work_dir, fingerprint)
+            and _reusable_manifest(project, stage.id, fingerprint)
         )
         planned.append(PlannedStage(stage.id, decision, fingerprint, reuse))
         decisions[stage.id] = decision
@@ -110,3 +107,12 @@ def _load_manifest(path: Path) -> StageManifest | None:
         return StageManifest.load(path)
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def _reusable_manifest(project: Project, stage_id: str, fingerprint: str) -> bool:
+    manifest = _load_manifest(_manifest_path(project, stage_id))
+    return (
+        manifest is not None
+        and manifest.stage == stage_id
+        and manifest.reusable(project.work_dir, fingerprint)
+    )

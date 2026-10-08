@@ -32,8 +32,8 @@ phase complete merely because a similarly named module exists.
 - No phase is closed. Phase 0 still requires the private acceptance recording
   and verified CI/installed-artifact checks. Prior task-list completion of
   phase 0 was premature.
-- Replace manifest-existence discovery checks with validated input revisions;
-  repair optional dependency propagation and include all source identities in
+- Discovery now requires matching stage identity, current fingerprint, successful
+   status, and verified artifacts. Repair optional dependency propagation and include all source identities in
   fingerprints. A completed prototype unit suite is not an end-to-end run.
 - Fix source selection/stream decoding and carry over Whisper OOM recovery.
   The current sync implementation fits one affine map even when labelled

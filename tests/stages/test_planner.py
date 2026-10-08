@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from studio.core.project import Project
+from studio.core.project import ArtifactStatus, Project, StageManifest, describe_artifact
 from studio.stages.base import Decision, GpuUse, Requirement, StageContext, StageOutput
 from studio.stages.planner import build_plan
 
@@ -33,7 +33,11 @@ def _project(tmp_path: Path) -> Project:
     work = tmp_path / "_studio"
     (work / "manifests").mkdir(parents=True)
     for name in ("discover", "scan", "prepare"):
-        (work / "manifests" / f"{name}.json").write_text("{}")
+        artifact = work / f"{name}.json"
+        artifact.write_text("{}")
+        StageManifest(
+            name, name, {}, [describe_artifact(work, artifact)], ArtifactStatus.OK, "test",
+        ).save(work / "manifests" / f"{name}.json")
     return Project(tmp_path, work)
 
 
@@ -60,3 +64,25 @@ def test_user_skip_propagates_to_required_dependency(tmp_path: Path) -> None:
 def test_cycles_are_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="cycle"):
         build_plan([_Stage("a", ("b",)), _Stage("b", ("a",))], _project(tmp_path), {})
+
+
+@pytest.mark.parametrize("damage", ["malformed", "stale", "wrong_stage", "failed", "artifact"])
+def test_invalid_discovery_blocks_main_plan(tmp_path: Path, damage: str) -> None:
+    project = _project(tmp_path)
+    path = project.work_dir / "manifests" / "scan.json"
+    if damage == "malformed":
+        path.write_text("{}")
+    elif damage == "artifact":
+        (project.work_dir / "scan.json").write_text("changed")
+    else:
+        manifest = StageManifest.load(path)
+        if damage == "stale":
+            manifest.fingerprint = "old-inputs"
+        elif damage == "wrong_stage":
+            manifest.stage = "prepare"
+        else:
+            manifest.status = ArtifactStatus.FAILED
+        manifest.save(path)
+    plan = build_plan([_Stage("scan"), _Stage("sync", ("scan",))], project, {})
+    assert not plan.stages[0].will_reuse
+    assert plan.stages[1].decision.reason == "discovery inputs are not finalized"
