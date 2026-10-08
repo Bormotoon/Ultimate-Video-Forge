@@ -66,4 +66,6 @@ Python 3.12 (CI: 3.10–3.13) · PyQt6 · faster-whisper (CTranslate2) · pyanno
 
 ## Лицензия
 
-Пока не выбрана: WhisperSync — PolyForm Noncommercial, Forge — MIT. Решение о лицензии объединённого репозитория фиксируется до публикации исходного кода (раздел 2 плана).
+MIT. Решения владельца и политика обновления технологий зафиксированы в
+[docs/PROJECT_DECISIONS.md](docs/PROJECT_DECISIONS.md). Лицензии сторонних ресурсов
+и уведомления исходных snapshot сохраняются отдельно.
