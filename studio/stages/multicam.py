@@ -3,11 +3,12 @@
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from studio.core.timeline import EditMap
 from studio.stages.export import Sequence, _frame_time, write_fcpxml
 
 
 def write_multicam(sequence: Sequence, output: Path, *, media_base: Path,
-                  version: str = "1.9") -> Path:
+                  version: str = "1.9", camera_plan: EditMap | None = None) -> Path:
     videos = [clip for clip in sequence.clips if clip.has_video]
     if not videos:
         raise ValueError("multicam requires video angles")
@@ -32,7 +33,10 @@ def write_multicam(sequence: Sequence, output: Path, *, media_base: Path,
     # Partition coverage so the project never selects an unavailable angle.
     boundaries = sorted({0.0} | {value for clip in sequence.clips
                                  for value in (clip.timeline_start_s,
-                                               clip.timeline_start_s + clip.duration_s)})
+                                               clip.timeline_start_s + clip.duration_s)} | {
+        value for item in (camera_plan.keep if camera_plan else ())
+        for value in (item.start_s, item.end_s)
+    })
     spine.remove(bed)
     for start, end in zip(boundaries, boundaries[1:], strict=False):
         if end <= start:
@@ -43,7 +47,10 @@ def write_multicam(sequence: Sequence, output: Path, *, media_base: Path,
             ET.SubElement(spine, "gap", offset=_frame_time(start, sequence.fps), start="0s",
                           duration=_frame_time(end - start, sequence.fps))
             continue
-        selected = available[0]
+        desired = (next((item.camera_id for item in camera_plan.keep
+                         if item.start_s <= start and item.end_s >= end), None)
+                   if camera_plan else None)
+        selected = next((clip for clip in available if clip.asset_id == desired), available[0])
         element = ET.SubElement(spine, "mc-clip", ref="mc-resource", name=sequence.name,
                                 offset=_frame_time(start, sequence.fps),
                                 start=_frame_time(start, sequence.fps),

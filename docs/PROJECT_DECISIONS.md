@@ -253,3 +253,11 @@ entry points and recorded project paths in the same change.
   fcpxml/xmeml targets retain their behavior. Camera drift retiming is explicitly
   rejected for this target until multicam time maps are implemented. This writer
   is structurally tested, not yet validated by Final Cut import or an Apple DTD.
+
+- Multicam project selection now reuses program.speaker_cameras/min_shot_s,
+  including explicit roughcut camera choices. Source-time decisions are mapped
+  across removed ranges into edited multicam time without removing alternative
+  angles. Export fingerprints speaker artifacts and program selection settings.
+- A generated multicam document passed xmllint against Apple's FCPXML 1.9 DTD
+  obtained from the CommandPost mirror. DTD validation checks structure, not
+  Final Cut playback, media relinking or actual angle-switch import acceptance.

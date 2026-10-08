@@ -2,6 +2,7 @@ import xml.etree.ElementTree as ET
 from fractions import Fraction
 from pathlib import Path
 
+from studio.core.timeline import EditMap, KeepRange
 from studio.stages.export import Sequence, SequenceClip, _parse_time
 from studio.stages.multicam import write_multicam
 
@@ -29,3 +30,41 @@ def test_multicam_resources_angles_selection_and_gap(tmp_path: Path) -> None:
     assert _parse_time(gap.get("duration")) == 1
     refs = {asset.get("id") for asset in root.findall("./resources/asset")}
     assert all(clip.get("ref") in refs for angle in angles for clip in angle)
+
+
+def test_multicam_selection_preserves_alternative_angles(tmp_path: Path) -> None:
+    sequence = Sequence("Demo", Fraction(25), 1920, 1080, (
+        SequenceClip("a", tmp_path / "a.mov", 0, 4, 0, 0, True),
+        SequenceClip("b", tmp_path / "b.mov", 0, 4, 0, 1, True),
+    ))
+    path = write_multicam(sequence, tmp_path / "selected.fcpxml", media_base=tmp_path,
+                          camera_plan=EditMap("plan", (KeepRange(0, 2, "a"),
+                                                       KeepRange(2, 4, "b"))))
+    root = ET.parse(path).getroot()
+    assert len(root.findall("./resources/media/multicam/mc-angle")) == 2
+    clips = root.findall(".//project/sequence/spine/mc-clip")
+    assert [clip.find("mc-source").get("angleID") for clip in clips] == ["angle-1", "angle-2"]
+
+
+def test_speaker_plan_is_mapped_across_removed_ranges(tmp_path: Path) -> None:
+    import json
+
+    from studio.core.project import Asset, AssetRole, Project
+    from studio.core.timeline import SourcePlacement
+    from studio.stages.export import multicam_camera_plan
+
+    project = Project(tmp_path, tmp_path / "work")
+    project.assets = [Asset("a", Path("a.mov"), "video", AssetRole.CAMERA),
+                      Asset("b", Path("b.mov"), "video", AssetRole.CAMERA)]
+    project.placements = [SourcePlacement("a", 0, 0, 10), SourcePlacement("b", 0, 0, 10)]
+    speakers = tmp_path / "speakers.json"
+    speakers.write_text(json.dumps([{"start": 0, "end": 5, "speaker": "Alice"},
+                                    {"start": 5, "end": 10, "speaker": "Bob"}]))
+    edit = tmp_path / "edit.json"
+    edit.write_text(json.dumps({"mode": "cut", "keep": [{"start": 0, "end": 2},
+                                                         {"start": 6, "end": 8}]}))
+    project.outputs = {"roughcut": [edit], "speakers": [speakers]}
+    sequence = Sequence("Demo", Fraction(25), 1920, 1080, ())
+    plan = multicam_camera_plan(project, {"program": {"speaker_cameras": {
+        "Alice": "a", "Bob": "b"}, "min_shot_s": 0}}, True, sequence)
+    assert plan.keep == (KeepRange(0, 2, "a"), KeepRange(2, 4, "b"))

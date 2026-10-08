@@ -314,3 +314,14 @@ an actual Whisper/model/NLE end-to-end acceptance run.
 - Camera placements with k != 1 are rejected for multicam until retiming support
   exists. Speaker-driven NLE angle selection, ambience selection and actual
   NLE import acceptance remain open; this is a first writer, not completed parity.
+
+### Speaker-selected multicam continuation
+
+- Multicam export now consumes program speaker/camera mappings, minimum shot
+  settings and explicit roughcut camera choices. Selection maps from source
+  timeline to edited timeline while retaining all alternative angle resources.
+- Two new regressions verify alternative-angle preservation and selection across
+  removed spans. A generated document passed xmllint validation against Apple's
+  FCPXML 1.9 DTD from the CommandPost mirror (external temporary validation asset).
+- Final Cut import/playback, camera retiming and ambience selection remain open.
+- Full regression run: 235 passed; changed-file Ruff and `git diff --check` pass.

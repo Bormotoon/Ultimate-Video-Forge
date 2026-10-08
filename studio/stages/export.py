@@ -48,8 +48,8 @@ class Sequence:
 class ExportStage:
     id = "export"
     title = "NLE export"
-    after: tuple[str, ...] = ("timeline", "roughcut")
-    optional_after = ("roughcut",)
+    after: tuple[str, ...] = ("timeline", "roughcut", "speakers")
+    optional_after = ("roughcut", "speakers")
     gpu = GpuUse.NONE
 
     def requirements(self, settings: dict[str, object]) -> list[Requirement]:
@@ -64,12 +64,13 @@ class ExportStage:
         inputs = [
             describe_artifact(project.work_dir, path)
             for key, paths in project.outputs.items()
-            if key.startswith(("sync:", "ambience:")) or key == "roughcut"
+             if key.startswith(("sync:", "ambience:")) or key in {"roughcut", "speakers"}
             for path in paths if path.is_file()
         ]
         return stable_fingerprint(
-            "export-v4", project.assets, project.placements, project.audio_warp_maps,
+            "export-v5", project.assets, project.placements, project.audio_warp_maps,
             inputs, settings.get("export", {}), settings.get("roughcut", {}),
+            settings.get("program", {}),
         )
 
     def run(self, context: StageContext) -> StageOutput:
@@ -94,6 +95,8 @@ class ExportStage:
                 sequence, fcpxml.with_name(f"{sequence.name}-multicam.fcpxml"),
                 media_base=context.project.source_dir,
                 version=str(conf.get("fcpxml_version", "1.9")),
+                camera_plan=multicam_camera_plan(context.project, context.settings,
+                                                bool(use_edit), sequence),
             ))
         if "fcpxml" in targets:
             write_fcpxml(
@@ -106,6 +109,40 @@ class ExportStage:
             artifacts.append(xmeml)
         outputs = {**context.project.outputs, "export": artifacts}
         return StageOutput(tuple(artifacts), {"outputs": outputs})
+
+
+def multicam_camera_plan(project: Project, settings: dict, use_edit: bool,
+                        sequence: Sequence) -> EditMap | None:
+    from studio.stages.camera_selection import speaker_camera_edit
+    from studio.stages.program import load_edit_map
+
+    conf = settings.get("program", {})
+    mapping = conf.get("speaker_cameras", {})
+    paths = project.outputs.get("roughcut", [])
+    edit = None
+    if use_edit and paths and paths[0].is_file():
+        if json.loads(paths[0].read_text(encoding="utf-8")).get("mode") == "cut":
+            edit = load_edit_map(paths[0])
+    if not mapping and not (edit and any(item.camera_id for item in edit.keep)):
+        return None
+    if edit is None:
+        end = max(clip.timeline_start_s + clip.duration_s for clip in sequence.clips)
+        edit = EditMap("uncut", (KeepRange(0, end),))
+    turns = []
+    if mapping:
+        speakers = project.outputs.get("speakers", [])
+        if not speakers or not speakers[0].is_file():
+            raise ValueError("multicam speaker selection requires speakers output")
+        turns = json.loads(speakers[0].read_text(encoding="utf-8"))
+    plan = speaker_camera_edit(project, edit, turns, mapping,
+                               min_shot_s=float(conf.get("min_shot_s", 1)))
+    # Keep all source angles; only project selection is mapped to edited time.
+    ranges = []
+    for item in plan.keep:
+        start = timeline_to_edited(item.start_s, edit)
+        if start is not None:
+            ranges.append(KeepRange(start, start + item.end_s - item.start_s, item.camera_id))
+    return EditMap("multicam-selection", tuple(ranges))
 
 
 def build_sequence(project: Project, name: str = "Studio", *, use_edit: bool = True) -> Sequence:
