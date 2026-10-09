@@ -10,7 +10,10 @@ Confirmed by the project owner on 2026-10-08.
   are deferred until the local workflow can be tested end to end.
 - Original WhisperSync and Podcast Reels Forge repositories are left untouched.
   No feature freeze or archival changes are applied to them.
-- Subtitle editor: system browser first; embedded browser integration later.
+- Subtitle editor (owner correction, 2026-10-09): implement inside the existing
+  PyQt GUI with native Qt controls and video preview. Save project settings and
+  subtitle edits through the application; no separate browser interface or
+  File System Access API dependency. This supersedes the browser-first decision.
 - Technology policy: prefer the newest stable releases compatible with the
   actual dependency stack and verified processing workflow. Evaluate Python
   3.14 and current Qt/CTranslate2/torch releases before adopting them; retain
@@ -34,6 +37,33 @@ namespace and old commands during migration to avoid invalidating subprocess
 entry points and recorded project paths in the same change.
 
 ## Autonomous implementation decisions (2026-10-08)
+
+### Text-output migration (2026-10-09)
+
+- Text generation is opt-in (`text.proofread` and `text.article` both default to
+  `false`), so a normal local edit never starts an LLM service unexpectedly.
+- Corrected transcript segments retain original ASR word timings and record an
+  explicit text override. This preserves subtitle/export compatibility without
+  falsely claiming word-level realignment; a future alignment pass may replace
+  those timings under the same artifact contract.
+- A failed proofread batch leaves its source text unchanged. An article chunk
+  that fails the faithfulness guardrail is published with its diagnostic report,
+  rather than silently presented as a faithful edit.
+
+### Unattended batch safety (2026-10-09)
+
+- `uvf batch` runs project folders sequentially through the normal locked
+  pipeline and reports each result. It intentionally exposes no arbitrary
+  before/after shell hooks until an allowlist and explicit permission contract
+  exist; an unattended helper must not be able to terminate or modify unrelated
+  local processes.
+
+### YouTube source safety (2026-10-09)
+
+- `uvf fetch URL DESTINATION` accepts only a new or empty material directory,
+  downloads exactly one source plus its metadata without shell execution, then
+  runs the standard scan. A remote URL is never mixed into an existing local
+  shoot or allowed to overwrite user media.
 
 - Continue in dependency order: reliable execution, source decoding, synchronized
   export, then remaining sync modes, editing/program, speakers, Forge stages,

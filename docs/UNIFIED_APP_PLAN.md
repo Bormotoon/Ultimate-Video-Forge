@@ -1,6 +1,6 @@
 # План: одно десктопное приложение из WhisperSync и Podcast Reels Forge
 
-> Черновик от 2026-10-05. Рабочее имя приложения — **Studio**, имя пакета — `studio`. И то и другое заглушки: настоящее название пока не выбрано (см. [раздел 2](#2-открытые-решения)), и при выборе имени их заменяют одной автозаменой.
+> Исходный план от 2026-10-05; актуальная сверка реализации — 2026-10-10. Продукт — **Ultimate Video Forge**, публичная команда — `uvf`. Внутренний пакет `studio` сохранён для совместимости. Решения владельца в `docs/PROJECT_DECISIONS.md` имеют приоритет.
 >
 > Исходные проекты: [WhisperSync](https://github.com/Bormotoon/WhisperSync) (0.1.0, локально `/home/borm/VibeCoding/WhisperSync`) и Podcast Reels Forge (1.4.x, этот репозиторий).
 
@@ -102,9 +102,11 @@
 `docs/PROJECT_DECISIONS.md` и имеют приоритет над рекомендациями таблицы:
 MIT, Ultimate Video Forge, разработка в `/srv/storage/docs/Ultimate-Video-Forge/`,
 приёмка сначала на текущем Linux, исходные репозитории не изменяем,
-редактор субтитров в системном браузере. Предпочитаем самые свежие стабильные
-технологии после проверки совместимости; Python 3.12 пока остаётся проверенной
-базой, переход на 3.14 требует отдельной проверки зависимостей.
+редактор субтитров внутри существующего PyQt GUI (уточнение владельца от 2026-10-09).
+Предпочитаем самые свежие стабильные
+технологии после проверки совместимости; Python 3.12 остаётся целевой release-базой.
+Текущие локальные тесты/сборка выполнены на Python 3.10.20; квалификация установленного
+артефакта на 3.12 и переход на 3.14 требуют отдельных проверок.
 
 План ниже исходит из рекомендованного варианта. Последний столбец — что изменится, если выбрать иначе.
 
@@ -114,8 +116,8 @@ MIT, Ultimate Video Forge, разработка в `/srv/storage/docs/Ultimate-V
 | 2 | Лицензия | Решать тебе. Юридически можно любую: WhisperSync целиком твой, а MIT разрешает включать код Forge. | PolyForm Noncommercial закрывает коммерческое использование. MIT открывает и код синхронизации. На код и план это не влияет, меняются только `LICENSE` и `pyproject.toml`. |
 | 3 | Mac | **Синхронизация, транскрипт, черновой монтаж и экспорт — везде. Рилсы и всё на torch — только с NVIDIA.** | Полная поддержка Mac потребует Whisper через MLX и рендер без NVENC (VideoToolbox) — это отдельная фаза после 7. |
 | 4 | Старые репозитории | **Заморозка функций сейчас, только исправления ошибок.** Архивировать WhisperSync после фазы 2, Forge — после фазы 5, когда новый догонит их по возможностям. | Если развивать параллельно, каждую фичу придётся переносить дважды. |
-| 5 | Название | — | Автозамена `studio` → новое имя. |
-| 6 | Редактор субтитров | **Сначала открывать в системном браузере**, как сейчас. Встраивание через QWebEngineView — позже. | Сразу встраивать — +PyQt6-WebEngine (около 100 МБ) в базовую установку. |
+| 5 | Название | **Ultimate Video Forge**, distribution `ultimate-video-forge`, CLI `uvf`; внутренний `studio` сохраняется для совместимости. | Смена внутреннего namespace не требуется для публичного имени. |
+| 6 | Редактор субтитров | **Внутри существующего PyQt GUI:** нативные Qt-контролы, видеопредпросмотр, сохранение через приложение. Решение владельца от 2026-10-09. | Веб-реализация Forge остаётся источником поведения и пресетов для переноса. |
 | 7 | Версия Python | **3.12** для основного окружения. CI — 3.10–3.13. | 3.13+ — нужно сверить совместимость с torch и pyannote. |
 
 ---
@@ -825,7 +827,7 @@ compute:    {allow_cpu: false}
 | `utils/logging_utils.py` | `core/logging.py` | заменить | |
 | `prompts/{ru,en}/*` | `resources/prompts/{ru,en}/` | как есть | |
 | `assets/fonts/*` (+ licenses), `assets/models/*` | `resources/fonts/`, `resources/models/` | как есть | модели — кандидаты на скачивание при первом запуске, а не в репозитории |
-| `assets/subtitles/style-editor.html`, `gui/assets/editor.js`, `editor.css`, `subtitle-presets.js`, `gui/subtitles.html` | `resources/subtitle_editor/` | адаптировать | открывается из приложения в браузере; читает и пишет раздел `reels.subtitles` |
+| `assets/subtitles/style-editor.html`, `gui/assets/editor.js`, `editor.css`, `subtitle-presets.js`, `gui/subtitles.html` | `gui/`, `resources/` | перенести поведение и пресеты | нативный редактор внутри PyQt GUI; читает и пишет раздел `reels.subtitles` и правки субтитров через приложение |
 | `gui/*.html`, `gui/assets/app.js`, `app.css` (сборщик `config.yaml`) | — | не переносить | заменяется экраном настроек в Qt |
 | `tests/*` (620 тестов в проверенном дереве) | `tests/text`, `tests/reels`, `tests/speakers`, `tests/fetch`, `tests/core`, `tests/llm` | адаптировать через фасады | `test_pipeline.py`, `test_pipeline_efficiency.py`, `test_unattended_runs.py`, `test_stage_decisions.py` переписываются под планировщик и исполнитель |
 | `docs/USER_GUIDE.md`, `CONFIGURATION.md`, `AUTONOMOUS.md`, `PROMPTS.md`, `DEVELOPMENT.md` | `docs/` | адаптировать | конфигурация — под новые разделы, AUTONOMOUS → `batch` |
@@ -876,23 +878,52 @@ compute:    {allow_cpu: false}
 
 После каждой фазы есть работающее приложение. Фаза закрыта, когда выполнены все критерии готовности.
 
+### Актуальный срез — 2026-10-09
+
+Галочки ниже относятся к выполнению конкретной задачи, а не к приёмке всей фазы.
+Обозначения: `[x]` — реализация выполнена в указанном объёме; `[ ] Частично` —
+есть реализация, но перечисленный остаток не закрыт; `[ ] Не выполнено` — работы
+ещё нет; `[ ] Приёмка` — требуется проверка на модели/реальном материале/внешнем ПО.
+Любая частичная задача содержит явное описание недоделанного.
+Незакрытая задача может быть частично реализована: оставшаяся часть указана в таблице.
+Подробный актуальный backlog и доказательства — в начале `docs/IMPLEMENTATION_STATUS.md`;
+его последующий журнал хранит исторические, а не текущие списки пробелов.
+
+| Фаза | Текущее состояние | Что мешает закрытию |
+|---|---|---|
+| 0 | Истории, snapshots/patch, фикстуры и локальные сборки есть | CI/чистая установка, реальная запись, квалификация Python 3.12 |
+| 1 | Каркас и локальный pipeline реализованы | Полная golden-регрессия и сквозная GUI/CLI приёмка |
+| 2 | Режимы sync, voice/warp, FCPXML/XMEML и ручные роли есть | RecorderTrack UI/паритет потоков, раздельные сессии, реальный импорт NLE |
+| 3 | Паузы/дубли, решения, аудиопрослушивание через master и CFR-мастер есть | Полнота cut preview, независимый от master preview, стыки звука и реальная проверка слов |
+| 4 | Mics/pyannote facade, выбор камер и multicam есть | Полнота GUI привязок, нелинейная mic-карта, модели и NLE приёмка |
+| 5 | Тексты/term-check, role routing, рилсы/аудиокэш, captions/editor, vision, fetch и channel/batch есть | Raw warp replay, полная legacy compatibility, внешние уведомления, отмена загрузок, phase-wide reuse и Forge-регрессия |
+| 6 | Модули, YuNet/Light-ASD, мастер настройки, GGUF picker и Linux frozen есть | LLM-монтаж, загрузка Whisper/GGUF, измеряемое tuning, production installers |
+| 7 | Последующая дорожная карта | Не блокирует первоначальный локальный выпуск |
+
+**Ни одна фаза ещё не закрыта по всем критериям приёмки.** Текущая база —
+410 passed, 2 skipped на Python 3.10.20; Linux installed/frozen smoke проходит, включая
+CLI/worker/resources и offscreen GUI startup. Это не все исходные 403 + 620 тестов,
+не реальный ML-прогон, не NLE-приёмка и не чистая установка. Python 3.12 — целевая
+release-база, её квалификация в этом окружении ещё нужна. Linux приоритетен;
+остальные ОС следуют после сквозной локальной проверки по решению владельца.
+
 ### Фаза 0. Подготовка и фиксация исходного состояния
 
 **Задачи:**
 
 - [x] Принять решения из раздела 2. См. `docs/PROJECT_DECISIONS.md`.
 - [x] Определить политику исходных репозиториев: по решению владельца не изменяем их; разработка только в Ultimate Video Forge.
-- [ ] Зафиксировать `HEAD`, Python, lock-файлы и статус рабочих деревьев обоих проектов. Для WhisperSync сохранить patchset незакоммиченных файлов отдельным patch-файлом и принять решение: закоммитить его в исходнике или перенести вручную до subtree.
+- [x] Snapshot manifest фиксирует HEAD/окружения/состояние исходников; WhisperSync patch сохранён с SHA256, отдельные lock-файлы присутствуют. Исторический импорт описан в `docs/source-snapshots/README.md`; исходники теперь не меняем.
 - [x] Создать репозиторий и импортировать оба проекта с историей: реализация Studio импортирована merge с сохранением обоих subtree и исходной истории Ultimate Video Forge.
   ```bash
   git init studio && cd studio && git commit --allow-empty -m "chore: start"
   git subtree add --prefix=legacy/whispersync /home/borm/VibeCoding/WhisperSync main
   git subtree add --prefix=legacy/forge "/srv/storage/docs/Podcast Reels Forge" main
   ```
-- [ ] CI: оба набора тестов запускаются в своих каталогах без изменений; зафиксировать отдельные lock-файлы для Python 3.12 и smoke-матрицу 3.10–3.13. Не заявлять Python 3.14, пока torch/pyannote/Qt не проверены.
-- [ ] Добавить smoke build wheel и PyInstaller в первую CI-фазу; отдельно проверить ресурсы QSS, prompts, fonts, subtitle editor и поздние импорты из установленного артефакта.
-- [ ] Скрипт `tools/make_fixtures.py`: синтетический проект из двух «камер» и рекордера. Речь — локальный TTS (espeak-ng или Piper), дрейф — `asetrate` на 0.05–0.1 %, сдвиг, глава GoPro, пауза, повтор фразы (для дублей). Небольшой, детерминированный, без чужих записей.
-- [ ] Выбрать реальную запись ПедОбраза для приёмки (не в репозиторий): 2 камеры + рекордер, 20–40 минут.
+- [ ] **Частично:** CI definitions и отдельные locks есть. Не доделано: подтверждённый запуск обоих legacy suites и smoke-матрицы 3.10–3.13; Python 3.14 не квалифицирован.
+- [ ] **Частично:** wheel/frozen build и same-host installed resources/CLI/GUI smoke выполнены. Не доделано: подтверждённый CI и чистое окружение, реальные поздние ML-импорты.
+- [x] Скрипт `tools/make_fixtures.py`: детерминированный синтетический проект с двумя камерами, рекордером, речью, дрейфом, сдвигом, главой GoPro, паузой и повтором фразы. Локально генерируется; сквозной ML-прогон в CI ещё нужен.
+- [ ] **Приёмка:** выбрать приватную запись 20–40 минут (2 камеры + рекордер); в workspace пока не выбрана.
 
 **Готово, когда:** исходные тесты зелёные (текущая фактическая база 403 + 620), patchset WhisperSync учтён, фикстуры генерируются одной командой, а wheel/PyInstaller smoke-тесты проходят на чистом окружении.
 
@@ -903,17 +934,17 @@ compute:    {allow_cpu: false}
 
 **Задачи:**
 
-- [ ] Сначала написать characterization/golden-тесты для текущих FCPXML, transcript JSON, fingerprints, lock/cancel и ошибок subprocess. Только после этого переносить реализации.
-- [ ] `core/`: новые `project.py`, `timeline.py` с `SourcePlacement`, `AudioWarpMap`, `EditMap`, schema-version и manifest; перенос существующих модулей через фасады.
-- [ ] `stages/base.py`, `discover.py`, `planner.py`, `runner.py`, `worker.py`, `events.py` — с двухфазным планированием и атомарной публикацией с самого начала.
-- [ ] `scan` v1: подпапки, шаблоны имён, теги, главы, роли.
-- [ ] `transcribe`: `WhisperEngine` из WhisperSync, выбор файлов по `decide()`.
-- [ ] `prepare` + `transcribe`: полный набор нужных файлов фиксируется до исполнения.
-- [ ] `sync`: режим `complex` с сохранением текущего поведения WhisperSync; результат публикуется как `SourcePlacement` + `AudioWarpMap`.
-- [ ] `export`: сначала нейтральный `Sequence`, затем FCPXML-адаптер; старый `SyncPlan` допускается только внутри compatibility facade.
-- [ ] `gui`: экраны «Старт» (выбор или перетаскивание папки), «Материал» (только просмотр), «План», «Работа» (прогресс, таймлайн, лог, отмена), «Результат»; `bridge.py` на QProcess.
-- [ ] `cli`: `scan`, `plan`, `run`, `doctor`.
-- [ ] Перенос тестов WhisperSync в новую структуру; legacy-код оставить до прохождения golden-регрессии.
+- [ ] **Частично:** characterization для transcript/export, fingerprints, locks/processes и PCM parity есть. Не доделано: полная golden-матрица исходных workflow и сравнение на реальной записи.
+- [x] `core/`: `Project`, `SourcePlacement`, `AudioWarpMap`, `EditMap`, schema-version и проверяемые manifests реализованы; полный legacy-паритет проверяется отдельно.
+- [x] Stage API, discover/planner/runner/worker/events: повторное планирование, приватные worker-результаты, проверка артефактов, публикация с rollback journal и recovery. Это восстанавливаемая многофайловая публикация, а не одновременная видимость всех файлов.
+- [x] `scan` v1: подпапки, шаблоны имён, теги, главы, роли и сохранение ручных overrides.
+- [x] `transcribe`: Whisper facade, выбор входов, явный поток, content cache, OOM-лестница. Реальный модельный прогон остаётся приёмкой.
+- [x] `prepare` + `transcribe`: нужные входы объявляются планировщиком, effective settings сохраняются для worker.
+- [ ] **Частично:** `sync complex` planner/renderer, voice WAV, warp maps и PCM parity реализованы. Не доделано: полный characterization и реальная WhisperSync-регрессия.
+- [x] Нейтральный `Sequence` и FCPXML/XMEML адаптеры реализованы; экспорт синхронизированного звука, rates/channels/roles покрыт локальными регрессиями. NLE-приёмка отдельно.
+- [ ] **Частично:** Qt-экраны/bridge, запуск/лог/отмена/Material и Settings dirty guards есть. Не доделано: drag/drop, полный timeline preview и визуальная/клавиатурная приёмка.
+- [x] `cli`: `scan`, `plan`, `run`, `doctor` (публичный entry point `uvf`).
+- [ ] **Частично:** перенесены выбранные регрессии. Не доделано: весь baseline suite и golden parity; legacy сохраняется.
 
 **Готово, когда:**
 
@@ -926,15 +957,15 @@ compute:    {allow_cpu: false}
 
 **Задачи:**
 
-- [ ] Реализовать `AudioWarpMap` для strategy 1/2/3; `k ≈ 1` — только оптимизация, а не изменение семантики результата.
-- [ ] Режимы `camera`, `simple`, `auto` (правило из 5.3), экспорт без рендера только при доказанном безопасном source-reference.
-- [ ] Размещение камер относительно друг друга без рекордера.
-- [ ] Этап `timeline` (транскрипт таймлайна без повторного Whisper) через `SourcePlacement`; для рендер-таймингов использовать warp map.
-- [ ] Из Forge `transcribe_stage.py`: разбиение `.srt` по предложениям, уверенность сегментов, глоссарий → `hotwords`/`initial_prompt`.
-- [ ] `export/sequence.py`; FCPXML переводится на `Sequence`; `xmeml.py` + круговые тесты.
-- [ ] Экран «Материал» становится редактируемым (перетаскивание между группами, роли, имена), правки переживают повторный скан.
-- [ ] Многодорожечные рекордеры в скане (`RecorderTrack`).
-- [ ] Границы `AudioWarpMap` проверяются на непрерывность и отсутствие перекрытий.
+- [x] `AudioWarpMap` и preserved strategy 1/2/3 planner/renderer реализованы; приближённый k не заменяет кусочную модель. Реальный полный parity — отдельная приёмка.
+- [ ] **Частично:** camera/simple/auto и acoustic fallback реализованы. Не доделано: полный паритет selection/source-reference и раздельные сессии записи.
+- [x] Camera-only acoustic placement реализован и проверен generated-audio regression.
+- [x] Timeline transcript строится через placement без повторного Whisper; синхронизированный voice имеет отдельные warp/rendered contracts.
+- [ ] **Частично:** transcript/SRT, confidence и initial_prompt есть. Не доделано: подтверждённый полный sentence/glossary/hotwords parity Forge.
+- [x] Sequence → FCPXML/XMEML, структурные/interval regression tests реализованы. Реальный NLE импорт не закрыт этой отметкой.
+- [ ] **Частично:** роли/группы/device редактируются и переживают rescan. Не доделано: drag/drop групп, полнота naming/channel UX.
+- [ ] **Частично:** stream/channel metadata и явные mic tracks есть. Не доделано: отдельная RecorderTrack модель и полноценный GUI выбора дорожек.
+- [x] Typed warp validation проверяет порядок/перекрытия/покрытие согласно контракту; tests присутствуют.
 
 **Готово, когда:**
 
@@ -946,13 +977,13 @@ compute:    {allow_cpu: false}
 
 **Задачи:**
 
-- [ ] `core/audio_spans.py` (общие паузы и энергия).
-- [ ] `roughcut`: паузы, дубли, начало и конец — режут; паразиты и нераспознанные звуки — маркеры.
-- [ ] `EditList`, режимы `cut` и `markers`; экспорт резов и маркеров в оба формата; пробный `disable` на реальном импорте.
-- [ ] `program`: черновой мастер, транскрипт мастера.
-- [ ] Экран «Решения монтажа»: список резов, прослушивание, принять или отклонить, переэкспорт без пересчёта.
-- [ ] `timeline_preview` показывает резы.
-- [ ] Проверка `keep_fillers` (влияние `initial_prompt` на «ээ»/«мм») на реальной записи.
+- [x] Общие word-gap/silence span utilities и energy-gated roughcut реализованы.
+- [ ] **Частично:** pauses/head/tail/retakes и filler markers есть. Не доделано: полный набор unknown-sound detectors и реальные preset/listening проверки.
+- [ ] **Приёмка:** cut/markers и XML reasons реализованы; не проверены disable/видимость/семантика в реальном NLE.
+- [x] `program`: placement-aware мастер с выбранными камерами и синхронизированным звуком, CFR и отображением транскрипта на фактические кадровые интервалы. Приёмка стыков/длинного A/V отдельно.
+- [ ] **Частично:** accept/reject и audio audition с контекстом через timeline master реализованы. Не доделано: preview без master, реальное прослушивание и сквозная проверка переэкспорта.
+- [ ] **Не выполнено:** полноценный timeline cut preview; список решений не заменяет его.
+- [ ] **Приёмка:** keep_fillers/initial_prompt на реальной записи не проверены.
 
 **Готово, когда:**
 
@@ -964,11 +995,11 @@ compute:    {allow_cpu: false}
 
 **Задачи:**
 
-- [ ] `speakers`: `mics` (новое), `pyannote` (перенос), `turns` (перенос), имена спикеров вручную.
-- [ ] Привязка камера ↔ спикер и «общий план» на экране «Материал».
-- [ ] Правила переключения камер (5.6), `KeepRange.camera_id`.
-- [ ] FCPXML: мультикам-клип (`mc-clip`), переключение ракурсов в Final Cut работает. xmeml: «стопка» дорожек.
-- [ ] `program` учитывает выбранную камеру.
+- [ ] **Частично:** mics/smoothing/pyannote facade есть. Не доделано: turns/manual naming parity, cross-file identity, nonlinear mic attribution и real model acceptance.
+- [ ] **Частично:** speaker-camera mapping доступен через настройки. Не доделано: нативные Material controls и отдельная политика общего плана.
+- [ ] **Частично:** camera_id, minimum shot, coverage fallback и manual precedence реализованы. Не доделано: полный набор правил 5.6 и реальная оценка переключений.
+- [ ] **Приёмка:** retimed multicam/voice/ambience/speaker selection и XMEML lanes реализованы, generated FCPXML прошёл 1.9 DTD. Не проверены импорт/переключение/playback в NLE.
+- [x] `program` учитывает выбранную камеру, ручные решения и speaker-camera mapping с проверкой покрытия.
 
 **Готово, когда:** запись «2 камеры + 2 петлички» даёт в Final Cut мультикам с разумными переключениями, и ракурс на любом куске меняется штатно (клавишами или в инспекторе).
 
@@ -976,14 +1007,14 @@ compute:    {allow_cpu: false}
 
 **Задачи:**
 
-- [ ] `llm/` (провайдеры, схемы, сервер, сессия) — перенос.
-- [ ] `text`: вычитка, статья, `term_check` — перенос, `run(ctx)`.
-- [ ] `reels-select`: `analyze_stage` + `analysis/` — перенос; fingerprint включает транскрипт, диаризацию, метаданные, prompts, role/model mapping, настройки и доступное source audio.
-- [ ] `reels-render`: `video_processor` + субтитры + `vision/` — перенос; вход — `program.mp4` или исходный video asset с явным `EditMap`, без фиктивного обязательного рендера.
-- [ ] `fetch` (YouTube) — перенос; проект из ссылки.
-- [ ] `cli batch` (из `autonomy.py`): очередь проектов или канал, отчёты, уведомления, коды возврата для планировщика; хуки `before_*`/`after_*`; перевод `local/forge-local.sh` и `forge-night.sh` на новый CLI.
-- [ ] Редактор субтитров из приложения (браузер).
-- [ ] Перенос тестов Forge, удаление `legacy/forge`.
+- [ ] **Частично:** provider/cache/session/retries/role routing есть. Не доделано: полная legacy settings/schema compatibility и phase-wide model reuse.
+- [x] Вычитка/realignment, статья и term-check интеграция реализованы: ручные offline fixes, отдельный network opt-in, кэш и отчёт. Реальная приёмка отдельно.
+- [ ] **Частично:** verified selection/refine/judge/ranking/context, role routing и content-based audio probes/cache реализованы. Voice/placement/edited mapping позволяют работать без постоянного мастера/program. Не доделано: raw warp replay без voice artifacts, полный legacy settings и moments golden parity.
+- [ ] **Частично:** source/program reels, captions и isolated tracking/fallback есть. Не доделано: полный render parity, реальные vision/frozen inference и визуальная приёмка.
+- [x] `fetch`: single URL в новую/пустую папку с metadata. Channel discovery/acquisition также реализован; реальная загрузка и night-run — отдельная приёмка.
+- [ ] **Частично:** project/channel queue, atomic reports, queue_finished event, resume и night helper реализованы. Не доделано: внешние уведомления, mid-download cancellation, phase-wide reuse и overnight acceptance. Shell hooks отложены по PROJECT_DECISIONS.md.
+- [x] Нативный редактор субтитров внутри PyQt GUI с видео/overlay, правкой текста/таймингов/стилей и публикацией JSON/SRT/ASS. Визуальная приёмка отдельно.
+- [ ] **Частично:** выбранные Forge regressions перенесены. Не доделано: все 620 baseline tests и golden workflow parity; legacy не удаляем до подтверждения.
 
 **Готово, когда:**
 
@@ -996,22 +1027,22 @@ compute:    {allow_cpu: false}
 
 **Задачи:**
 
-- [ ] LLM-детекторы чернового монтажа: лучший дубль по подаче, оговорки, начало разговора, паразиты по смыслу. По образцу `scout → cleanup → judge`: JSON-грамматика, сверка с транскриптом, кэш ответов.
-- [ ] `modules/manager.py` + рецепты; экран «Модули» в настройках; блокировки этапов со ссылкой «установить модуль».
-- [ ] Скачивание моделей (Whisper, YuNet, Light-ASD, GGUF) при первом использовании с прогрессом.
-- [ ] Установщики PyInstaller под Linux, Windows и macOS (базовая часть); мастер первого запуска (ffmpeg, CUDA, модули).
-- [ ] Автонастройка Whisper по видеопамяти (как `_autotune_llama_cpp_conf`).
+- [ ] **Не выполнено:** LLM-детекторы монтажа (подача дубля, оговорки, начало разговора, смысловые паразиты) с JSON/evidence guardrails.
+- [ ] **Частично:** modules manager/recipes/GUI/progress/cancel/locks есть. Не доделано: полнота stage → install navigation и реальные ML установки/запуски.
+- [ ] **Частично:** YuNet/Light-ASD SHA256 downloads и local GGUF picker есть. Не доделано: managed Whisper/GGUF download и first-use workflow.
+- [ ] **Частично:** Linux frozen, setup wizard и local install script (binary/link/desktop entry) есть; same-host installed smoke пройден. Не доделано: dependency bundling, clean-machine/Python 3.12 и Windows/macOS; бинарник требует rebuild после последних guards.
+- [ ] **Частично:** compute probe/recommendations есть. Не доделано: измеряемое memory/performance autotuning Whisper/llama.
 
 **Готово, когда:** на чистой машине установщик → первый запуск → проект из фикстур проходит без ручной установки чего-либо, кроме драйвера NVIDIA.
 
 ### Фаза 7. Дальше (по приоритету)
 
-- Рилсы из исходников: ракурс камеры спикера, а не кроп мастера.
-- Авто-привязка камер к спикерам (`vision/`).
-- Экспорт OTIO (DaVinci Resolve).
-- Mac: Whisper через MLX, рендер через VideoToolbox.
-- Встраивание редактора субтитров (QWebEngineView).
-- Пробелы из обзора конкурентов: нормализация громкости −14 LUFS, обложки, крючок-заголовок, аудиограмма для аудио-эпизодов, тепловая карта «most replayed» с YouTube.
+- [ ] **Частично:** source-video reels есть; не доделан speaker-angle выбор для рилсов, per-reel framing и instant crop preview.
+- [ ] **Не выполнено:** vision авто-привязка камер к спикерам.
+- [ ] **Не выполнено:** OTIO/DaVinci Resolve экспорт.
+- [ ] **Не выполнено:** MLX/VideoToolbox на Mac.
+- [ ] **Частично:** нативный subtitle editor есть; последующие расширения/визуальная приёмка остаются.
+- [ ] **Не выполнено:** −14 LUFS, обложки, отдельный hook-title layout, аудиограмма и YouTube most-replayed integration.
 
 ---
 

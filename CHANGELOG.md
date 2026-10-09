@@ -16,6 +16,20 @@ All notable changes to Studio will be documented in this file.
 
 ### Added
 
+- Opt-in text stage: conservative proofreading with word realignment, article with
+  faithfulness report, and term check with offline fixes and separate network opt-in.
+- Reels selection with verified quotes, episode overview, cleanup/judge review,
+  bounded retries/backoff and audio features; `reel_render` with captions, portrait
+  framing and optional YuNet/Light-ASD tracking in the managed vision environment.
+- Native PyQt subtitle editor with video preview, cue/style editing and
+  `program_subtitles` captioned review master.
+- Desktop Settings (basic + Advanced YAML), setup wizard, Modules and models page
+  with progress/cancellation, compute inspection and GGUF picker with dirty guards.
+- Managed llama-server session shared across adjacent LLM stages and batch
+  projects; per-task LLM role routing; persistent project LLM response cache.
+- `uvf channel` queue with resumable acquisition report, `tools/night_run.sh`,
+  frozen `--gui/--cli/--worker` entry and `packaging/install_linux.sh`.
+
 - Frozen-source characterization tests and golden transcript/export contracts,
   including lock interruption, fingerprint adoption, and subprocess errors.
 - Frozen source snapshots for WhisperSync and Podcast Reels Forge.
