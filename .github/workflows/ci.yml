@@ -106,8 +106,10 @@ jobs:
       - name: Build and smoke-test the frozen executable
         run: |
           pyinstaller --noconfirm --clean packaging/pyinstaller/studio.spec
-          dist/studio --version
-          dist/studio doctor
+          dist/ultimate-video-forge --cli --version
+          dist/ultimate-video-forge --check-resources
+          dist/ultimate-video-forge --worker --help
+          dist/ultimate-video-forge --cli doctor
 
   cross-platform:
     name: Installed artifact smoke (${{ matrix.os }})
