@@ -42,3 +42,24 @@ def test_legacy_json_without_schema_or_time_domain_is_accepted() -> None:
 
 def test_srt_uses_segment_cues() -> None:
     assert to_srt(_transcript()).startswith("1\n00:00:00,100 --> 00:00:01,000\nПривет.")
+
+
+def test_corrected_segment_round_trips_original_words_for_audit() -> None:
+    transcript = _transcript()
+    corrected = Transcript(
+        transcript.source_audio,
+        transcript.language,
+        transcript.duration,
+        [
+            Segment(
+                transcript.segments[0].start,
+                transcript.segments[0].end,
+                transcript.segments[0].words,
+                text_override="Здравствуйте.",
+                raw_words=transcript.segments[0].words,
+            )
+        ],
+    )
+    restored = Transcript.from_dict(corrected.to_dict())
+    assert restored.segments[0].text == "Здравствуйте."
+    assert restored.segments[0].raw_words == transcript.segments[0].words

@@ -29,9 +29,13 @@ class Segment:
     words: tuple[Word, ...] = ()
     confidence: float | None = None
     avg_logprob: float | None = None
+    text_override: str | None = None
+    raw_words: tuple[Word, ...] | None = None
 
     @property
     def text(self) -> str:
+        if self.text_override is not None:
+            return self.text_override
         return " ".join(word.text for word in self.words).strip()
 
 
@@ -79,6 +83,11 @@ class Transcript:
                     if segment.avg_logprob is not None
                     else {}
                 ),
+                **(
+                    {"raw_words": [_word_dict(word) for word in segment.raw_words]}
+                    if segment.raw_words is not None
+                    else {}
+                ),
             }
             for segment in self.segments
         ]
@@ -124,6 +133,8 @@ class Transcript:
                     ),
                     confidence=_optional_float(segment.get("confidence")),
                     avg_logprob=_optional_float(segment.get("avg_logprob")),
+                    text_override=_text_override(segment),
+                    raw_words=_words(segment.get("raw_words")),
                 )
                 for segment in data.get("segments", [])
             ],
@@ -196,3 +207,38 @@ def _srt_time(seconds: float) -> str:
 
 def _optional_float(value: object) -> float | None:
     return float(str(value)) if value is not None else None
+
+
+def _word_dict(word: Word) -> dict[str, float | str]:
+    return {
+        "start": round(word.start, 3),
+        "end": round(word.end, 3),
+        "word": word.text,
+        "probability": round(word.probability, 3),
+    }
+
+
+def _words(value: object) -> tuple[Word, ...] | None:
+    if not isinstance(value, list):
+        return None
+    return tuple(
+        Word(
+            str(word.get("word", word.get("text", ""))),
+            float(word["start"]),
+            float(word["end"]),
+            float(word.get("probability", 1.0)),
+        )
+        for word in value
+        if isinstance(word, dict)
+    )
+
+
+def _text_override(segment: dict[str, Any]) -> str | None:
+    text = segment.get("text")
+    if not isinstance(text, str):
+        return None
+    word_text = " ".join(
+        str(word.get("word", word.get("text", ""))).strip()
+        for word in segment.get("words", [])
+    ).strip()
+    return text if text != word_text else None
