@@ -42,16 +42,34 @@ class ProgramStage:
         edit_path = _edit_path(project)
         edit = edit_path.read_text(encoding="utf-8") if edit_path.is_file() else ""
         return stable_fingerprint(
-            "program-v6", edit, project.placements, project.outputs.get("sync"),
-            [path.read_text(encoding="utf-8") for path in project.outputs.get("speakers", [])
-             if path.is_file()],
+            "program-v7",
+            edit,
+            project.placements,
+            project.outputs.get("sync"),
+            [
+                path.read_text(encoding="utf-8")
+                for path in project.outputs.get("speakers", [])
+                if path.is_file()
+            ],
             [(asset.id, asset.group_id) for asset in project.assets],
-            [describe_artifact(project.work_dir, path)
-             for key, paths in project.outputs.items() if key.startswith("sync:")
-             for path in paths if path.is_file()],
-            [describe_artifact(project.source_dir, project.source_dir / asset.path)
-             for asset in project.assets if asset.role is AssetRole.CAMERA],
-            settings.get("program", {}), settings.get("roughcut", {}),
+            [
+                describe_artifact(project.work_dir, path)
+                for key, paths in project.outputs.items()
+                if key.startswith("sync:")
+                for path in paths
+                if path.is_file()
+            ],
+            [
+                describe_artifact(project.source_dir, project.source_dir / asset.path)
+                for asset in project.assets
+                if asset.role is AssetRole.CAMERA
+            ],
+            {
+                key: value
+                for key, value in settings.get("program", {}).items()
+                if key != "burn_subtitles"
+            },
+            settings.get("roughcut", {}),
         )
 
     def run(self, context: StageContext) -> StageOutput:
@@ -59,8 +77,11 @@ class ProgramStage:
         edit_path = _edit_path(context.project)
         roughcut = context.settings.get("roughcut", {})
         use_edit = roughcut.get("enabled", True) if isinstance(roughcut, dict) else True
-        edit = (load_edit_map(edit_path) if edit_path.is_file() and use_edit else
-                EditMap("uncut", (KeepRange(0.0, timeline.duration),)))
+        edit = (
+            load_edit_map(edit_path)
+            if edit_path.is_file() and use_edit
+            else EditMap("uncut", (KeepRange(0.0, timeline.duration),))
+        )
         output = context.work_dir / "program" / "program.mp4"
         output.parent.mkdir(parents=True, exist_ok=True)
         conf = context.settings.get("program", {})
@@ -73,11 +94,17 @@ class ProgramStage:
             if not paths or not paths[0].is_file():
                 raise ValueError("speaker camera selection requires speakers output; run speakers")
             edit = speaker_camera_edit(
-                context.project, edit, json.loads(paths[0].read_text(encoding="utf-8")),
-                mapping, min_shot_s=float(conf.get("min_shot_s", 1.0)),
+                context.project,
+                edit,
+                json.loads(paths[0].read_text(encoding="utf-8")),
+                mapping,
+                min_shot_s=float(conf.get("min_shot_s", 1.0)),
             )
         render_report = render_project_program(
-            context.project, edit, output, encoder=str(conf.get("encoder", "auto")),
+            context.project,
+            edit,
+            output,
+            encoder=str(conf.get("encoder", "auto")),
             fps=str(conf.get("fps", "auto")),
         )
         transcript_ranges = []
@@ -88,6 +115,10 @@ class ProgramStage:
                 transcript_ranges.append(KeepRange(item.start_s, item.end_s))
         edited = map_transcript_to_edited(timeline, EditMap(edit.id, tuple(transcript_ranges)))
         edited = align_transcript_to_frames(edited, render_report)
+        render_report["timeline_to_rendered"] = rendered_timeline_map(edit, render_report)
+        render_report["edited_timing_fingerprint"] = stable_fingerprint(
+            edited.duration, [(word.start, word.end) for word in edited.words]
+        )
         render_report["camera_plan"] = [
             {"start_s": item.start_s, "end_s": item.end_s, "camera_id": item.camera_id}
             for item in edit.keep
@@ -108,10 +139,15 @@ def load_edit_map(path: Path) -> EditMap:
     if data.get("mode") == "markers":
         ranges = data.get("keep", [])
         if ranges:
-            return EditMap("uncut", (KeepRange(
-                min(float(item["start"]) for item in ranges),
-                max(float(item["end"]) for item in ranges),
-            ),))
+            return EditMap(
+                "uncut",
+                (
+                    KeepRange(
+                        min(float(item["start"]) for item in ranges),
+                        max(float(item["end"]) for item in ranges),
+                    ),
+                ),
+            )
     return EditMap(
         "roughcut",
         tuple(
@@ -136,18 +172,28 @@ def program_pieces(project: Project, edit: EditMap) -> list[ProgramPiece]:
     placements = [item for item in project.placements if item.asset_id in cameras]
     result = []
     for keep in edit.keep:
-        boundaries = sorted({keep.start_s, keep.end_s} | {
-            value for item in placements
-            for value in (item.offset_s, item.offset_s + item.duration_s * item.k)
-            if keep.start_s < value < keep.end_s
-        })
+        boundaries = sorted(
+            {keep.start_s, keep.end_s}
+            | {
+                value
+                for item in placements
+                for value in (item.offset_s, item.offset_s + item.duration_s * item.k)
+                if keep.start_s < value < keep.end_s
+            }
+        )
         for start, end in zip(boundaries, boundaries[1:], strict=False):
-            available = [item for item in placements
-                         if item.offset_s <= start + 1e-6
-                         and item.offset_s + item.duration_s * item.k >= end - 1e-6]
+            available = [
+                item
+                for item in placements
+                if item.offset_s <= start + 1e-6
+                and item.offset_s + item.duration_s * item.k >= end - 1e-6
+            ]
             if keep.camera_id:
-                group_ids = {asset.id for asset in cameras.values()
-                             if asset.group_id == keep.camera_id or asset.id == keep.camera_id}
+                group_ids = {
+                    asset.id
+                    for asset in cameras.values()
+                    if asset.group_id == keep.camera_id or asset.id == keep.camera_id
+                }
                 available = [item for item in available if item.asset_id in group_ids]
             if not available:
                 raise ValueError(f"no camera covers retained range {start:.3f}-{end:.3f}")
@@ -158,20 +204,26 @@ def program_pieces(project: Project, edit: EditMap) -> list[ProgramPiece]:
             has_audio = bool(asset.manual.get("media_info", {}).get("audio_codec"))
             audio = voice or (source if has_audio else None)
             source_in = timeline_to_file(start, placement)
-            result.append(ProgramPiece(source, audio, source_in, source_in,
-                                       end - start, placement.k))
+            result.append(
+                ProgramPiece(source, audio, source_in, source_in, end - start, placement.k)
+            )
     if not result:
         raise ValueError("cannot render empty retained ranges")
     return result
 
 
 def render_project_program(
-    project: Project, edit: EditMap, output: Path, *, encoder: str = "auto",
+    project: Project,
+    edit: EditMap,
+    output: Path,
+    *,
+    encoder: str = "auto",
     fps: str = "auto",
 ) -> dict[str, object]:
     pieces = program_pieces(project, edit)
-    first = next(asset for asset in project.assets
-                 if project.source_dir / asset.path == pieces[0].video)
+    first = next(
+        asset for asset in project.assets if project.source_dir / asset.path == pieces[0].video
+    )
     info = first.manual.get("media_info", {})
     width, height = int(info.get("width") or 1920), int(info.get("height") or 1080)
     requested_fps = fps
@@ -206,24 +258,41 @@ def render_project_program(
             command = ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(piece.video)]
             if piece.audio is not None:
                 command.extend(["-i", str(piece.audio)])
-                audio = (f"[1:a]atrim=start={piece.audio_in_s}:duration={duration},"
-                         "asetpts=PTS-STARTPTS,"
-                         + ",".join(build_atempo_chain(1 / piece.rate)) + ","
-                         "aresample=48000,aformat=channel_layouts=stereo,"
-                         f"apad,atrim=duration={rendered_duration}[a]")
+                audio = (
+                    f"[1:a]atrim=start={piece.audio_in_s}:duration={duration},"
+                    "asetpts=PTS-STARTPTS," + ",".join(build_atempo_chain(1 / piece.rate)) + ","
+                    "aresample=48000,aformat=channel_layouts=stereo,"
+                    f"apad,atrim=duration={rendered_duration}[a]"
+                )
             else:
-                audio = ("anullsrc=r=48000:cl=stereo,"
-                         f"atrim=duration={rendered_duration}[a]")
-            video = (f"[0:v]trim=start={piece.video_in_s}:duration={duration},"
-                     f"setpts={piece.rate}*(PTS-STARTPTS),"
-                     f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                     f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-                     f"fps={fps},tpad=stop_mode=clone:stop_duration={rendered_duration},"
-                     f"trim=end_frame={frames},setpts=N/({fps}*TB)[v]")
-            command.extend(["-filter_complex", video + ";" + audio,
-                            "-map", "[v]", "-map", "[a]", "-c:v", codec,
-                            "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le",
-                            "-t", str(rendered_duration), str(directory / f"part-{index}.mkv")])
+                audio = f"anullsrc=r=48000:cl=stereo,atrim=duration={rendered_duration}[a]"
+            video = (
+                f"[0:v]trim=start={piece.video_in_s}:duration={duration},"
+                f"setpts={piece.rate}*(PTS-STARTPTS),"
+                f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                f"fps={fps},tpad=stop_mode=clone:stop_duration={rendered_duration},"
+                f"trim=end_frame={frames},setpts=N/({fps}*TB)[v]"
+            )
+            command.extend(
+                [
+                    "-filter_complex",
+                    video + ";" + audio,
+                    "-map",
+                    "[v]",
+                    "-map",
+                    "[a]",
+                    "-c:v",
+                    codec,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "pcm_s16le",
+                    "-t",
+                    str(rendered_duration),
+                    str(directory / f"part-{index}.mkv"),
+                ]
+            )
             try:
                 _run_ffmpeg(command)
             except RuntimeError as exc:
@@ -231,29 +300,100 @@ def render_project_program(
                     raise
                 # Regenerate every part to avoid joining different H.264
                 # parameter sets when hardware fails halfway through a job.
-                retry = render_project_program(project, edit, output, encoder="cpu",
-                                               fps=requested_fps)
-                retry.update({"requested_encoder": encoder, "initial_codec": choice.codec,
-                              "selection_reason": choice.reason,
-                              "runtime_fallback_reason": str(exc)[-2000:]})
+                retry = render_project_program(
+                    project, edit, output, encoder="cpu", fps=requested_fps
+                )
+                retry.update(
+                    {
+                        "requested_encoder": encoder,
+                        "initial_codec": choice.codec,
+                        "selection_reason": choice.reason,
+                        "runtime_fallback_reason": str(exc)[-2000:],
+                    }
+                )
                 return retry
         listing = directory / "parts.txt"
-        listing.write_text("".join(f"file 'part-{index}.mkv'\n"
-                                   f"duration {float(Fraction(frames) / rate):.12f}\n"
-                                   for index, frames in enumerate(frame_counts) if frames),
-                           encoding="utf-8")
-        _run_ffmpeg(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "concat",
-                     "-safe", "0", "-i", str(listing), "-c:v", "copy", "-c:a", "aac",
-                     "-movflags", "+faststart", str(output)])
-    return {"schema_version": 1, "requested_encoder": encoder,
-            "initial_codec": choice.codec, "final_codec": codec,
-            "selection_reason": choice.reason, "runtime_fallback_reason": fallback_reason,
-            "width": width, "height": height, "fps": fps, "piece_count": len(pieces),
-            "requested_fps": requested_fps, "frame_count": previous_frame,
-            "frame_counts": frame_counts, "timing_policy": "CFR cumulative frame boundaries",
-            "piece_durations_s": [piece.duration_s for piece in pieces],
-            "requested_duration_s": sum(piece.duration_s for piece in pieces),
-            "duration_s": float(Fraction(previous_frame) / rate)}
+        listing.write_text(
+            "".join(
+                f"file 'part-{index}.mkv'\nduration {float(Fraction(frames) / rate):.12f}\n"
+                for index, frames in enumerate(frame_counts)
+                if frames
+            ),
+            encoding="utf-8",
+        )
+        _run_ffmpeg(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(listing),
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ]
+        )
+    return {
+        "schema_version": 1,
+        "requested_encoder": encoder,
+        "initial_codec": choice.codec,
+        "final_codec": codec,
+        "selection_reason": choice.reason,
+        "runtime_fallback_reason": fallback_reason,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "piece_count": len(pieces),
+        "requested_fps": requested_fps,
+        "frame_count": previous_frame,
+        "frame_counts": frame_counts,
+        "timing_policy": "CFR cumulative frame boundaries",
+        "piece_durations_s": [piece.duration_s for piece in pieces],
+        "requested_duration_s": sum(piece.duration_s for piece in pieces),
+        "duration_s": float(Fraction(previous_frame) / rate),
+    }
+
+
+def rendered_timeline_map(edit: EditMap, report: dict) -> list[dict]:
+    """Intersect retained timeline spans with actual CFR trim/pad intervals."""
+    rate = float(Fraction(str(report["fps"])))
+    retained = []
+    cursor = 0.0
+    for keep in edit.keep:
+        duration = keep.end_s - keep.start_s
+        retained.append((cursor, cursor + duration, keep.start_s))
+        cursor += duration
+    result = []
+    original = rendered = 0.0
+    for duration, frames in zip(report["piece_durations_s"], report["frame_counts"], strict=True):
+        output_duration = frames / rate
+        for start, end, timeline in retained:
+            left, right = (
+                max(original, start),
+                min(original + duration, end, original + output_duration),
+            )
+            if right > left:
+                result.append(
+                    {
+                        "timeline_start": timeline + left - start,
+                        "timeline_end": timeline + right - start,
+                        "edited_start": rendered + left - original,
+                        "edited_end": rendered + right - original,
+                    }
+                )
+        original += duration
+        rendered += output_duration
+    return result
 
 
 def align_transcript_to_frames(transcript: Transcript, report: dict[str, object]) -> Transcript:
@@ -263,8 +403,9 @@ def align_transcript_to_frames(transcript: Transcript, report: dict[str, object]
     original_cursor = rendered_cursor = 0.0
     for duration, frames in zip(report["piece_durations_s"], report["frame_counts"], strict=True):
         rendered_duration = frames / rate
-        intervals.append((original_cursor, original_cursor + duration,
-                          rendered_cursor, rendered_duration))
+        intervals.append(
+            (original_cursor, original_cursor + duration, rendered_cursor, rendered_duration)
+        )
         original_cursor += duration
         rendered_cursor += rendered_duration
     segments = []
@@ -279,8 +420,15 @@ def align_transcript_to_frames(transcript: Transcript, report: dict[str, object]
             if mapped:
                 words.append(Word(word.text, mapped[0][0], mapped[-1][1], word.probability))
         if words:
-            segments.append(Segment(words[0].start, words[-1].end, tuple(words),
-                                    segment.confidence))
+            segments.append(
+                Segment(
+                    words[0].start,
+                    words[-1].end,
+                    tuple(words),
+                    segment.confidence,
+                    text_override=segment.text_override,
+                )
+            )
     from dataclasses import replace
 
     return replace(transcript, duration=rendered_cursor, segments=segments)
@@ -297,8 +445,7 @@ def map_transcript_to_edited(transcript: Transcript, edit: EditMap) -> Transcrip
     for segment in transcript.segments:
         words: list[Word] = []
         for word in segment.words:
-            if not any(item.start_s <= word.start and word.end <= item.end_s
-                       for item in edit.keep):
+            if not any(item.start_s <= word.start and word.end <= item.end_s for item in edit.keep):
                 continue
             start = timeline_to_edited(word.start, edit)
             end = timeline_to_edited(word.end, edit)
@@ -306,7 +453,13 @@ def map_transcript_to_edited(transcript: Transcript, edit: EditMap) -> Transcrip
                 words.append(Word(word.text, start, end, word.probability))
         if words:
             segments.append(
-                Segment(words[0].start, words[-1].end, tuple(words), segment.confidence)
+                Segment(
+                    words[0].start,
+                    words[-1].end,
+                    tuple(words),
+                    segment.confidence,
+                    text_override=segment.text_override,
+                )
             )
     duration = sum(item.end_s - item.start_s for item in edit.keep)
     return Transcript(

@@ -1,0 +1,420 @@
+"""Render verified moments in their declared transcript time domain."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+from dataclasses import replace
+from pathlib import Path
+
+from studio.core.proc import run_logged
+from studio.core.project import Project, stable_fingerprint
+from studio.core.subtitles import load_edits, to_ass
+from studio.core.timeline import EditMap, KeepRange, TimeDomain
+from studio.core.transcript import Segment, Transcript, Word, to_srt
+from studio.stages.base import Decision, GpuUse, Requirement, StageContext, StageOutput
+from studio.stages.program import render_project_program
+from studio.stages.reels import _settings, _transcript_path
+
+
+class ReelRenderStage:
+    id = "reel_render"
+    title = "Render reels"
+    after = ("reels", "program")
+    optional_after = ("program",)
+    gpu = GpuUse.NONE
+
+    def requirements(self, settings: dict[str, object]) -> list[Requirement]:
+        return []
+
+    def decide(self, project: Project, settings: dict[str, object]) -> Decision:
+        if not _settings(settings).get("render", False):
+            return Decision.skip("reels rendering is disabled")
+        if not project.outputs.get("reels"):
+            return Decision.blocked("no verified moments are available", "run reels")
+        path = _transcript_path(project)
+        if path is None:
+            return Decision.blocked("no transcript is available", "run timeline")
+        if Transcript.load(path).time_domain is TimeDomain.EDITED and not project.outputs.get(
+            "program"
+        ):
+            return Decision.blocked("edited moments need the review program", "enable program")
+        return Decision.run({})
+
+    def fingerprint(self, project: Project, settings: dict[str, object]) -> str:
+        inputs = [*project.outputs.get("reels", []), *project.outputs.get("program", [])]
+        inputs.extend(project.source_dir / asset.path for asset in project.assets)
+        inputs.extend(
+            path
+            for key, paths in project.outputs.items()
+            if key.startswith("sync:")
+            for path in paths
+        )
+        transcript = _transcript_path(project)
+        if transcript:
+            inputs.append(transcript)
+        saved = project.work_dir / "subtitles"
+        if saved.is_dir():
+            inputs.extend(sorted(saved.glob("*.json")))
+        model_dir = Path(
+            os.environ.get(
+                "UVF_MODELS_DIR", str(Path.home() / ".cache" / "ultimate-video-forge" / "models")
+            )
+        )
+        if _settings(settings).get("tracking", False):
+            inputs.extend(
+                model_dir / name
+                for name in ("face_detection_yunet_2023mar.onnx", "light_asd_talkset.model")
+            )
+        return stable_fingerprint(
+            "reel-render-v3",
+            _settings(settings),
+            project.to_dict()["assets"],
+            [str(placement) for placement in project.placements],
+            {
+                key: [str(path) for path in paths]
+                for key, paths in project.outputs.items()
+                if key.startswith("sync:")
+            },
+            [(str(path), _digest(path)) for path in inputs if path.is_file()],
+        )
+
+    def run(self, context: StageContext) -> StageOutput:
+        settings = _settings(context.settings)
+        transcript_path = _transcript_path(context.project)
+        if transcript_path is None:
+            raise ValueError("no transcript is available")
+        transcript = Transcript.load(transcript_path)
+        selection_report = next(
+            (
+                path
+                for path in context.project.outputs.get("reels", [])
+                if path.name == "report.json"
+            ),
+            None,
+        )
+        if selection_report:
+            selection = json.loads(selection_report.read_text(encoding="utf-8"))
+            if selection.get("time_domain") != transcript.time_domain.value or selection.get(
+                "transcript_fingerprint"
+            ) != stable_fingerprint(transcript.to_dict()):
+                raise ValueError("moments belong to a different transcript; rerun reels selection")
+        moments_path = next(
+            path for path in context.project.outputs.get("reels", []) if path.name == "moments.json"
+        )
+        moments = json.loads(moments_path.read_text(encoding="utf-8"))
+        directory = context.work_dir / "stages" / "reel_render"
+        directory.mkdir(parents=True, exist_ok=True)
+        artifacts: list[Path] = []
+        entries = []
+        for number, moment in enumerate(moments, 1):
+            start, end = float(moment["start"]), float(moment["end"])
+            if not 0 <= start < end <= transcript.duration:
+                raise ValueError("moment is outside its transcript")
+            stem = f"reel-{number:03d}"
+            video = directory / f"{stem}.mp4"
+            if transcript.time_domain is TimeDomain.TIMELINE:
+                render_project_program(
+                    context.project,
+                    EditMap(stem, (KeepRange(start, end),)),
+                    video,
+                    encoder="cpu",
+                    fps=str(settings.get("render_fps", "25")),
+                )
+            elif transcript.time_domain is TimeDomain.EDITED:
+                sources = context.project.outputs.get("program", [])
+                if not sources:
+                    raise ValueError("edited moments require a rendered program")
+                result = run_logged(
+                    [
+                        "ffmpeg",
+                        "-nostdin",
+                        "-v",
+                        "error",
+                        "-y",
+                        "-ss",
+                        str(start),
+                        "-i",
+                        str(sources[0]),
+                        "-t",
+                        str(end - start),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "0:a:0?",
+                        "-vf",
+                        f"fps={settings.get('render_fps', '25')}",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "fast",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-c:a",
+                        "aac",
+                        "-movflags",
+                        "+faststart",
+                        str(video),
+                    ],
+                    timeout=max(120, (end - start) * 20),
+                )
+                if result.returncode:
+                    raise RuntimeError(result.stderr)
+            else:
+                raise ValueError("reels require timeline or edited transcript times")
+            framing = str(settings.get("framing", "source"))
+            if framing != "source":
+                framed = directory / f"{stem}-framed.mp4"
+                framing_report = reframe_video(video, framed, settings)
+                framed.replace(video)
+            else:
+                framing_report = {"tracking": "disabled"}
+            published_video = context.project.work_dir / video.relative_to(context.work_dir)
+            local = clip_transcript(transcript, start, end, published_video)
+            cues, style = load_edits(context.project.work_dir, stem, local)
+            subtitle_transcript = replace(
+                local,
+                segments=[Segment(cue.start, cue.end, text_override=cue.text) for cue in cues],
+            )
+            json_path, srt_path = directory / f"{stem}.json", directory / f"{stem}.srt"
+            local.save(json_path)
+            srt_path.write_text(to_srt(subtitle_transcript), encoding="utf-8")
+            artifacts.extend((video, json_path, srt_path))
+            ass_path = directory / f"{stem}.ass"
+            ass_path.write_text(
+                to_ass(
+                    cues,
+                    style,
+                    portrait=framing != "source"
+                    and int(settings.get("height", 1920)) > int(settings.get("width", 1080)),
+                ),
+                encoding="utf-8",
+            )
+            artifacts.append(ass_path)
+            if settings.get("burn_subtitles", False):
+                captioned = directory / f"{stem}-captioned.mp4"
+                burn_subtitles(video, ass_path, captioned)
+                artifacts.append(captioned)
+            entries.append(
+                {
+                    "candidate_id": moment.get("candidate_id"),
+                    "video": video.name,
+                    "transcript": json_path.name,
+                    "subtitles": srt_path.name,
+                    "styled_subtitles": ass_path.name,
+                    "captioned": f"{stem}-captioned.mp4"
+                    if settings.get("burn_subtitles")
+                    else None,
+                    "source_start": start,
+                    "source_end": end,
+                    "source_time_domain": transcript.time_domain.value,
+                    "framing": framing,
+                    "framing_report": framing_report,
+                    "crop_x": settings.get("crop_x", 0.5) if framing == "crop" else None,
+                }
+            )
+        report = directory / "render.json"
+        report.write_text(json.dumps({"schema_version": 1, "reels": entries}, indent=2) + "\n")
+        artifacts.append(report)
+        return StageOutput(
+            tuple(artifacts),
+            {
+                "outputs": {**context.project.outputs, "reel_render": artifacts},
+            },
+        )
+
+
+def clip_transcript(source: Transcript, start: float, end: float, video: Path) -> Transcript:
+    segments = []
+    for segment in source.segments:
+        if segment.end <= start or segment.start >= end:
+            continue
+        words = tuple(
+            Word(
+                word.text,
+                max(start, word.start) - start,
+                min(end, word.end) - start,
+                word.probability,
+            )
+            for word in segment.words
+            if word.start < end and word.end > start
+        )
+        segments.append(
+            Segment(
+                max(start, segment.start) - start,
+                min(end, segment.end) - start,
+                words,
+                text_override=None if words else segment.text,
+            )
+        )
+    return replace(
+        source,
+        source_audio=video,
+        duration=end - start,
+        segments=segments,
+        time_domain=TimeDomain.FILE,
+        map_id=None,
+        metadata={
+            **source.metadata,
+            "reel_source_start": start,
+            "reel_source_time_domain": source.time_domain.value,
+        },
+    )
+
+
+def _digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def burn_subtitles(video: Path, subtitles: Path, output: Path) -> None:
+    # Keep arbitrary project filenames out of ffmpeg's filtergraph parser.
+    with tempfile.TemporaryDirectory(prefix="uvf-subtitles-") as temporary:
+        safe_path = Path(temporary) / f"captions{subtitles.suffix}"
+        shutil.copyfile(subtitles, safe_path)
+        escaped = str(safe_path).replace("\\", "/").replace(":", "\\:")
+        result = run_logged(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(video),
+                "-vf",
+                f"subtitles=filename='{escaped}'",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "fast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ],
+            timeout=3600,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+
+
+def reframe_video(video: Path, output: Path, settings: dict[str, object]) -> dict[str, object]:
+    width, height = int(settings.get("width", 1080)), int(settings.get("height", 1920))
+    if settings.get("framing") == "crop":
+        x = float(settings.get("crop_x", 0.5))
+        filters = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}:(iw-ow)*{x}:(ih-oh)/2,setsar=1"
+        )
+    else:
+        filters = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
+            f"force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+        )
+    tracking = "disabled"
+    if settings.get("tracking", False):
+        tracked = tracking_filter(video, width, height, settings)
+        tracking = "applied" if tracked else "unavailable-static-fallback"
+        filters = tracked or filters
+    result = run_logged(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(video),
+            "-vf",
+            filters,
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ],
+        timeout=3600,
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr)
+    return {"tracking": tracking, "width": width, "height": height}
+
+
+def tracking_filter(
+    video: Path, width: int, height: int, settings: dict[str, object]
+) -> str | None:
+    import logging
+
+    try:
+        from studio.core.media import probe
+        from studio.modules.manager import ModuleManager
+
+        manager = ModuleManager()
+        if not manager.installed("vision"):
+            raise ValueError("managed vision module is missing; install it through modules install")
+        with tempfile.TemporaryDirectory(prefix="uvf-vision-") as folder:
+            request, output = Path(folder) / "request.json", Path(folder) / "result.json"
+            request.write_text(
+                json.dumps(
+                    {
+                        "video": str(video.resolve()),
+                        "duration": probe(video).duration_s,
+                        "width": width,
+                        "height": height,
+                        "device": str(settings.get("tracking_device", "cuda")),
+                        "active_speaker": bool(settings.get("active_speaker", True)),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = (
+                str(
+                    Path(sys._MEIPASS) / "managed"
+                    if getattr(sys, "frozen", False)
+                    else Path(__file__).resolve().parents[2]
+                )
+                + os.pathsep
+                + environment.get("PYTHONPATH", "")
+            )
+            result = run_logged(
+                [
+                    str(manager.interpreter("vision")),
+                    "-m",
+                    "studio.vision.worker",
+                    str(request),
+                    str(output),
+                ],
+                env=environment,
+                timeout=3600,
+            )
+            if result.returncode:
+                raise RuntimeError(result.stderr[-4096:])
+            value = json.loads(output.read_text(encoding="utf-8"))
+            if value["filter"]:
+                return value["filter"] + ",setsar=1"
+    except Exception as exc:
+        logging.getLogger(__name__).warning("tracking unavailable: %s", exc)
+    logging.getLogger(__name__).warning("tracking unavailable; using configured static crop")
+    return None
