@@ -69,8 +69,14 @@ that point in development, not today's backlog. Plan phase acceptance remains op
 - Phase 5–6 work (text/term-check, reels/vision/render, native subtitle editor,
   settings/setup/modules pages, LLM session/roles/retries, channel queue, frozen
   entry, Linux installer) existed only as uncommitted working-tree changes. It is
-  now committed by area and pushed to `origin/main`, so the GitHub CI definitions
-  run for the first time; their results are not yet recorded here.
+  now committed by area and pushed to `origin/main`.
+- GitHub CI (run 37990897469, commit `571cc8f`): frozen WhisperSync baseline
+  (403) and Forge baseline (620) pass; Studio smoke passes on Python 3.10, 3.11
+  and 3.13; wheel/PyInstaller and installed-artifact smoke pass on macOS and
+  Windows. **Failing:** `mypy studio tools` in the Python 3.12 job — 195 errors in
+  36 files, introduced after `8ccdef7` (last green run, 2026-10-08) because local
+  checks ran pytest and Ruff only. Type-check repair is the next CI task; until
+  then the local "Ruff passes" statements do not imply a green CI.
 - Intermediate area commits are not individually guaranteed to pass the suite;
   shared modules (settings, CLI, main window) changed across areas. The final
   commit state is the verified one.

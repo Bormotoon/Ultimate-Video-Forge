@@ -71,6 +71,7 @@ Python 3.12 (CI: 3.10–3.13) · PyQt6 · faster-whisper (CTranslate2) · pyanno
 pip install -e ".[dev,whisper]"
 QT_QPA_PLATFORM=offscreen python -m pytest -q   # 410 passed, 2 skipped (Python 3.10, 2026-10-10)
 ruff check studio tests
+mypy studio tools                                # обязательно для CI (Python 3.12)
 python tools/make_fixtures.py                    # синтетический проект для ручного прогона
 pyinstaller packaging/pyinstaller/studio.spec    # локальный Linux-бинарник
 ```
