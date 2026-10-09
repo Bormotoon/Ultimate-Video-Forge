@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import os
 import sys
 import venv
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from platformdirs import user_data_path
+
+from studio.core.workspace import project_lock
+from studio.modules.cancellation import check_cancelled, run_install
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,7 +26,9 @@ class ModuleRecipe:
 RECIPES = {
     "youtube": ModuleRecipe("youtube", ("yt-dlp>=2025.1.0",)),
     "diarization": ModuleRecipe("diarization", ("pyannote.audio>=3.1,<4",)),
-    "vision": ModuleRecipe("vision", ("torch>=2.7,<3", "opencv-python-headless>=4.8,<5")),
+    "vision": ModuleRecipe(
+        "vision", ("torch>=2.7,<3", "opencv-python-headless>=4.8,<5", "PyYAML>=6,<7")
+    ),
 }
 
 
@@ -38,18 +44,54 @@ class ModuleManager:
         marker = self.root / name / "module.json"
         return self.interpreter(name).is_file() and marker.is_file()
 
-    def install(self, name: str) -> Path:
+    def install(
+        self,
+        name: str,
+        *,
+        progress: Callable[[dict], None] = lambda event: None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Path:
         recipe = RECIPES.get(name)
         if recipe is None:
             raise ValueError(f"unknown Studio module: {name}")
         folder = self.root / name
         folder.parent.mkdir(parents=True, exist_ok=True)
-        venv.EnvBuilder(with_pip=True, clear=True).create(folder)
+        with project_lock(self.root / ".locks" / name):
+            check_cancelled(cancelled or (lambda: False))
+            if self.installed(name):
+                progress({"phase": "complete", "percent": 100, "name": name})
+                return self.interpreter(name)
+            return self._install(recipe, progress, cancelled)
+
+    def _install(
+        self,
+        recipe: ModuleRecipe,
+        progress: Callable[[dict], None],
+        cancelled: Callable[[], bool] | None,
+    ) -> Path:
+        name = recipe.name
+        folder = self.root / name
+        progress({"phase": "environment", "percent": None, "name": name})
+        if getattr(sys, "frozen", False):
+            python = os.environ.get("UVF_MODULE_PYTHON")
+            if not python:
+                raise RuntimeError(
+                    "Set UVF_MODULE_PYTHON to a compatible Python interpreter "
+                    "for module installation."
+                )
+            run_install([python, "-m", "venv", "--clear", str(folder)], cancelled)
+        else:
+            if cancelled is None:
+                venv.EnvBuilder(with_pip=True, clear=True).create(folder)
+            else:
+                run_install([sys.executable, "-m", "venv", "--clear", str(folder)], cancelled)
         interpreter = self.interpreter(name)
-        subprocess.run(
+        progress({"phase": "dependencies", "percent": None, "name": name})
+        run_install(
             [str(interpreter), "-m", "pip", "install", *recipe.requirements],
-            check=True,
+            cancelled,
         )
+        check_cancelled(cancelled or (lambda: False))
         (folder / "module.json").write_text(
             json.dumps(
                 {"schema_version": 1, "name": name, "requirements": recipe.requirements},
@@ -58,6 +100,7 @@ class ModuleManager:
             + "\n",
             encoding="utf-8",
         )
+        progress({"phase": "complete", "percent": 100, "name": name})
         return interpreter
 
 

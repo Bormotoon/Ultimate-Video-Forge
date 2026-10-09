@@ -1,0 +1,127 @@
+"""Verified optional vision model installation without importing ML packages."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import os
+import sys
+import urllib.request
+from collections.abc import Callable
+from dataclasses import dataclass
+from importlib.resources import files
+from pathlib import Path
+
+from studio.core.workspace import project_lock, published
+from studio.modules.cancellation import check_cancelled
+
+
+@dataclass(frozen=True)
+class ModelRecipe:
+    filename: str
+    url: str
+    sha256: str
+
+
+def recipes() -> dict[str, ModelRecipe]:
+    result = {}
+    for name, module, filename in (
+        ("yunet", "face_crop.py", "face_detection_yunet_2023mar.onnx"),
+        ("light-asd", "active_speaker.py", "light_asd_talkset.model"),
+    ):
+        source = (
+            Path(sys._MEIPASS) / "managed" / "studio" / "vision" / module
+            if getattr(sys, "frozen", False)
+            else files("studio.vision").joinpath(module)
+        )
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        constants = {
+            target.id: ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name) and target.id in {"MODEL_URL", "MODEL_SHA256"}
+        }
+        url = constants["MODEL_URL"]
+        if name == "yunet":
+            url = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+        result[name] = ModelRecipe(filename, url, constants["MODEL_SHA256"])
+    return result
+
+
+class ModelManager:
+    def __init__(self, root: Path | None = None) -> None:
+        self.root = root or Path(
+            os.environ.get(
+                "UVF_MODELS_DIR", str(Path.home() / ".cache" / "ultimate-video-forge" / "models")
+            )
+        )
+
+    def path(self, name: str) -> Path:
+        if name not in recipes():
+            raise ValueError(f"unknown vision model: {name}")
+        return self.root / recipes()[name].filename
+
+    def installed(self, name: str) -> bool:
+        path = self.path(name)
+        return path.is_file() and digest(path) == recipes()[name].sha256
+
+    def install(
+        self,
+        name: str,
+        *,
+        progress: Callable[[dict], None] = lambda event: None,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> Path:
+        path = self.path(name)
+        recipe = recipes()[name]
+        with project_lock(self.root):
+            check_cancelled(cancelled)
+            if self.installed(name):
+                progress({"phase": "complete", "percent": 100, "name": name})
+                return path
+            progress({"phase": "download", "percent": 0, "name": name})
+            with published(path) as temporary:
+                with (
+                    urllib.request.urlopen(recipe.url, timeout=60) as response,
+                    temporary.open("wb") as output,
+                ):
+                    size = 0
+                    total = (
+                        int(response.headers.get("Content-Length", 0))
+                        if hasattr(response, "headers")
+                        else 0
+                    )
+                    last = -1
+                    for block in iter(lambda: response.read(1024 * 1024), b""):
+                        check_cancelled(cancelled)
+                        size += len(block)
+                        if size > 128 * 1024 * 1024:
+                            raise ValueError("model download exceeds size limit")
+                        output.write(block)
+                        percent = min(99, int(size * 100 / total)) if total else None
+                        if percent != last:
+                            progress(
+                                {
+                                    "phase": "download",
+                                    "percent": percent,
+                                    "bytes": size,
+                                    "total": total,
+                                    "name": name,
+                                }
+                            )
+                            last = percent
+                progress({"phase": "verify", "percent": None, "name": name})
+                if digest(temporary) != recipe.sha256:
+                    raise ValueError(f"{name}: downloaded model checksum mismatch")
+                check_cancelled(cancelled)
+            progress({"phase": "complete", "percent": 100, "name": name})
+        return path
+
+
+def digest(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
