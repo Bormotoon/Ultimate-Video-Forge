@@ -47,7 +47,11 @@ class LlamaServer:
 
     def stop(self, timeout_s: float = 5.0) -> None:
         process = self.process
-        if process is None or process.poll() is not None:
+        if process is None:
+            return
+        if process.poll() is not None:
+            if self._owns_process(process.pid):
+                self.marker_path.unlink(missing_ok=True)
             return
         if not self._owns_process(process.pid):
             raise RuntimeError("refusing to stop an unowned llama-server process")

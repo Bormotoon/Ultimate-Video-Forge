@@ -9,17 +9,24 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
+from studio.core.workspace import published
+from studio.llm.json_utils import extract_first_json_value
+
 
 @dataclass(frozen=True, slots=True)
 class LlamaProvider:
     base_url: str
     model: str
     cache_dir: Path | None = None
+    model_identity: str = ""
+    timeout_s: float = 600.0
 
-    def complete(self, prompt: str, *, grammar: str | None = None) -> str:
+    def complete(self, prompt: str, *, grammar: str | None = None, refresh: bool = False) -> str:
         cache = self._cache_path(prompt, grammar)
-        if cache and cache.is_file():
-            return cache.read_text(encoding="utf-8")
+        if not refresh and cache and cache.is_file():
+            text = cache.read_text(encoding="utf-8")
+            if text.strip():
+                return text
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
@@ -33,19 +40,30 @@ class LlamaProvider:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urlopen(request, timeout=600) as response:  # noqa: S310
+        with urlopen(request, timeout=self.timeout_s) as response:  # noqa: S310
             data = json.load(response)
-        text = str(data["choices"][0]["message"]["content"])
+        text = data["choices"][0]["message"]["content"]
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("local LLM returned no text content")
         if cache:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            cache.write_text(text, encoding="utf-8")
+            with published(cache) as temporary:
+                temporary.write_text(text, encoding="utf-8")
         return text
 
     def _cache_path(self, prompt: str, grammar: str | None) -> Path | None:
         if self.cache_dir is None:
             return None
         material = json.dumps(
-            {"model": self.model, "prompt": prompt, "grammar": grammar},
+            {
+                "version": 2,
+                "endpoint": self.base_url.rstrip("/"),
+                "model": self.model,
+                "model_identity": self.model_identity,
+                "prompt": prompt,
+                "grammar": grammar,
+                "temperature": 0,
+            },
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -54,8 +72,4 @@ class LlamaProvider:
 
 
 def parse_json_response(text: str) -> Any:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        lines = stripped.splitlines()
-        stripped = "\n".join(lines[1:-1])
-    return json.loads(stripped)
+    return extract_first_json_value(text)
