@@ -39,10 +39,16 @@ class ScanStage:
             )
             for path in files
         ]
-        return stable_fingerprint("scan-v2", identities, settings.get("scan", {}))
+        overrides = {
+            asset.id: asset.manual.get("overrides", {})
+            for asset in project.assets
+            if asset.manual.get("overrides")
+        }
+        return stable_fingerprint("scan-v3", identities, overrides, settings.get("scan", {}))
 
     def run(self, context: StageContext) -> StageOutput:
         assets, warnings = scan(context.project.source_dir)
+        assets = apply_manual_overrides(context.project.assets, assets)
         report = context.work_dir / "stages" / "scan" / "report.json"
         report.parent.mkdir(parents=True, exist_ok=True)
         import json
@@ -99,6 +105,33 @@ def scan(source_dir: Path) -> tuple[list[Asset], list[str]]:
         if kind is AssetKind.VIDEO and not info.audio_codec:
             warnings.append(f"{relative}: video has no audio; acoustic sync is unavailable")
     return assets, warnings
+
+
+def apply_manual_overrides(previous: list[Asset], scanned: list[Asset]) -> list[Asset]:
+    """Keep explicit user choices while refreshing probe-derived asset metadata."""
+    overrides = {
+        asset.id: asset.manual.get("overrides")
+        for asset in previous
+        if isinstance(asset.manual.get("overrides"), dict)
+    }
+    for asset in scanned:
+        values = overrides.get(asset.id)
+        if not values:
+            continue
+        role = values.get("role")
+        group_id = values.get("group_id")
+        device = values.get("device")
+        if isinstance(role, str):
+            try:
+                asset.role = AssetRole(role)
+            except ValueError:
+                pass
+        if isinstance(group_id, str) or group_id is None:
+            asset.group_id = group_id
+        if isinstance(device, str) or device is None:
+            asset.device = device
+        asset.manual["overrides"] = values
+    return scanned
 
 
 def _media_paths(source_dir: Path) -> list[Path]:

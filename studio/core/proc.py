@@ -72,6 +72,7 @@ def run_logged(
     log_dir: Path | None = None,
     tail_bytes: int = DEFAULT_TAIL_BYTES,
     keep_logs: bool = False,
+    env: dict[str, str] | None = None,
 ) -> ProcResult:
     """Run ``cmd`` with its output streamed to disk; return a bounded tail.
 
@@ -96,6 +97,7 @@ def run_logged(
                 stderr=err_fh,
                 timeout=timeout,
                 check=False,
+                env=env,
             )
         return ProcResult(
             completed.returncode,

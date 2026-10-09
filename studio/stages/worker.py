@@ -18,10 +18,14 @@ from studio.stages.events import EventType, StageEvent
 from studio.stages.export import ExportStage
 from studio.stages.prepare import PrepareStage
 from studio.stages.program import ProgramStage
+from studio.stages.program_subtitles import ProgramSubtitlesStage
+from studio.stages.reel_render import ReelRenderStage
+from studio.stages.reels import ReelsStage
 from studio.stages.roughcut import RoughcutStage
 from studio.stages.scan import ScanStage
 from studio.stages.speakers import SpeakersStage
 from studio.stages.sync import SyncStage
+from studio.stages.text import TextStage
 from studio.stages.timeline import TimelineStage
 from studio.stages.transcribe import TranscribeStage
 
@@ -35,8 +39,12 @@ def stage_registry() -> dict[str, Stage]:
         TimelineStage(),
         SpeakersStage(),
         RoughcutStage(),
+        TextStage(),
+        ReelsStage(),
+        ReelRenderStage(),
         ExportStage(),
         ProgramStage(),
+        ProgramSubtitlesStage(),
     ]
     return {stage.id: stage for stage in stages}
 
@@ -46,8 +54,11 @@ def _emit(event: StageEvent) -> None:
 
 
 def execute(
-    stage_id: str, project_path: Path, settings_path: Path,
-    output_dir: Path, result_project: Path,
+    stage_id: str,
+    project_path: Path,
+    settings_path: Path,
+    output_dir: Path,
+    result_project: Path,
 ) -> int:
     stage = stage_registry().get(stage_id)
     if stage is None:

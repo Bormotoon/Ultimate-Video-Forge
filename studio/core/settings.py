@@ -81,6 +81,7 @@ class ExportSettings:
 @dataclass(slots=True)
 class ProgramSettings:
     enabled: bool = False
+    burn_subtitles: bool = False
     encoder: str = "auto"
     fps: str = "auto"
     speaker_cameras: dict[str, str] = field(default_factory=dict)
@@ -106,7 +107,73 @@ class SpeakerSettings:
 
 
 @dataclass(slots=True)
+class TextSettings:
+    proofread: bool = False
+    article: bool = False
+    base_url: str = "http://127.0.0.1:8080"
+    model: str = "local"
+    prompt_language: str = "auto"
+    max_chars_chunk: int = 4000
+    article_max_chars_chunk: int = 6000
+    min_similarity: float = 0.8
+    term_check: bool = False
+    term_check_network: bool = False
+    term_fixes: dict[str, str] = field(default_factory=dict)
+    term_max_candidates: int = 10
+
+
+@dataclass(slots=True)
+class ReelsSettings:
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8080"
+    model: str = "local"
+    prompt_language: str = "auto"
+    chunk_seconds: int = 600
+    max_chars_chunk: int = 6000
+    max_candidates: int = 10
+    target_min_s: float = 30.0
+    target_max_s: float = 60.0
+    cleanup: bool = True
+    judge: bool = True
+    review_batch_size: int = 10
+    cleanup_max_candidates: int = 100
+    judge_max_candidates: int = 50
+    json_retries: int = 1
+    retry_budget: int = 5
+    request_timeout_s: float = 600.0
+    retry_backoff_s: float = 1.0
+    audio_features: bool = False
+    audio_max_candidates: int = 50
+    audio_noise_db: float = -30.0
+    audio_silence_min_s: float = 0.35
+    audio_timeout_s: float = 30.0
+    episode_context: bool = True
+    min_quote_ratio: float = 0.75
+    render: bool = False
+    render_fps: str = "25"
+    burn_subtitles: bool = False
+    framing: str = "source"
+    width: int = 1080
+    height: int = 1920
+    crop_x: float = 0.5
+    tracking: bool = False
+    tracking_device: str = "cuda"
+    active_speaker: bool = True
+
+
+@dataclass(slots=True)
+class LlmSettings:
+    managed: bool = False
+    executable: str = "llama-server"
+    model_path: str = ""
+    port: int = 8080
+    startup_timeout_s: float = 120.0
+    roles: dict[str, dict[str, str]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class Settings:
+    llm: LlmSettings = field(default_factory=LlmSettings)
     scan: ScanSettings = field(default_factory=ScanSettings)
     sync: SyncSettings = field(default_factory=SyncSettings)
     transcribe: TranscribeSettings = field(default_factory=TranscribeSettings)
@@ -115,6 +182,8 @@ class Settings:
     program: ProgramSettings = field(default_factory=ProgramSettings)
     compute: ComputeSettings = field(default_factory=ComputeSettings)
     speakers: SpeakerSettings = field(default_factory=SpeakerSettings)
+    text: TextSettings = field(default_factory=TextSettings)
+    reels: ReelsSettings = field(default_factory=ReelsSettings)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -145,6 +214,13 @@ def validate_settings(settings: Settings) -> None:
         for name, expected in get_type_hints(type(section)).items():
             if not _matches_type(getattr(section, name), expected):
                 raise SettingsError(f"{section_name}.{name} has an invalid value type")
+    if not 1 <= settings.llm.port <= 65535:
+        raise SettingsError("llm.port must be between 1 and 65535")
+    _positive("llm.startup_timeout_s", settings.llm.startup_timeout_s)
+    if settings.llm.managed and (
+        not settings.llm.model_path.strip() or not settings.llm.executable.strip()
+    ):
+        raise SettingsError("managed llama requires executable and model_path")
     _one_of("scan.grouping", settings.scan.grouping, {"auto", "folders", "names"})
     _positive("scan.probe_timeout_s", settings.scan.probe_timeout_s)
     _one_of("sync.mode", settings.sync.mode, {"auto", "camera", "simple", "complex"})
@@ -157,8 +233,11 @@ def validate_settings(settings: Settings) -> None:
     _one_of("sync.self_check", settings.sync.self_check, {"off", "warn", "repair"})
     if settings.sync.self_check == "repair" and settings.sync.voice_enhance != "off":
         raise SettingsError("sync.self_check=repair currently requires voice_enhance=off")
-    _one_of("sync.voice_enhance", settings.sync.voice_enhance,
-            {"off", "denoise", "denoise_dereverb", "resemble"})
+    _one_of(
+        "sync.voice_enhance",
+        settings.sync.voice_enhance,
+        {"off", "denoise", "denoise_dereverb", "resemble"},
+    )
     for name in ("acoustic_grid_s", "acoustic_window_s", "acoustic_min_sharpness"):
         _positive(f"sync.{name}", getattr(settings.sync, name))
     _one_of("transcribe.device", settings.transcribe.device, {"auto", "cuda", "cpu"})
@@ -188,8 +267,10 @@ def validate_settings(settings: Settings) -> None:
         raise SettingsError("speakers.silence_floor_db must be between -100 and 0")
     _one_of("program.encoder", settings.program.encoder, {"auto", "nvenc", "libx264", "cpu"})
     _non_negative("program.min_shot_s", settings.program.min_shot_s)
-    if any(not key.strip() or not value.strip()
-           for key, value in settings.program.speaker_cameras.items()):
+    if any(
+        not key.strip() or not value.strip()
+        for key, value in settings.program.speaker_cameras.items()
+    ):
         raise SettingsError("program.speaker_cameras requires nonempty speaker and camera names")
     if settings.program.fps != "auto":
         from fractions import Fraction
@@ -205,11 +286,115 @@ def validate_settings(settings: Settings) -> None:
     _non_negative("roughcut.head_tail_pad_s", settings.roughcut.head_tail_pad_s)
     _non_negative("roughcut.retake_max_gap_s", settings.roughcut.retake_max_gap_s)
     _positive("roughcut.phrase_gap_threshold", settings.roughcut.phrase_gap_threshold)
+    _one_of("text.prompt_language", settings.text.prompt_language, {"auto", "ru", "en"})
+    if not settings.text.base_url.strip():
+        raise SettingsError("text.base_url must not be empty")
+    if not settings.text.model.strip():
+        raise SettingsError("text.model must not be empty")
+    for name in ("max_chars_chunk", "article_max_chars_chunk"):
+        value = getattr(settings.text, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 500:
+            raise SettingsError(f"text.{name} must be an integer of at least 500")
+    if not isinstance(settings.text.min_similarity, (int, float)) or not (
+        0 <= settings.text.min_similarity <= 1
+    ):
+        raise SettingsError("text.min_similarity must be between 0 and 1")
+    _one_of("reels.prompt_language", settings.reels.prompt_language, {"auto", "ru", "en"})
+    _one_of("reels.framing", settings.reels.framing, {"source", "crop", "fit"})
+    _one_of("reels.tracking_device", settings.reels.tracking_device, {"cpu", "cuda"})
+    if settings.reels.tracking and settings.reels.framing != "crop":
+        raise SettingsError("reels.tracking requires reels.framing=crop")
+    for name in ("width", "height"):
+        value = getattr(settings.reels, name)
+        if not 64 <= value <= 4096 or value % 2:
+            raise SettingsError(f"reels.{name} must be an even integer between 64 and 4096")
+    if not math.isfinite(settings.reels.crop_x) or not 0 <= settings.reels.crop_x <= 1:
+        raise SettingsError("reels.crop_x must be between 0 and 1")
+    if not settings.reels.base_url.strip() or not settings.reels.model.strip():
+        raise SettingsError("reels.base_url and reels.model must not be empty")
+    for name in (
+        "chunk_seconds",
+        "max_chars_chunk",
+        "max_candidates",
+        "review_batch_size",
+        "cleanup_max_candidates",
+        "judge_max_candidates",
+    ):
+        value = getattr(settings.reels, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise SettingsError(f"reels.{name} must be a positive integer")
+    if (
+        not isinstance(settings.reels.audio_max_candidates, int)
+        or isinstance(settings.reels.audio_max_candidates, bool)
+        or settings.reels.audio_max_candidates < 1
+    ):
+        raise SettingsError("reels.audio_max_candidates must be a positive integer")
+    for name in ("audio_silence_min_s", "audio_timeout_s"):
+        _positive(f"reels.{name}", getattr(settings.reels, name))
+    if (
+        not math.isfinite(settings.reels.audio_noise_db)
+        or not -100 <= settings.reels.audio_noise_db <= 0
+    ):
+        raise SettingsError("reels.audio_noise_db must be between -100 and 0")
+    for name in ("json_retries", "retry_budget"):
+        value = getattr(settings.reels, name)
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 100:
+            raise SettingsError(f"reels.{name} must be an integer between 0 and 100")
+    _positive("reels.request_timeout_s", settings.reels.request_timeout_s)
+    for role, config in settings.llm.roles.items():
+        if (
+            role not in {"proofread", "article", "context", "scout", "cleanup", "judge"}
+            or not isinstance(config, dict)
+            or not config
+            or set(config) - {"model", "base_url"}
+            or any(not isinstance(v, str) or not v.strip() for v in config.values())
+        ):
+            raise SettingsError("invalid llm.roles model/base_url mapping")
+        if settings.llm.managed and "base_url" in config:
+            raise SettingsError("managed roles cannot override base_url")
+    if any(
+        not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip()
+        for k, v in settings.text.term_fixes.items()
+    ):
+        raise SettingsError("invalid text.term_fixes")
+    if settings.text.term_check_network and not settings.text.term_check:
+        raise SettingsError("term_check_network requires term_check")
+    if settings.text.term_check and not settings.text.proofread:
+        raise SettingsError("term_check requires proofread")
+    if (
+        not isinstance(settings.text.term_max_candidates, int)
+        or isinstance(settings.text.term_max_candidates, bool)
+        or not 1 <= settings.text.term_max_candidates <= 100
+    ):
+        raise SettingsError("invalid text.term_max_candidates")
+    _non_negative("reels.retry_backoff_s", settings.reels.retry_backoff_s)
+    if settings.reels.retry_backoff_s > 30:
+        raise SettingsError("reels.retry_backoff_s must not exceed 30 seconds")
+    for name in ("target_min_s", "target_max_s"):
+        _positive(f"reels.{name}", getattr(settings.reels, name))
+    if settings.reels.target_max_s < settings.reels.target_min_s:
+        raise SettingsError("reels.target_max_s must not be below reels.target_min_s")
+    if (
+        not math.isfinite(settings.reels.min_quote_ratio)
+        or not 0 <= settings.reels.min_quote_ratio <= 1
+    ):
+        raise SettingsError("reels.min_quote_ratio must be between 0 and 1")
+    from fractions import Fraction
+
+    try:
+        if not 1 <= Fraction(settings.reels.render_fps) <= 240:
+            raise ValueError("fps out of range")
+    except (ValueError, ZeroDivisionError) as exc:
+        raise SettingsError("reels.render_fps must be a rate between 1 and 240") from exc
     if settings.roughcut.retake_min_words < 1:
         raise SettingsError("roughcut.retake_min_words must be a positive integer")
     threshold = settings.roughcut.silence_threshold_db
-    if (not isinstance(threshold, (float, int)) or isinstance(threshold, bool)
-            or not math.isfinite(threshold) or not -100 <= threshold <= 0):
+    if (
+        not isinstance(threshold, (float, int))
+        or isinstance(threshold, bool)
+        or not math.isfinite(threshold)
+        or not -100 <= threshold <= 0
+    ):
         raise SettingsError("roughcut.silence_threshold_db must be between -100 and 0")
     if settings.roughcut.pause_keep_s >= settings.roughcut.pause_min_s:
         raise SettingsError("roughcut.pause_keep_s must be less than pause_min_s")
@@ -225,6 +410,7 @@ def _construct(data: dict[str, Any]) -> Settings:
         raise SettingsError(f"unknown settings sections: {sorted(unknown)}")
     try:
         return Settings(
+            llm=LlmSettings(**_section(data, "llm")),
             scan=ScanSettings(**_section(data, "scan")),
             sync=SyncSettings(**_section(data, "sync")),
             transcribe=TranscribeSettings(**_section(data, "transcribe")),
@@ -233,6 +419,8 @@ def _construct(data: dict[str, Any]) -> Settings:
             program=ProgramSettings(**_section(data, "program")),
             compute=ComputeSettings(**_section(data, "compute")),
             speakers=SpeakerSettings(**_section(data, "speakers")),
+            text=TextSettings(**_section(data, "text")),
+            reels=ReelsSettings(**_section(data, "reels")),
         )
     except TypeError as exc:
         raise SettingsError(str(exc)) from exc

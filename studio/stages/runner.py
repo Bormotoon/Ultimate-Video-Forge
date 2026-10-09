@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 from collections.abc import Callable
@@ -16,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from studio.core.launch import python_command
 from studio.core.project import Artifact, ArtifactStatus, Project, StageManifest, describe_artifact
 from studio.core.publication import publish_files, recover_publications
 from studio.core.settings import load_settings
@@ -57,8 +57,15 @@ def run_stage_process(
         snapshot = Path(temporary) / "settings.yaml"
         snapshot.write_text(yaml.safe_dump(settings), encoding="utf-8")
         return _run_stage_process(
-            stage_id, project_path, snapshot, settings_path, fingerprint,
-            settings, cancelled, terminate_after_s, on_event,
+            stage_id,
+            project_path,
+            snapshot,
+            settings_path,
+            fingerprint,
+            settings,
+            cancelled,
+            terminate_after_s,
+            on_event,
         )
 
 
@@ -80,11 +87,18 @@ def _run_stage_process(
     output_dir = snapshot.parent / "output"
     output_dir.mkdir()
     result_project = snapshot.parent / "result-project.json"
-    command = [
-        sys.executable, "-m", "studio.stages.worker", stage_id,
-        str(private_project), str(snapshot),
-        "--output-dir", str(output_dir), "--result-project", str(result_project),
-    ]
+    command = python_command(
+        "studio.stages.worker",
+        [
+            stage_id,
+            str(private_project),
+            str(snapshot),
+            "--output-dir",
+            str(output_dir),
+            "--result-project",
+            str(result_project),
+        ],
+    )
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -159,9 +173,7 @@ def _run_stage_process(
         if process.stderr is not None:
             process.stderr.close()
     artifact_paths = [
-        Path(event.payload["path"])
-        for event in events
-        if event.type is EventType.ARTIFACT
+        Path(event.payload["path"]) for event in events if event.type is EventType.ARTIFACT
     ]
     artifacts: list[Artifact] = []
     replacements: list[tuple[Path, Path]] = []
@@ -206,10 +218,12 @@ def _run_stage_process(
     )
     private_manifest = snapshot.parent / "manifest.json"
     manifest.save(private_manifest)
-    replacements.extend([
-        (result_project, project_path),
-        (private_manifest, project.work_dir / "manifests" / f"{stage_id}.json"),
-    ])
+    replacements.extend(
+        [
+            (result_project, project_path),
+            (private_manifest, project.work_dir / "manifests" / f"{stage_id}.json"),
+        ]
+    )
     if cancelled():
         raise StageProcessError(f"stage {stage_id} was cancelled")
     if project_path.read_bytes() != initial_project:

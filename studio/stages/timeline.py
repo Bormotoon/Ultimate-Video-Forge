@@ -63,6 +63,7 @@ class TimelineStage:
                 ),
                 segment.confidence,
                 segment.avg_logprob,
+                segment.text_override,
             )
             for segment in source.segments
         ]

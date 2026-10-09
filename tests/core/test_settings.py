@@ -28,6 +28,15 @@ def test_invalid_settings_fail_before_work(tmp_path: Path) -> None:
         ("sync:\n  self_check: repair\n  voice_enhance: denoise\n", "requires"),
         ("program:\n  fps: '0/1'\n", "program.fps"),
         ("program:\n  fps: 'garbage'\n", "program.fps"),
+        ("reels:\n  cleanup_max_candidates: 0\n", "cleanup_max_candidates"),
+        ("reels:\n  judge_max_candidates: false\n", "judge_max_candidates"),
+        ("reels:\n  judge_max_candidates: 1.5\n", "judge_max_candidates"),
+        ("reels:\n  retry_budget: -1\n", "retry_budget"),
+        ("reels:\n  json_retries: true\n", "json_retries"),
+        ("reels:\n  request_timeout_s: .nan\n", "request_timeout_s"),
+        ("reels:\n  request_timeout_s: 0\n", "request_timeout_s"),
+        ("reels:\n  retry_backoff_s: -1\n", "retry_backoff_s"),
+        ("reels:\n  retry_backoff_s: 31\n", "retry_backoff_s"),
     ]
     path = tmp_path / "settings.yaml"
     for content, message in cases:
